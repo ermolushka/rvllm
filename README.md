@@ -1,0 +1,1 @@
+cargo run --release --   --model ../SmolLM2-360M.Q8_0.gguf   --tokenizer tokenizer.json   --prompt "The capital of France is"   --max-tokens 1
