@@ -147,11 +147,23 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if scheduler.pool.available() < needed_blocks {
                 break;
             }
+
+            // Read-only pre-check of what `prefill` is about to reuse from
+            // the prefix cache, so we know how many of this prompt's tokens
+            // to skip recomputing - `prefill` itself doesn't return this.
+            // Only *full* cached blocks are skippable (mirrors `prefill`'s
+            // own `cache_block_count * block_size`); clamp below the last
+            // token so there's always at least one real forward call left
+            // to produce this step's logits, even on a 100% cache hit.
+            let token_ids = scheduler.sequences[&seq_id].token_ids.clone();
+            let (_matched_tokens, matched_blocks) = scheduler.prefix_cache.match_prefix(&token_ids);
+            let skip_tokens = (matched_blocks.len() * block_size).min(token_ids.len() - 1);
+
             scheduler.prefill(seq_id);
 
             let seq = &scheduler.sequences[&seq_id];
             let tokens: Vec<u32> = seq.token_ids.iter().map(|t| t.0 as u32).collect();
-            let write_positions: Vec<(BlockID, usize)> = (0..tokens.len())
+            let write_positions: Vec<(BlockID, usize)> = (skip_tokens..tokens.len())
                 .map(|i| seq.block_table.logical_to_physical(i))
                 .collect();
             let read_blocks = seq.block_table.blocks().to_vec();
@@ -159,14 +171,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let logits = model::forward(
                 &config,
-                &tokens,
+                &tokens[skip_tokens..],
                 &device,
                 &mut kv_storage,
                 &write_positions,
                 &read_blocks,
                 read_num_tokens,
-                0,
-            )?; // [prompt_len, vocab_size]
+                skip_tokens,
+            )?; // [prompt_len - skip_tokens, vocab_size]
             let (seq_len, _) = logits.dims2()?;
             let next_id = logits.get(seq_len - 1)?.argmax(0)?.to_scalar::<u32>()?;
 
@@ -293,6 +305,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("[{i}] prompt: {:?}", args.prompt[i]);
         println!("[{i}] completion: {text}");
     }
+
+    println!(
+        "prefix cache: {} / {} tokens hit ({:.1}%), {} total block allocations",
+        scheduler.metrics.prefix_hits,
+        scheduler.metrics.prefix_total,
+        scheduler.metrics.hit_rate() * 100.0,
+        scheduler.pool.total_allocs,
+    );
 
     Ok(())
 }
