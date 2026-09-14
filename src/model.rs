@@ -1,6 +1,8 @@
 use candle_core::{Device, Tensor, scalar::TensorScalar};
 use candle_nn::ops::{silu, softmax};
+use kv_cache_scheduler::block_pool::BlockID;
 
+use crate::kv_storage::KvStorage;
 use crate::weights::SmollLM230MConfig;
 
 // RMSNorm: rescale each row by its root-mean-square, then apply a learned
@@ -178,7 +180,11 @@ pub fn transformer_block(
     rope_theta: f32,
     eps: f32,
     device: &Device,
-    kv_cache: &mut (Tensor, Tensor),
+    kv_storage: &mut KvStorage,
+    layer: usize,
+    write_positions: &[(BlockID, usize)], // one per token in this call
+    read_blocks: &[BlockID],              // full logical block list for this sequence
+    read_num_tokens: usize,               // trims gather's tail past the real seq len
     position_offset: usize, // where in the sequence 'x' starts, mostly for RoPE
 ) -> candle_core::Result<Tensor> {
     // Normalize before attention (pre-norm), not after - this is the
@@ -217,13 +223,18 @@ pub fn transformer_block(
         .collect::<candle_core::Result<Vec<_>>>()?;
     let k_roped = Tensor::stack(&k_slices, 0)?;
 
-    // dim 1 because [n_kv_heads, cached_len, head_dim], dim 1 is growing seq length, the rest two axis are fixed
-    let new_k_cache = Tensor::cat(&[&kv_cache.0, &k_roped], 1)?;
-    let new_v_cache = Tensor::cat(&[&kv_cache.1, &v], 1)?;
-    // update the cache with new concat value
-    *kv_cache = (new_k_cache, new_v_cache);
-    // The actual attention computation.
-    let mut attn_out = gqa_attention(&q_roped, &kv_cache.0, &kv_cache.1, position_offset)?;
+    // Write this call's tokens into their block slots, one token at a time -
+    // k_roped/v are [n_kv_heads, seq_len, head_dim], write_positions gives
+    // each token's (block_id, offset) in the same order.
+    for (i, &(block_id, offset)) in write_positions.iter().enumerate() {
+        let k_token = k_roped.narrow(1, i, 1)?.squeeze(1)?;
+        let v_token = v.narrow(1, i, 1)?.squeeze(1)?;
+        kv_storage.write(layer, block_id, offset, &k_token, &v_token)?;
+    }
+    // Gather the full cached K/V for this sequence (trimmed to its real
+    // length) and attend against it.
+    let (k_full, v_full) = kv_storage.gather(layer, read_blocks, read_num_tokens)?;
+    let mut attn_out = gqa_attention(&q_roped, &k_full, &v_full, position_offset)?;
 
     // Merge the heads back into one dimension - inverse of the earlier split.
     attn_out = attn_out
@@ -249,11 +260,16 @@ pub fn transformer_block(
 
 // Full forward pass: embed(tokens) -> N x transformer_block -> final norm -> LM head.
 // token_ids: input sequence. Returns logits, [seq_len, vocab_size].
+#[allow(clippy::too_many_arguments)]
 pub fn forward(
     config: &SmollLM230MConfig,
     token_ids: &[u32],
     device: &Device,
-    kv_cache: &mut Vec<(Tensor, Tensor)>,
+    kv_storage: &mut KvStorage,
+    write_positions: &[(BlockID, usize)],
+    read_blocks: &[BlockID],
+    read_num_tokens: usize,
+    position_offset: usize,
 ) -> candle_core::Result<Tensor> {
     // Turn token ids into vectors.
     let mut x = embed(token_ids, &config.tensors["token_embd.weight"], device)?;
@@ -261,7 +277,6 @@ pub fn forward(
     // Pulling weights straight out of the tensor map by the same key strings
     // weights.rs used when loading them.
     for i in 0..config.n_layers {
-        let position_offset = kv_cache[i as usize].0.dim(1)?;
         x = transformer_block(
             &x,
             &config.tensors[&format!("blk.{i}.attn_norm.weight")],
@@ -278,7 +293,11 @@ pub fn forward(
             config.rope_theta,
             config.rms_eps,
             device,
-            &mut kv_cache[i as usize],
+            kv_storage,
+            i as usize,
+            write_positions,
+            read_blocks,
+            read_num_tokens,
             position_offset,
         )?;
     }
@@ -292,6 +311,7 @@ pub fn forward(
 mod tests {
     use super::*;
     use candle_core::Device;
+    use kv_cache_scheduler::block_pool::BlockID;
 
     #[test]
     fn rms_norm_hand_computed() {
@@ -466,10 +486,11 @@ mod tests {
         let ffn_gate_weight = Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap();
         let ffn_up_weight = Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap();
         let ffn_down_weight = Tensor::rand(0f32, 1., (hidden_dim, ffn_dim), &device).unwrap();
-        let mut kv_cache: (Tensor, Tensor) = (
-            Tensor::zeros((n_kv_heads, 0, 2), candle_core::DType::F32, &device).unwrap(),
-            Tensor::zeros((n_kv_heads, 0, 2), candle_core::DType::F32, &device).unwrap(),
-        );
+        // One block, big enough to hold both tokens of this call.
+        let mut kv_storage = KvStorage::new(1, 1, seq_len, n_kv_heads, 2, &device).unwrap();
+        let write_positions: Vec<(BlockID, usize)> =
+            (0..seq_len).map(|i| (BlockID(0), i)).collect();
+        let read_blocks = [BlockID(0)];
         let out = transformer_block(
             &x,
             &attn_norm_weight,
@@ -486,7 +507,11 @@ mod tests {
             10000.0,
             1e-5,
             &device,
-            &mut kv_cache,
+            &mut kv_storage,
+            0,
+            &write_positions,
+            &read_blocks,
+            seq_len,
             0,
         )
         .unwrap();
@@ -584,11 +609,22 @@ mod tests {
         };
 
         let token_ids: [u32; 2] = [0, 2];
-        let mut kv_cache: Vec<(Tensor, Tensor)> = vec![(
-            Tensor::zeros((n_kv_heads, 0, head_dim), candle_core::DType::F32, &device).unwrap(),
-            Tensor::zeros((n_kv_heads, 0, head_dim), candle_core::DType::F32, &device).unwrap(),
-        )];
-        let logits = forward(&config, &token_ids, &device, &mut kv_cache).unwrap();
+        let mut kv_storage =
+            KvStorage::new(1, 1, token_ids.len(), n_kv_heads, head_dim, &device).unwrap();
+        let write_positions: Vec<(BlockID, usize)> =
+            (0..token_ids.len()).map(|i| (BlockID(0), i)).collect();
+        let read_blocks = [BlockID(0)];
+        let logits = forward(
+            &config,
+            &token_ids,
+            &device,
+            &mut kv_storage,
+            &write_positions,
+            &read_blocks,
+            token_ids.len(),
+            0,
+        )
+        .unwrap();
 
         assert_eq!(logits.dims(), &[token_ids.len(), vocab_size]);
     }

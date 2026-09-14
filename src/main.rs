@@ -1,11 +1,15 @@
 pub mod model;
 pub mod tokenizer;
 pub mod weights;
+pub mod kv_storage;
 
 use std::collections::HashMap;
 
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use clap::Parser;
+use kv_cache_scheduler::block_pool::BlockID;
+use kv_cache_scheduler::sequence::{Scheduler, TokenId};
+use kv_storage::KvStorage;
 use tokenizer::SmollLM230MTokenizer;
 use weights::SmollLM230MConfig;
 
@@ -19,6 +23,11 @@ struct Args {
     prompt: String,
     #[arg(long, default_value_t = 20)]
     max_tokens: usize,
+    #[arg(long, default_value_t = 16)]
+    block_size: usize,
+    // Defaults to context_length / block_size (rounded up) once the model is loaded.
+    #[arg(long)]
+    num_blocks: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -47,30 +56,69 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ids: Vec<u32> = smoll_tokenizer.encode(&args.prompt)?;
 
     let head_dim = (config.hidden_dim / config.n_heads) as usize;
-    let mut kv_cache: Vec<(Tensor, Tensor)> = (0..config.n_layers)
-        .map(|_| {
-            Ok((
-                Tensor::zeros(
-                    (config.n_kv_heads as usize, 0, head_dim),
-                    candle_core::DType::F32,
-                    &device,
-                )?,
-                Tensor::zeros(
-                    (config.n_kv_heads as usize, 0, head_dim),
-                    candle_core::DType::F32,
-                    &device,
-                )?,
-            ))
-        })
-        .collect::<candle_core::Result<Vec<_>>>()?;
+    let block_size = args.block_size;
+    let num_blocks = args
+        .num_blocks
+        .unwrap_or_else(|| (config.context_length as usize).div_ceil(block_size));
 
-    // Greedy decode loop. First step primes the cache with the whole prompt;
-    // every step after only feeds the newly generated token, since everything
-    // before it is already in kv_cache.
+    let mut kv_storage = KvStorage::new(
+        config.n_layers as usize,
+        num_blocks,
+        block_size,
+        config.n_kv_heads as usize,
+        head_dim,
+        &device,
+    )?;
+
+    let mut scheduler = Scheduler::new(num_blocks as u32, block_size);
+    let seq_id =
+        scheduler.add_request(ids.iter().map(|&t| TokenId(t as i32)).collect());
+
+    // Greedy decode loop. First step primes the cache with the whole prompt
+    // (via prefill, which allocates blocks for it); every step after only
+    // feeds the newly generated token, since everything before it is already
+    // in kv_storage.
     let mut next_input = ids.clone();
-    for _ in 0..args.max_tokens {
+    for step_idx in 0..args.max_tokens {
+        // Tokens already cached before this call's allocation - 0 on the
+        // first (prefill) call.
+        let position_offset = scheduler.sequences[&seq_id].block_table.num_tokens();
+
+        if step_idx == 0 {
+            scheduler.prefill(seq_id);
+        } else {
+            // Allocates this call's one new token slot. step() pushes a
+            // placeholder TokenId(0) onto the sequence's token history -
+            // patch it with the real id we already generated.
+            scheduler.step();
+            let last = scheduler
+                .sequences
+                .get_mut(&seq_id)
+                .unwrap()
+                .token_ids
+                .last_mut()
+                .unwrap();
+            *last = TokenId(next_input[0] as i32);
+        }
+
+        let seq = &scheduler.sequences[&seq_id];
+        let write_positions: Vec<(BlockID, usize)> = (0..next_input.len())
+            .map(|i| seq.block_table.logical_to_physical(position_offset + i))
+            .collect();
+        let read_blocks = seq.block_table.blocks().to_vec();
+        let read_num_tokens = seq.block_table.num_tokens();
+
         // 1. Run the model on only the tokens not yet cached.
-        let logits = model::forward(&config, &next_input, &device, &mut kv_cache)?; // [seq_len, vocab_size]
+        let logits = model::forward(
+            &config,
+            &next_input,
+            &device,
+            &mut kv_storage,
+            &write_positions,
+            &read_blocks,
+            read_num_tokens,
+            position_offset,
+        )?; // [seq_len, vocab_size]
 
         // 2. Take the last row of logits (the prediction for the next token).
         let (seq_len, _vocab_size) = logits.dims2()?;
