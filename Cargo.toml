@@ -3,9 +3,22 @@ name = "rvllm"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rvllm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rvllm"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 clap = { version = "4.6.4", features = ["derive"] }
 tokenizers = "0.23.1"
 kv-cache-scheduler = "0.1.0"
+rand = "0.9"
