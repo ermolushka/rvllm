@@ -9,16 +9,14 @@
 // rather than real text - this needs `--model` (for config: vocab size,
 // layer count, block-table sizing) but not `--tokenizer`.
 
-use std::collections::HashMap;
 use std::fs;
 
-use candle_core::Device;
 use clap::Parser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rvllm::engine::{self, RequestSpec};
+use rvllm::model::Model;
 use rvllm::sampler::Sampler;
-use rvllm::weights::SmollLM230MConfig;
 
 #[derive(Parser)]
 struct Args {
@@ -111,24 +109,23 @@ fn requests_from_trace(rng: &mut StdRng, vocab_size: u32, trace: &[TraceEntry]) 
 
 fn run_and_report(
     label: &str,
-    config: &SmollLM230MConfig,
-    device: &Device,
+    model: &Model,
     requests: &[RequestSpec],
     block_size: usize,
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let batch_size = requests.len();
-    let blocks_per_seq = (config.context_length as usize).div_ceil(block_size);
+    let blocks_per_seq = (model.config.context_length as usize).div_ceil(block_size);
     let num_blocks = blocks_per_seq * batch_size.max(1);
 
     // Warmup run (discarded) so the measured run isn't paying for first-touch
     // allocation of the KV storage tensors, per the plan's "steady-state
     // throughput once warmup is excluded".
     let mut warmup_sampler = Sampler::new(0.0, 1.0, seed);
-    engine::run(config, device, requests, block_size, num_blocks, &mut warmup_sampler)?;
+    engine::run(model, requests, block_size, num_blocks, &mut warmup_sampler)?;
 
     let mut sampler = Sampler::new(0.0, 1.0, seed);
-    let result = engine::run(config, device, requests, block_size, num_blocks, &mut sampler)?;
+    let result = engine::run(model, requests, block_size, num_blocks, &mut sampler)?;
     let stats = &result.stats;
 
     let secs = stats.elapsed.as_secs_f64();
@@ -172,31 +169,15 @@ fn run_and_report(
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
-    let device = Device::Cpu;
-
-    let mut config = SmollLM230MConfig {
-        n_layers: 0,
-        n_heads: 0,
-        n_kv_heads: 0,
-        hidden_dim: 0,
-        ffn_dim: 0,
-        rope_theta: 0.0,
-        rms_eps: 0.0,
-        vocab_size: 0,
-        context_length: 0,
-        eos_token_id: 0,
-        bos_token_id: 0,
-        tensors: HashMap::new(),
-    };
-    config.read_gguf(&args.model)?;
+    let model = Model::load(&args.model)?;
 
     let mut rng = StdRng::seed_from_u64(args.seed);
 
     if let Some(trace_path) = &args.trace_file {
         let trace = parse_trace_file(trace_path)?;
-        let requests = requests_from_trace(&mut rng, config.vocab_size, &trace);
+        let requests = requests_from_trace(&mut rng, model.config.vocab_size, &trace);
         println!("trace: {} requests from {trace_path}", requests.len());
-        run_and_report("trace", &config, &device, &requests, args.block_size, args.seed)?;
+        run_and_report("trace", &model, &requests, args.block_size, args.seed)?;
         return Ok(());
     }
 
@@ -213,15 +194,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for &batch_size in &batch_sizes {
         let requests = synthetic_requests(
             &mut rng,
-            config.vocab_size,
+            model.config.vocab_size,
             batch_size,
             args.prompt_len,
             args.gen_len,
         );
         run_and_report(
             &format!("batch_size={batch_size}"),
-            &config,
-            &device,
+            &model,
             &requests,
             args.block_size,
             args.seed,

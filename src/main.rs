@@ -1,11 +1,8 @@
-use std::collections::HashMap;
-
-use candle_core::Device;
 use clap::Parser;
 use rvllm::engine::{self, RequestSpec};
 use rvllm::sampler::Sampler;
+use rvllm::model::Model;
 use rvllm::tokenizer::SmollLM230MTokenizer;
-use rvllm::weights::SmollLM230MConfig;
 
 #[derive(Parser)]
 struct Args {
@@ -39,27 +36,16 @@ struct Args {
     top_p: f32,
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    // Also print each prompt with its labelled completion, then prefix cache and
+    // throughput stats. Without it, only the completion text is printed.
+    #[arg(long)]
+    debug: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
-    let device = Device::Cpu;
-
-    let mut config = SmollLM230MConfig {
-        n_layers: 0,
-        n_heads: 0,
-        n_kv_heads: 0,
-        hidden_dim: 0,
-        ffn_dim: 0,
-        rope_theta: 0.0,
-        rms_eps: 0.0,
-        vocab_size: 0,
-        context_length: 0,
-        eos_token_id: 0,
-        bos_token_id: 0,
-        tensors: HashMap::new(),
-    };
-    config.read_gguf(&args.model)?;
+    let model = Model::load(&args.model)?;
+    let config = &model.config;
 
     let smoll_tokenizer =
         SmollLM230MTokenizer::from_file(&args.tokenizer, config.eos_token_id, config.bos_token_id)?;
@@ -81,33 +67,39 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
     let mut sampler = Sampler::new(args.temperature, args.top_p, args.seed);
-    let result = engine::run(&config, &device, &requests, block_size, num_blocks, &mut sampler)?;
+    let result = engine::run(&model, &requests, block_size, num_blocks, &mut sampler)?;
 
     for (i, generated) in result.generated.iter().enumerate() {
         let text = smoll_tokenizer.decode(generated)?;
-        println!("[{i}] prompt: {:?}", args.prompt[i]);
-        println!("[{i}] completion: {text}");
+        if args.debug {
+            println!("[{i}] prompt: {:?}", args.prompt[i]);
+            println!("[{i}] completion: {text}");
+        } else {
+            println!("{text}");
+        }
     }
 
-    let stats = &result.stats;
-    println!(
-        "prefix cache: {} / {} tokens hit ({:.1}%), {} total block allocations",
-        stats.prefix_hits,
-        stats.prefix_total,
-        if stats.prefix_total == 0 {
-            0.0
-        } else {
-            stats.prefix_hits as f64 / stats.prefix_total as f64 * 100.0
-        },
-        stats.total_block_allocs,
-    );
-    println!(
-        "{} steps, {} output tokens in {:.2?} ({:.1} tok/s)",
-        stats.steps,
-        stats.output_tokens,
-        stats.elapsed,
-        stats.output_tokens as f64 / stats.elapsed.as_secs_f64(),
-    );
+    if args.debug {
+        let stats = &result.stats;
+        println!(
+            "prefix cache: {} / {} tokens hit ({:.1}%), {} total block allocations",
+            stats.prefix_hits,
+            stats.prefix_total,
+            if stats.prefix_total == 0 {
+                0.0
+            } else {
+                stats.prefix_hits as f64 / stats.prefix_total as f64 * 100.0
+            },
+            stats.total_block_allocs,
+        );
+        println!(
+            "{} steps, {} output tokens in {:.2?} ({:.1} tok/s)",
+            stats.steps,
+            stats.output_tokens,
+            stats.elapsed,
+            stats.output_tokens as f64 / stats.elapsed.as_secs_f64(),
+        );
+    }
 
     Ok(())
 }

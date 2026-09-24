@@ -1,4 +1,3 @@
-use candle_nn::encoding;
 use tokenizers::Tokenizer;
 
 pub struct SmollLM230MTokenizer {
@@ -33,7 +32,7 @@ impl SmollLM230MTokenizer {
 
 #[test]
 fn round_trip() {
-    let tok = SmollLM230MTokenizer::from_file("../tokenizer.json", 0, 0).unwrap();
+    let tok = SmollLM230MTokenizer::from_file("tokenizer.json", 0, 0).unwrap();
     let ids = tok.encode("Hello, world!").unwrap();
     let text = tok.decode(&ids).unwrap();
     assert_eq!(text.trim(), "Hello, world!");

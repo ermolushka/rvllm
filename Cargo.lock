@@ -768,9 +768,9 @@ dependencies = [
 
 [[package]]
 name = "kv-cache-scheduler"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b28c35fedb8193ea33b8a6369f08f45a9a4d4b45f1097428fe7f6aebf975a06"
+checksum = "3167fdef38fbd4c79de693fab5b79e0f2fc4386f16aa4a5e48121f00ad7ed638"
 dependencies = [
  "linked-hash-map",
  "thiserror 1.0.69",

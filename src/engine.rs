@@ -8,14 +8,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use candle_core::Device;
+use candle_core::Result;
 use kv_cache_scheduler::block_pool::BlockID;
 use kv_cache_scheduler::sequence::{Scheduler, SequenceId, TokenId};
 
 use crate::kv_storage::KvStorage;
-use crate::model::{self, BatchItem};
+use crate::model::{BatchItem, Model};
 use crate::sampler::Sampler;
-use crate::weights::SmollLM230MConfig;
 
 pub struct RequestSpec {
     pub tokens: Vec<u32>,
@@ -55,29 +54,44 @@ struct PendingRequest {
     tokens: Vec<u32>,
 }
 
-struct RequestState {
+// Everything the engine tracks per sequence, keyed by the scheduler's id.
+struct SeqState {
+    // Index into the caller's `requests` slice.
+    req_idx: usize,
+    // Length of the original prompt, before any generated tokens were appended.
+    prompt_len: usize,
     max_tokens: usize,
     generated: Vec<u32>,
+    // Token to feed the next decode step: the last one sampled.
     next_input: u32,
 }
 
+// One running sequence's contribution to a decode step. Owned here so the
+// `BatchItem`s can borrow from it; the block table is borrowed straight from
+// the scheduler instead of copied.
+struct DecodeRow {
+    seq_id: SequenceId,
+    token: [u32; 1],
+    write: [(BlockID, usize); 1],
+    position_offset: usize,
+}
+
 pub fn run(
-    config: &SmollLM230MConfig,
-    device: &Device,
+    model: &Model,
     requests: &[RequestSpec],
     block_size: usize,
     num_blocks: usize,
     sampler: &mut Sampler,
-) -> candle_core::Result<RunResult> {
-    let head_dim = (config.hidden_dim / config.n_heads) as usize;
+) -> Result<RunResult> {
+    let config = &model.config;
 
     let mut kv_storage = KvStorage::new(
         config.n_layers as usize,
         num_blocks,
         block_size,
         config.n_kv_heads as usize,
-        head_dim,
-        device,
+        config.head_dim(),
+        model.device(),
     )?;
     let mut scheduler = Scheduler::new(num_blocks as u32, block_size);
 
@@ -92,9 +106,7 @@ pub fn run(
         .collect();
     pending.make_contiguous().sort_by_key(|r| r.arrival_step);
 
-    let mut state: HashMap<SequenceId, RequestState> = HashMap::new();
-    let mut req_idx_of: HashMap<SequenceId, usize> = HashMap::new();
-    let mut orig_prompt_len: HashMap<SequenceId, usize> = HashMap::new();
+    let mut seqs: HashMap<SequenceId, SeqState> = HashMap::new();
 
     let started = Instant::now();
     let mut step_idx = 0usize;
@@ -111,12 +123,20 @@ pub fn run(
             let prompt_len = req.tokens.len();
             let seq_id =
                 scheduler.add_request(req.tokens.iter().map(|&t| TokenId(t as i32)).collect());
-            req_idx_of.insert(seq_id, req.req_idx);
-            orig_prompt_len.insert(seq_id, prompt_len);
+            seqs.insert(
+                seq_id,
+                SeqState {
+                    req_idx: req.req_idx,
+                    prompt_len,
+                    max_tokens: requests[req.req_idx].max_tokens,
+                    generated: Vec::new(),
+                    next_input: 0,
+                },
+            );
         }
 
         // 2. Admit as many waiting requests as fit into freed/available
-        //    capacity, prefilling each with its own (unbatched) forward call.
+        //    capacity, prefilling each with its own forward call.
         while let Some(&seq_id) = scheduler.waiting.front() {
             let needed_blocks =
                 scheduler.sequences[&seq_id].token_ids.len().div_ceil(block_size);
@@ -137,34 +157,25 @@ pub fn run(
             let write_positions: Vec<(BlockID, usize)> = (skip_tokens..tokens.len())
                 .map(|i| seq.block_table.logical_to_physical(i))
                 .collect();
-            let read_blocks = seq.block_table.blocks().to_vec();
-            let read_num_tokens = seq.block_table.num_tokens();
 
-            let logits = model::forward_last(
-                config,
-                &tokens[skip_tokens..],
-                device,
-                &mut kv_storage,
-                &write_positions,
-                &read_blocks,
-                read_num_tokens,
-                skip_tokens,
-            )?; // [1, vocab_size]: last position only
-            let (seq_len, _) = logits.dims2()?;
-            let next_id = sampler.sample(&logits.get(seq_len - 1)?)?;
+            // Only the tokens past the cached prefix run through the model,
+            // but attention reads the sequence's whole block table.
+            let item = BatchItem {
+                tokens: &tokens[skip_tokens..],
+                write_positions: &write_positions,
+                read_blocks: seq.block_table.blocks(),
+                read_num_tokens: seq.block_table.num_tokens(),
+                position_offset: skip_tokens,
+            };
+            let logits = model.forward_last(&[item], &mut kv_storage)?; // [1, 1, vocab_size]
+            let next_id = sampler.sample(&logits.get(0)?.get(0)?)?;
             let prefill_elapsed = prefill_started.elapsed();
             prefill_time += prefill_elapsed;
             prefill_tokens += tokens.len() - skip_tokens;
-            ttft[req_idx_of[&seq_id]] = prefill_elapsed;
 
-            state
-                .entry(seq_id)
-                .or_insert_with(|| RequestState {
-                    max_tokens: requests[req_idx_of[&seq_id]].max_tokens,
-                    generated: Vec::new(),
-                    next_input: 0,
-                })
-                .next_input = next_id;
+            let state = seqs.get_mut(&seq_id).unwrap();
+            ttft[state.req_idx] = prefill_elapsed;
+            state.next_input = next_id;
         }
 
         if scheduler.running.is_empty() && scheduler.waiting.is_empty() && pending.is_empty() {
@@ -172,7 +183,7 @@ pub fn run(
         }
 
         // 3. Batched decode: every currently running sequence contributes
-        //    exactly one new token to a single forward_batch call.
+        //    exactly one new token to a single forward call.
         if !scheduler.running.is_empty() {
             let decode_started = Instant::now();
             let running = scheduler.running.clone();
@@ -183,61 +194,61 @@ pub fn run(
 
             scheduler.step();
 
+            // A sequence that dropped out of `running` was preempted (its
+            // blocks evicted): rewind its token list to the real tokens so
+            // it re-prefills cleanly when readmitted.
             for &seq_id in &running {
                 if !scheduler.running.contains(&seq_id) {
-                    let real_len = orig_prompt_len[&seq_id] + state[&seq_id].generated.len();
+                    let state = &seqs[&seq_id];
+                    let real_len = state.prompt_len + state.generated.len();
                     scheduler.sequences.get_mut(&seq_id).unwrap().token_ids.truncate(real_len);
                 }
             }
 
-            let mut write_positions_by_seq: HashMap<SequenceId, [(BlockID, usize); 1]> =
-                HashMap::new();
-            let mut still_running = Vec::new();
+            let mut rows: Vec<DecodeRow> = Vec::with_capacity(running.len());
             for &seq_id in &running {
                 if !scheduler.running.contains(&seq_id) {
                     continue;
                 }
-                let next_input = state[&seq_id].next_input;
-                if let Some(t) = scheduler.sequences.get_mut(&seq_id).unwrap().token_ids.last_mut()
-                {
+                let next_input = seqs[&seq_id].next_input;
+                let seq = scheduler.sequences.get_mut(&seq_id).unwrap();
+                if let Some(t) = seq.token_ids.last_mut() {
                     *t = TokenId(next_input as i32);
                 }
-
-                let offset = position_offsets[&seq_id];
-                let block_pos =
-                    scheduler.sequences[&seq_id].block_table.logical_to_physical(offset);
-                write_positions_by_seq.insert(seq_id, [block_pos]);
-                still_running.push(seq_id);
+                let position_offset = position_offsets[&seq_id];
+                rows.push(DecodeRow {
+                    seq_id,
+                    token: [next_input],
+                    write: [seq.block_table.logical_to_physical(position_offset)],
+                    position_offset,
+                });
             }
 
-            let tokens_by_seq: HashMap<SequenceId, [u32; 1]> =
-                still_running.iter().map(|&id| (id, [state[&id].next_input])).collect();
-            let read_blocks_by_seq: HashMap<SequenceId, Vec<BlockID>> = still_running
-                .iter()
-                .map(|&id| (id, scheduler.sequences[&id].block_table.blocks().to_vec()))
-                .collect();
+            let logits = {
+                let items: Vec<BatchItem> = rows
+                    .iter()
+                    .map(|row| {
+                        let table = &scheduler.sequences[&row.seq_id].block_table;
+                        BatchItem {
+                            tokens: &row.token,
+                            write_positions: &row.write,
+                            read_blocks: table.blocks(),
+                            read_num_tokens: table.num_tokens(),
+                            position_offset: row.position_offset,
+                        }
+                    })
+                    .collect();
+                model.forward(&items, &mut kv_storage)? // [batch, 1, vocab_size]
+            };
 
-            let items: Vec<BatchItem> = still_running
-                .iter()
-                .map(|&id| BatchItem {
-                    tokens: &tokens_by_seq[&id],
-                    write_positions: &write_positions_by_seq[&id],
-                    read_blocks: &read_blocks_by_seq[&id],
-                    read_num_tokens: scheduler.sequences[&id].block_table.num_tokens(),
-                    position_offset: position_offsets[&id],
-                })
-                .collect();
-
-            let logits = model::forward_batch(config, &items, device, &mut kv_storage)?; // [batch, 1, vocab_size]
-
-            for (i, &seq_id) in still_running.iter().enumerate() {
+            for (i, row) in rows.iter().enumerate() {
                 let next_id = sampler.sample(&logits.get(i)?.get(0)?)?;
-                let req = state.get_mut(&seq_id).unwrap();
+                let req = seqs.get_mut(&row.seq_id).unwrap();
                 req.generated.push(next_id);
                 let finished =
                     next_id == config.eos_token_id || req.generated.len() >= req.max_tokens;
                 if finished {
-                    scheduler.finish_sequence(seq_id);
+                    scheduler.finish_sequence(row.seq_id);
                 } else {
                     req.next_input = next_id;
                 }
@@ -252,10 +263,9 @@ pub fn run(
     let elapsed = started.elapsed();
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
     let mut output_tokens = 0usize;
-    for (seq_id, req_idx) in &req_idx_of {
-        let tokens = state[seq_id].generated.clone();
-        output_tokens += tokens.len();
-        generated[*req_idx] = tokens;
+    for state in seqs.into_values() {
+        output_tokens += state.generated.len();
+        generated[state.req_idx] = state.generated;
     }
 
     Ok(RunResult {

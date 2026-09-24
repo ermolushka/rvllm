@@ -29,6 +29,11 @@ arrival: that request only becomes eligible for admission at decode step `n`
 KV cache's paging granularity and total capacity; `--num-blocks` defaults to
 enough blocks for every request to reach `context_length` at once.
 
+By default only the completion text is printed (one per request, in `--prompt`
+order). Pass `--debug` to also print each prompt with a labelled completion,
+plus the prefix cache hit rate, total block allocations, and step count /
+throughput (tok/s) for the run.
+
 ## Sampling
 
 `--temperature` (default `0.0`) and `--top-p` (default `1.0`) control next-token

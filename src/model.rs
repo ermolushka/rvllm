@@ -1,14 +1,63 @@
-use candle_core::{D, Device, Tensor};
+use candle_core::{D, Device, Result, Tensor};
 use candle_nn::ops::{silu, softmax};
 use kv_cache_scheduler::block_pool::BlockID;
 
-use crate::kv_storage::KvStorage;
-use crate::weights::SmollLM230MConfig;
+use crate::kv_storage::{GatherPlan, KvStorage};
+
+// Model hyperparameters, read from the GGUF metadata by `Model::load`.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub n_layers: u32,
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub hidden_dim: u32,
+    pub ffn_dim: u32,
+    pub rope_theta: f32,
+    pub rms_eps: f32,
+    pub vocab_size: u32,
+    pub context_length: u32,
+    pub eos_token_id: u32,
+    pub bos_token_id: u32,
+}
+
+impl Config {
+    pub fn head_dim(&self) -> usize {
+        (self.hidden_dim / self.n_heads) as usize
+    }
+}
+
+// One transformer block's weights, all F32 in candle Linear convention
+// ([out_features, in_features]) except the two norm vectors.
+pub struct Layer {
+    // Index of this layer's slot in `KvStorage`.
+    pub index: usize,
+    pub attn_norm: Tensor,
+    pub attn_q: Tensor,
+    pub attn_k: Tensor,
+    pub attn_v: Tensor,
+    pub attn_output: Tensor,
+    pub ffn_norm: Tensor,
+    pub ffn_gate: Tensor,
+    pub ffn_up: Tensor,
+    pub ffn_down: Tensor,
+}
+
+// The whole model. `Model::load` (in weights.rs) builds one from a GGUF file.
+pub struct Model {
+    pub config: Config,
+    // [vocab_size, hidden_dim]
+    pub token_embd: Tensor,
+    pub layers: Vec<Layer>,
+    pub output_norm: Tensor,
+    // [vocab_size, hidden_dim]. Shares storage with `token_embd` when the
+    // model ties its input and output embeddings.
+    pub output: Tensor,
+}
 
 // RMSNorm: rescale each row by its root-mean-square, then apply a learned
 // per-channel scale. No mean-centering (unlike LayerNorm) - just magnitude
 // control, which is cheaper and works fine for Llama-family models.
-pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     // rms = sqrt(mean(x^2) + eps), one value per row (kept as a column so it
     // broadcasts back against every element of that row). Normalizing over the
     // last dim (rather than a hardcoded 1) is what lets this same function run
@@ -34,7 +83,7 @@ pub fn rope_cos_sin(
     head_dim: usize,
     positions: &[usize],
     device: &Device,
-) -> candle_core::Result<(Tensor, Tensor)> {
+) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let theta: Vec<f32> = (0..half)
         .map(|j| rope_theta.powf(-2.0 * j as f32 / head_dim as f32))
@@ -53,7 +102,7 @@ pub fn rope_cos_sin(
 // given cos/sin that broadcast against [..., n, head_dim / 2]. Because the
 // rotation is elementwise over the last dim, one call covers every head (and
 // every batch item) at once.
-pub fn rope_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+pub fn rope_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let half = x.dim(D::Minus1)? / 2;
     // Rotate-half pairing: dim i pairs with dim i + half, not its neighbor.
     let first = x.narrow(D::Minus1, 0, half)?;
@@ -68,12 +117,7 @@ pub fn rope_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result
 
 // Applies RoPE to `x` of shape [n, head_dim], one row per position given in
 // `positions` (same order as `x`'s rows).
-pub fn rope(
-    x: &Tensor,
-    rope_theta: f32,
-    device: &Device,
-    positions: &[usize],
-) -> candle_core::Result<Tensor> {
+pub fn rope(x: &Tensor, rope_theta: f32, device: &Device, positions: &[usize]) -> Result<Tensor> {
     let (_, head_dim) = x.dims2()?;
     let (cos, sin) = rope_cos_sin(rope_theta, head_dim, positions, device)?;
     rope_apply(x, &cos, &sin)
@@ -81,19 +125,32 @@ pub fn rope(
 
 // Looks up embedding rows for `token_ids` from `embedding_weight` ([vocab_size,
 // hidden_dim]), producing a [seq_len, hidden_dim] tensor.
-pub fn embed(
-    token_ids: &[u32],
-    embedding_weight: &Tensor,
-    device: &Device,
-) -> candle_core::Result<Tensor> {
+pub fn embed(token_ids: &[u32], embedding_weight: &Tensor, device: &Device) -> Result<Tensor> {
     // Wrap the ids so we can use them as row indices.
     let tokens_tensor = Tensor::from_slice(token_ids, token_ids.len(), device)?;
     // Pull out row `token_ids[i]` for each i - that row is that token's embedding.
     embedding_weight.index_select(&tokens_tensor, 0)
 }
 
+// y = x @ weight^T for x [..., in_features] and weight [out_features,
+// in_features] (candle Linear convention). Leading dims are flattened into one
+// 2D matmul, which candle runs on the transposed weight view directly. Do not
+// use `broadcast_matmul` here: it calls `.contiguous()` on the broadcast
+// weight, materializing a full transposed copy of it on every call, which
+// made decode ~96% memcpy.
+pub fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    let in_features = x.dim(D::Minus1)?;
+    let rows: usize = dims[..dims.len() - 1].iter().product();
+    let mut out_dims = dims.to_vec();
+    *out_dims.last_mut().unwrap() = weight.dim(0)?;
+    x.reshape((rows, in_features))?
+        .matmul(&weight.t()?)?
+        .reshape(out_dims)
+}
+
 // SwiGLU FFN: down(silu(gate(x)) * up(x)).
-// x: [seq_len, hidden_dim]
+// x: [..., hidden_dim]
 // gate_weight, up_weight: [ffn_dim, hidden_dim] (candle Linear convention: out_features x in_features)
 // down_weight: [hidden_dim, ffn_dim]
 pub fn swiglu_ffn(
@@ -101,137 +158,32 @@ pub fn swiglu_ffn(
     gate_weight: &Tensor,
     up_weight: &Tensor,
     down_weight: &Tensor,
-) -> candle_core::Result<Tensor> {
-    // Two parallel projections of the same input... (`broadcast_matmul` rather
-    // than `matmul` so this same function works whether x is 2D [seq_len,
-    // hidden_dim] or batched 3D [batch, seq_len, hidden_dim] - the 2D case
-    // needs no actual broadcasting so behavior is unchanged there.)
-    let gate = x.broadcast_matmul(&gate_weight.t()?)?;
-    let up = x.broadcast_matmul(&up_weight.t()?)?;
+) -> Result<Tensor> {
+    // Two parallel projections of the same input...
+    let gate = linear(x, gate_weight)?;
+    let up = linear(x, up_weight)?;
     // ...gate gets squashed through silu (a smooth "soft gate" nonlinearity)...
     let silu_gate = silu(&gate)?;
     // ...then used to scale up, elementwise - this is the "gating" in SwiGLU.
     let result = silu_gate.mul(&up)?;
     // Project back down to hidden_dim.
-    result.broadcast_matmul(&down_weight.t()?)
+    linear(&result, down_weight)
 }
 
-// Grouped-query causal attention.
-// q: [n_heads, seq_len, head_dim]     (RoPE already applied)
-// k: [n_kv_heads, seq_len, head_dim]  (RoPE already applied)
-// v: [n_kv_heads, seq_len, head_dim]
-// returns: [n_heads, seq_len, head_dim]
-pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, position_offset: usize) -> candle_core::Result<Tensor> {
-    let (_, q_seq_len, _) = q.dims3()?;
-    let (_, k_seq_len, _) = k.dims3()?;
-    let mask = causal_mask(q_seq_len, k_seq_len, position_offset, q.device())?;
-    gqa_attention_masked(q, k, v, &mask)
-}
-
-// Causal mask [q_len, k_len] for queries starting at `position_offset`: a
-// token at position i must not see future tokens (j > i), since at
-// generation time those tokens don't exist yet. -inf on those positions
-// forces softmax to assign them exactly 0 weight.
-pub fn causal_mask(
-    q_len: usize,
-    k_len: usize,
-    position_offset: usize,
-    device: &Device,
-) -> candle_core::Result<Tensor> {
-    let mut mask_data = vec![0f32; q_len * k_len];
-    for i in 0..q_len {
-        for j in (position_offset + i + 1)..k_len {
-            mask_data[i * k_len + j] = f32::NEG_INFINITY;
-        }
-    }
-    Tensor::from_vec(mask_data, (q_len, k_len), device)
-}
-
-// `gqa_attention` with the causal mask supplied by the caller (built once per
-// forward call rather than once per layer).
-pub fn gqa_attention_masked(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: &Tensor,
-) -> candle_core::Result<Tensor> {
-    let (n_heads, _q_seq_len, head_dim) = q.dims3()?;
-    let (n_kv_heads, k_seq_len, _) = k.dims3()?;
-
-    // GQA shares each KV head across several Q heads instead of 1:1 - this is
-    // how many Q heads point at the same KV head.
-    let group_size = n_heads / n_kv_heads;
-
-    // K/V only have n_kv_heads heads, but we need to compare against all
-    // n_heads Q heads. Duplicate each KV head group_size times, contiguously,
-    // so KV head j lines up with Q heads [j*group_size .. (j+1)*group_size).
-    let k_repeated = k
-        .unsqueeze(1)? // [n_kv_heads, 1, k_seq_len, head_dim]
-        .broadcast_as((n_kv_heads, group_size, k_seq_len, head_dim))?
-        .reshape((n_heads, k_seq_len, head_dim))?;
-
-    let v_repeated = v
-        .unsqueeze(1)?
-        .broadcast_as((n_kv_heads, group_size, k_seq_len, head_dim))?
-        .reshape((n_heads, k_seq_len, head_dim))?;
-
-    // Dot product of every query against every key gives a raw "how similar
-    // are these two vectors" score per (query position, key position) pair.
-    let dot_product_scores = q.matmul(&k_repeated.transpose(1, 2)?)?;
-    // Scaling by 1/sqrt(head_dim) keeps these scores from growing huge as
-    // head_dim increases, which would otherwise push softmax into saturating
-    // (near one-hot) outputs regardless of how similar the vectors really are.
-    let scaled_dot_product = dot_product_scores.affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
-
-    let scaled_dot_product = scaled_dot_product.broadcast_add(mask)?;
-
-    // Softmax turns each query's row of scores into a probability
-    // distribution over key positions - "how much attention to pay to each
-    // position," summing to 1.
-    let softmax_values = softmax(&scaled_dot_product, 2)?;
-    // Using those weights to blend the V vectors gives, for each query
-    // position, a weighted average of "what every position it attends to is
-    // saying" - this is attention's actual output.
-    softmax_values.matmul(&v_repeated)
-}
-
-// Batched grouped-query causal attention - one call covers every sequence in
-// a continuous-batching decode step, each with its own context length and
-// position. Unlike `gqa_attention`, `position_offset` and the KV context
-// length both vary per batch item, since sequences in the batch are at
-// different points in decoding.
-// q: [batch, n_heads, q_len, head_dim]        (RoPE already applied)
-// k, v: [batch, n_kv_heads, ctx_len, head_dim] (RoPE already applied; k/v are
-//   right-padded with zeros past each sequence's own real length up to
-//   ctx_len = max across the batch - `read_num_tokens` is what tells the mask
-//   where that padding starts for each sequence)
-// position_offset[b]: position of item b's first query row in its sequence
-// read_num_tokens[b]: item b's real (unpadded) context length
-// returns: [batch, n_heads, q_len, head_dim]
-pub fn gqa_attention_batch(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    position_offset: &[usize],
-    read_num_tokens: &[usize],
-) -> candle_core::Result<Tensor> {
-    let (_, _, q_len, _) = q.dims4()?;
-    let (_, _, ctx_len, _) = k.dims4()?;
-    let mask = batch_mask(position_offset, read_num_tokens, q_len, ctx_len, q.device())?;
-    gqa_attention_batch_masked(q, k, v, &mask)
-}
-
-// Per-batch-item mask [batch, 1, q_len, ctx_len]: causal within the
-// sequence's real tokens (as in `causal_mask`), and additionally -inf past
-// that sequence's own `read_num_tokens` - that's the batch-padding tail every
-// other sequence's longer context leaves behind for this one.
+// Per-batch-item attention mask [batch, 1, q_len, ctx_len]: causal within the
+// sequence's real tokens (a token at position i must not see future tokens
+// j > i, since at generation time those tokens don't exist yet), and
+// additionally masked past that sequence's own `read_num_tokens` - that's the
+// batch-padding tail every other sequence's longer context leaves behind for
+// this one. Masked positions get -inf so softmax assigns them exactly 0.
+// position_offset[b]: position of item b's first query row in its sequence.
 pub fn batch_mask(
     position_offset: &[usize],
     read_num_tokens: &[usize],
     q_len: usize,
     ctx_len: usize,
     device: &Device,
-) -> candle_core::Result<Tensor> {
+) -> Result<Tensor> {
     let batch = position_offset.len();
     let mut mask_data = vec![0f32; batch * q_len * ctx_len];
     for b in 0..batch {
@@ -248,452 +200,263 @@ pub fn batch_mask(
     Tensor::from_vec(mask_data, (batch, 1, q_len, ctx_len), device)
 }
 
-// `gqa_attention_batch` with the mask supplied by the caller.
-pub fn gqa_attention_batch_masked(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: &Tensor,
-) -> candle_core::Result<Tensor> {
-    let (batch, n_heads, _q_len, head_dim) = q.dims4()?;
+// Grouped-query attention over a batch, with a caller-supplied mask.
+// q: [batch, n_heads, q_len, head_dim]        (RoPE already applied)
+// k, v: [batch, n_kv_heads, ctx_len, head_dim] (k RoPE'd; right-padded past
+//   each sequence's real length, which `mask` rules out)
+// mask: [batch, 1, q_len, ctx_len], from `batch_mask`
+// returns: [batch, n_heads, q_len, head_dim]
+pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    let (batch, n_heads, q_len, head_dim) = q.dims4()?;
     let (_, n_kv_heads, ctx_len, _) = k.dims4()?;
+
+    // GQA shares each KV head across `group_size` consecutive Q heads. Rather
+    // than duplicating K and V group_size times to line up with every Q head
+    // (a full copy of the context per layer), fold the group into the query
+    // rows: Q heads [j*group_size .. (j+1)*group_size) all become extra query
+    // rows against KV head j, so K and V are read as-is.
     let group_size = n_heads / n_kv_heads;
+    let q = q
+        .contiguous()?
+        .reshape((batch, n_kv_heads, group_size * q_len, head_dim))?;
 
-    let k_repeated = k
-        .unsqueeze(2)? // [batch, n_kv_heads, 1, ctx_len, head_dim]
-        .broadcast_as((batch, n_kv_heads, group_size, ctx_len, head_dim))?
-        .reshape((batch, n_heads, ctx_len, head_dim))?;
-    let v_repeated = v
-        .unsqueeze(2)?
-        .broadcast_as((batch, n_kv_heads, group_size, ctx_len, head_dim))?
-        .reshape((batch, n_heads, ctx_len, head_dim))?;
+    // Dot product of every query against every key gives a raw "how similar
+    // are these two vectors" score per (query position, key position) pair.
+    let scores = q.matmul(&k.transpose(2, 3)?)?;
+    // Scaling by 1/sqrt(head_dim) keeps these scores from growing huge as
+    // head_dim increases, which would otherwise push softmax into saturating
+    // (near one-hot) outputs regardless of how similar the vectors really are.
+    let scores = scores.affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
 
-    let dot_product_scores = q.matmul(&k_repeated.transpose(2, 3)?)?;
-    let scaled_dot_product = dot_product_scores.affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
+    // Unfold the group to add the mask, which is the same for every head.
+    let scores = scores
+        .reshape((batch, n_kv_heads, group_size, q_len, ctx_len))?
+        .broadcast_add(&mask.unsqueeze(1)?)?;
 
-    let scaled_dot_product = scaled_dot_product.broadcast_add(mask)?;
-
-    let softmax_values = softmax(&scaled_dot_product, 3)?;
-    softmax_values.matmul(&v_repeated)
+    // Softmax turns each query's row of scores into a probability
+    // distribution over key positions - "how much attention to pay to each
+    // position," summing to 1.
+    let probs = softmax(&scores, D::Minus1)?;
+    // Using those weights to blend the V vectors gives, for each query
+    // position, a weighted average of "what every position it attends to is
+    // saying" - this is attention's actual output.
+    probs
+        .reshape((batch, n_kv_heads, group_size * q_len, ctx_len))?
+        .matmul(v)?
+        .reshape((batch, n_heads, q_len, head_dim))
 }
 
-// Everything that depends only on this forward call's positions and context
-// lengths, not on the layer: RoPE cos/sin and the attention mask. Built once
-// per call and shared by every layer instead of being rebuilt per layer/head.
+// One sequence's slice of a forward call: everything the model needs to know
+// about that sequence's tokens and cache bookkeeping. Prefill is a batch of
+// one item with many tokens; a decode step is one item per running sequence,
+// each with a single token. `tokens.len()` must be equal across the batch
+// (the query axis is not padded).
+pub struct BatchItem<'a> {
+    // This call's new tokens for the sequence.
+    pub tokens: &'a [u32],
+    // (block, slot) each new token's K/V is written to, one per token.
+    pub write_positions: &'a [(BlockID, usize)],
+    // The sequence's full block table.
+    pub read_blocks: &'a [BlockID],
+    // Real (unpadded) context length after this call's tokens are written.
+    pub read_num_tokens: usize,
+    // Position of the first new token within the sequence (drives RoPE and
+    // the causal mask).
+    pub position_offset: usize,
+}
+
+// Everything that depends only on this call's items, not on the layer: RoPE
+// cos/sin, the attention mask, the cache read plan and the flattened cache
+// write positions. Built once per call and shared by every layer instead of
+// being rebuilt per layer.
 pub struct StepCtx {
-    // Broadcast against [..., n, head_dim / 2]: [q_len, half] for a single
-    // sequence, [batch, 1, q_len, half] for a batch.
-    pub cos: Tensor,
-    pub sin: Tensor,
-    // [q_len, k_len] for a single sequence, [batch, 1, q_len, ctx_len] batched.
-    pub mask: Tensor,
+    // [batch, 1, q_len, head_dim / 2]
+    cos: Tensor,
+    sin: Tensor,
+    // [batch, 1, q_len, ctx_len]
+    mask: Tensor,
+    gather: GatherPlan,
+    // Every item's write positions, concatenated in (batch, q_len) row-major
+    // order to match the flattened K/V rows.
+    writes: Vec<(BlockID, usize)>,
 }
 
 impl StepCtx {
-    pub fn single(
-        rope_theta: f32,
-        head_dim: usize,
-        q_len: usize,
-        position_offset: usize,
-        k_len: usize,
-        device: &Device,
-    ) -> candle_core::Result<Self> {
-        let positions: Vec<usize> = (position_offset..position_offset + q_len).collect();
-        let (cos, sin) = rope_cos_sin(rope_theta, head_dim, &positions, device)?;
-        let mask = causal_mask(q_len, k_len, position_offset, device)?;
-        Ok(StepCtx { cos, sin, mask })
-    }
-
-    pub fn batch(
-        rope_theta: f32,
-        head_dim: usize,
-        items: &[BatchItem],
-        device: &Device,
-    ) -> candle_core::Result<Self> {
+    pub fn new(config: &Config, items: &[BatchItem], device: &Device) -> Result<Self> {
         let q_len = items[0].tokens.len();
-        let half = head_dim / 2;
+        debug_assert!(
+            items.iter().all(|item| item.tokens.len() == q_len),
+            "every item must contribute the same number of new tokens"
+        );
+        let head_dim = config.head_dim();
+
         // Every item is at its own position, so build per-row positions in
         // (batch, q_len) row-major order, then fold back to broadcast shape.
         let positions: Vec<usize> = items
             .iter()
             .flat_map(|item| item.position_offset..item.position_offset + q_len)
             .collect();
-        let (cos, sin) = rope_cos_sin(rope_theta, head_dim, &positions, device)?;
-        let cos = cos.reshape((items.len(), 1, q_len, half))?;
-        let sin = sin.reshape((items.len(), 1, q_len, half))?;
+        let (cos, sin) = rope_cos_sin(config.rope_theta, head_dim, &positions, device)?;
+        let rope_shape = (items.len(), 1, q_len, head_dim / 2);
+        let cos = cos.reshape(rope_shape)?;
+        let sin = sin.reshape(rope_shape)?;
+
+        let gather_items: Vec<(&[BlockID], usize)> = items
+            .iter()
+            .map(|item| (item.read_blocks, item.read_num_tokens))
+            .collect();
+        let gather = GatherPlan::new(&gather_items, device)?;
 
         let position_offsets: Vec<usize> = items.iter().map(|i| i.position_offset).collect();
         let read_num_tokens: Vec<usize> = items.iter().map(|i| i.read_num_tokens).collect();
-        let ctx_len = read_num_tokens.iter().copied().max().unwrap_or(0);
-        let mask = batch_mask(&position_offsets, &read_num_tokens, q_len, ctx_len, device)?;
-        Ok(StepCtx { cos, sin, mask })
+        let mask = batch_mask(&position_offsets, &read_num_tokens, q_len, gather.ctx_len(), device)?;
+
+        let writes = items
+            .iter()
+            .flat_map(|item| item.write_positions.iter().copied())
+            .collect();
+        Ok(StepCtx { cos, sin, mask, gather, writes })
     }
 }
 
-// One Llama transformer block:
-//   h   = x + attention(rms_norm(x, attn_norm_weight)) // aka residual
-//   out = h + swiglu_ffn(rms_norm(h, ffn_norm_weight))
-//
-// x: [seq_len, hidden_dim]
-// attn_q_weight: [n_heads*head_dim, hidden_dim], attn_k/v_weight: [n_kv_heads*head_dim, hidden_dim]
-// attn_output_weight: [hidden_dim, n_heads*head_dim]
-// ffn_gate/up_weight: [ffn_dim, hidden_dim], ffn_down_weight: [hidden_dim, ffn_dim]
-// returns: [seq_len, hidden_dim]
-#[allow(clippy::too_many_arguments)]
-pub fn transformer_block(
-    x: &Tensor,
-    attn_norm_weight: &Tensor,
-    attn_q_weight: &Tensor,
-    attn_k_weight: &Tensor,
-    attn_v_weight: &Tensor,
-    attn_output_weight: &Tensor,
-    ffn_norm_weight: &Tensor,
-    ffn_gate_weight: &Tensor,
-    ffn_up_weight: &Tensor,
-    ffn_down_weight: &Tensor,
-    n_heads: usize,
-    n_kv_heads: usize,
-    eps: f32,
-    ctx: &StepCtx, // RoPE cos/sin + causal mask for this call's positions
-    kv_storage: &mut KvStorage,
-    layer: usize,
-    write_positions: &[(BlockID, usize)], // one per token in this call
-    read_blocks: &[BlockID],              // full logical block list for this sequence
-    read_num_tokens: usize,               // trims gather's tail past the real seq len
-) -> candle_core::Result<Tensor> {
-    // Normalize before attention (pre-norm), not after - this is the
-    // convention Llama uses, and it's what keeps deep stacks of these blocks
-    // stable to train/run.
-    let normed = rms_norm(x, attn_norm_weight, eps)?;
+impl Layer {
+    // One Llama transformer block:
+    //   h   = x + attention(rms_norm(x, attn_norm)) // aka residual
+    //   out = h + swiglu_ffn(rms_norm(h, ffn_norm))
+    // x: [batch, q_len, hidden_dim]; returns the same shape.
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        config: &Config,
+        ctx: &StepCtx,
+        kv_storage: &mut KvStorage,
+    ) -> Result<Tensor> {
+        let (batch, q_len, _) = x.dims3()?;
+        let n_heads = config.n_heads as usize;
+        let n_kv_heads = config.n_kv_heads as usize;
+        let head_dim = config.head_dim();
 
-    // Project into query/key/value space. Q gets n_heads worth of output,
-    // K/V get fewer (n_kv_heads) since GQA shares them across several Q heads.
-    let q = normed.matmul(&attn_q_weight.t()?)?;
-    let k = normed.matmul(&attn_k_weight.t()?)?;
-    let v = normed.matmul(&attn_v_weight.t()?)?;
-    let (seq_len, hidden_dim) = x.dims2()?;
-    let head_dim = hidden_dim / n_heads;
+        // Normalize before attention (pre-norm), not after - this is the
+        // convention Llama uses, and it's what keeps deep stacks of these
+        // blocks stable to train/run.
+        let normed = rms_norm(x, &self.attn_norm, config.rms_eps)?;
 
-    // Split the projected dim into per-head chunks and move the head axis to
-    // the front - gqa_attention expects [n_heads, seq_len, head_dim], not one
-    // big [seq_len, n_heads*head_dim] blob.
-    let q = q.reshape((seq_len, n_heads, head_dim))?.transpose(0, 1)?;
-    let k = k
-        .reshape((seq_len, n_kv_heads, head_dim))?
-        .transpose(0, 1)?;
-    let v = v
-        .reshape((seq_len, n_kv_heads, head_dim))?
-        .transpose(0, 1)?;
+        // Project into query/key/value space. Q gets n_heads worth of output,
+        // K/V get fewer (n_kv_heads) since GQA shares them across several Q
+        // heads. Then split the projected dim into per-head chunks and move
+        // the head axis in front of the sequence axis:
+        // [batch, q_len, heads * head_dim] -> [batch, heads, q_len, head_dim].
+        let q = linear(&normed, &self.attn_q)?
+            .reshape((batch, q_len, n_heads, head_dim))?
+            .transpose(1, 2)?;
+        let k = linear(&normed, &self.attn_k)?
+            .reshape((batch, q_len, n_kv_heads, head_dim))?
+            .transpose(1, 2)?;
+        let v = linear(&normed, &self.attn_v)?
+            .reshape((batch, q_len, n_kv_heads, head_dim))?
+            .transpose(1, 2)?;
 
-    // RoPE rotates every head identically given the position, so one call
-    // per tensor covers all heads. Only Q and K get rotated - V carries
-    // content, not position.
-    let q_roped = rope_apply(&q, &ctx.cos, &ctx.sin)?;
-    let k_roped = rope_apply(&k, &ctx.cos, &ctx.sin)?;
+        // RoPE rotates every head identically given the position, so one call
+        // per tensor covers all heads. Only Q and K get rotated - V carries
+        // content, not position.
+        let q = rope_apply(&q, &ctx.cos, &ctx.sin)?;
+        let k = rope_apply(&k, &ctx.cos, &ctx.sin)?;
 
-    // Write this call's tokens into their block slots. k_roped/v are
-    // [n_kv_heads, seq_len, head_dim]; the cache wants token-major rows, in
-    // the same order as write_positions.
-    kv_storage.write_tokens(
-        layer,
-        write_positions,
-        &k_roped.transpose(0, 1)?.contiguous()?,
-        &v.transpose(0, 1)?.contiguous()?,
-    )?;
-    // Gather the full cached K/V for this sequence (trimmed to its real
-    // length) and attend against it.
-    let (k_full, v_full) = kv_storage.gather(layer, read_blocks, read_num_tokens)?;
-    let mut attn_out = gqa_attention_masked(&q_roped, &k_full, &v_full, &ctx.mask)?;
-
-    // Merge the heads back into one dimension - inverse of the earlier split.
-    attn_out = attn_out
-        .transpose(0, 1)?
-        .reshape((seq_len, n_heads * head_dim))?;
-
-    // Project attention's output back down to hidden_dim so it can be added
-    // to the residual stream.
-    attn_out = attn_out.matmul(&attn_output_weight.t()?)?;
-
-    // Residual connection: the block adds *to* x rather than replacing it,
-    // so gradients (and, at inference time, information) can flow straight
-    // through even if attention contributes very little.
-    let h = x.add(&attn_out)?;
-
-    // Same pre-norm pattern before the FFN half of the block.
-    let normed2 = rms_norm(&h, ffn_norm_weight, eps)?;
-    let ffn_out = swiglu_ffn(&normed2, ffn_gate_weight, ffn_up_weight, ffn_down_weight)?;
-
-    // Second residual connection - this is the block's output.
-    h.add(&ffn_out)
-}
-
-// Embed -> N x transformer_block; returns the final hidden states
-// [seq_len, hidden_dim], before the final norm and LM head.
-#[allow(clippy::too_many_arguments)]
-fn forward_hidden(
-    config: &SmollLM230MConfig,
-    token_ids: &[u32],
-    device: &Device,
-    kv_storage: &mut KvStorage,
-    write_positions: &[(BlockID, usize)],
-    read_blocks: &[BlockID],
-    read_num_tokens: usize,
-    position_offset: usize,
-) -> candle_core::Result<Tensor> {
-    // Turn token ids into vectors.
-    let mut x = embed(token_ids, &config.tensors["token_embd.weight"], device)?;
-    let head_dim = (config.hidden_dim / config.n_heads) as usize;
-    let ctx = StepCtx::single(
-        config.rope_theta,
-        head_dim,
-        token_ids.len(),
-        position_offset,
-        read_num_tokens,
-        device,
-    )?;
-    // Run through every layer in sequence, each one refining x a bit more.
-    // Pulling weights straight out of the tensor map by the same key strings
-    // weights.rs used when loading them.
-    for i in 0..config.n_layers {
-        x = transformer_block(
-            &x,
-            &config.tensors[&format!("blk.{i}.attn_norm.weight")],
-            &config.tensors[&format!("blk.{i}.attn_q.weight")],
-            &config.tensors[&format!("blk.{i}.attn_k.weight")],
-            &config.tensors[&format!("blk.{i}.attn_v.weight")],
-            &config.tensors[&format!("blk.{i}.attn_output.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_norm.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_gate.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_up.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_down.weight")],
-            config.n_heads as usize,
-            config.n_kv_heads as usize,
-            config.rms_eps,
-            &ctx,
-            kv_storage,
-            i as usize,
-            write_positions,
-            read_blocks,
-            read_num_tokens,
+        // Write this call's tokens into their block slots. The cache wants
+        // token-major rows: [batch * q_len, n_kv_heads, head_dim].
+        kv_storage.write_tokens(
+            self.index,
+            &ctx.writes,
+            &k.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
+            &v.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
         )?;
+        // Read back every sequence's full cached K/V (padded to the batch's
+        // longest context) and attend against it.
+        let (k_full, v_full) = kv_storage.gather(self.index, &ctx.gather)?;
+        let attn_out = gqa_attention(&q, &k_full, &v_full, &ctx.mask)?;
+
+        // Merge the heads back into one dimension - inverse of the earlier
+        // split - and project down to hidden_dim so it can be added to the
+        // residual stream.
+        let attn_out = attn_out
+            .transpose(1, 2)?
+            .reshape((batch, q_len, n_heads * head_dim))?;
+        let attn_out = linear(&attn_out, &self.attn_output)?;
+
+        // Residual connection: the block adds *to* x rather than replacing it,
+        // so gradients (and, at inference time, information) can flow straight
+        // through even if attention contributes very little.
+        let h = x.add(&attn_out)?;
+
+        // Same pre-norm pattern before the FFN half of the block.
+        let normed2 = rms_norm(&h, &self.ffn_norm, config.rms_eps)?;
+        let ffn_out = swiglu_ffn(&normed2, &self.ffn_gate, &self.ffn_up, &self.ffn_down)?;
+
+        // Second residual connection - this is the block's output.
+        h.add(&ffn_out)
     }
-    Ok(x)
 }
 
-// One final norm after the last layer, then project to vocab-sized logits.
-fn lm_head(config: &SmollLM230MConfig, x: &Tensor) -> candle_core::Result<Tensor> {
-    let normed = rms_norm(x, &config.tensors["output_norm.weight"], config.rms_eps)?;
-    normed.broadcast_matmul(&config.tensors["output.weight"].t()?)
-}
-
-// Full forward pass: embed(tokens) -> N x transformer_block -> final norm -> LM head.
-// token_ids: input sequence. Returns logits, [seq_len, vocab_size].
-#[allow(clippy::too_many_arguments)]
-pub fn forward(
-    config: &SmollLM230MConfig,
-    token_ids: &[u32],
-    device: &Device,
-    kv_storage: &mut KvStorage,
-    write_positions: &[(BlockID, usize)],
-    read_blocks: &[BlockID],
-    read_num_tokens: usize,
-    position_offset: usize,
-) -> candle_core::Result<Tensor> {
-    let x = forward_hidden(
-        config,
-        token_ids,
-        device,
-        kv_storage,
-        write_positions,
-        read_blocks,
-        read_num_tokens,
-        position_offset,
-    )?;
-    lm_head(config, &x)
-}
-
-// Same as `forward`, but only projects the *last* row to logits ([1,
-// vocab_size]). Prefill only samples from the final position, so running the
-// vocab-sized LM head over every prompt row is wasted work - RMSNorm is
-// row-wise, so narrowing before the norm and head gives the same last row.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_last(
-    config: &SmollLM230MConfig,
-    token_ids: &[u32],
-    device: &Device,
-    kv_storage: &mut KvStorage,
-    write_positions: &[(BlockID, usize)],
-    read_blocks: &[BlockID],
-    read_num_tokens: usize,
-    position_offset: usize,
-) -> candle_core::Result<Tensor> {
-    let x = forward_hidden(
-        config,
-        token_ids,
-        device,
-        kv_storage,
-        write_positions,
-        read_blocks,
-        read_num_tokens,
-        position_offset,
-    )?;
-    let last = x.narrow(0, x.dim(0)? - 1, 1)?;
-    lm_head(config, &last)
-}
-
-// One sequence's slice of a batched forward call - everything `forward_batch`
-// needs to know about that sequence's cache bookkeeping. `tokens` is this
-// call's new tokens for that sequence (in continuous batching that's always
-// exactly one decode token per sequence, so every item's `tokens.len()` is
-// equal across the batch - `forward_batch` assumes this, it does not pad the
-// query axis).
-pub struct BatchItem<'a> {
-    pub tokens: &'a [u32],
-    pub write_positions: &'a [(BlockID, usize)],
-    pub read_blocks: &'a [BlockID],
-    pub read_num_tokens: usize,
-    pub position_offset: usize,
-}
-
-// Batched version of `transformer_block`: runs `items.len()` sequences
-// through one block in a single call, each keeping its own KV blocks and
-// context length. x: [batch, q_len, hidden_dim]; returns the same shape.
-#[allow(clippy::too_many_arguments)]
-pub fn transformer_block_batch(
-    x: &Tensor,
-    attn_norm_weight: &Tensor,
-    attn_q_weight: &Tensor,
-    attn_k_weight: &Tensor,
-    attn_v_weight: &Tensor,
-    attn_output_weight: &Tensor,
-    ffn_norm_weight: &Tensor,
-    ffn_gate_weight: &Tensor,
-    ffn_up_weight: &Tensor,
-    ffn_down_weight: &Tensor,
-    n_heads: usize,
-    n_kv_heads: usize,
-    eps: f32,
-    ctx: &StepCtx, // RoPE cos/sin + batch mask for this call
-    kv_storage: &mut KvStorage,
-    layer: usize,
-    items: &[BatchItem],
-) -> candle_core::Result<Tensor> {
-    let normed = rms_norm(x, attn_norm_weight, eps)?;
-
-    let q = normed.broadcast_matmul(&attn_q_weight.t()?)?;
-    let k = normed.broadcast_matmul(&attn_k_weight.t()?)?;
-    let v = normed.broadcast_matmul(&attn_v_weight.t()?)?;
-
-    let (batch, q_len, hidden_dim) = x.dims3()?;
-    let head_dim = hidden_dim / n_heads;
-
-    // [batch, q_len, n_heads, head_dim] -> [batch, n_heads, q_len, head_dim].
-    let q = q.reshape((batch, q_len, n_heads, head_dim))?.transpose(1, 2)?;
-    let k = k
-        .reshape((batch, q_len, n_kv_heads, head_dim))?
-        .transpose(1, 2)?;
-    let v = v
-        .reshape((batch, q_len, n_kv_heads, head_dim))?
-        .transpose(1, 2)?;
-
-    // Each item's cos/sin was built for its own position in `StepCtx::batch`;
-    // one call rotates every head of every item.
-    let q_roped = rope_apply(&q, &ctx.cos, &ctx.sin)?; // [batch, n_heads, q_len, head_dim]
-    let k_roped = rope_apply(&k, &ctx.cos, &ctx.sin)?; // [batch, n_kv_heads, q_len, head_dim]
-
-    // Write each item's new tokens into its own cache blocks. Flattening in
-    // (batch, q_len) row-major order matches the order of the concatenated
-    // per-item write_positions.
-    let flat_writes: Vec<(BlockID, usize)> = items
-        .iter()
-        .flat_map(|item| item.write_positions.iter().copied())
-        .collect();
-    kv_storage.write_tokens(
-        layer,
-        &flat_writes,
-        &k_roped.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
-        &v.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
-    )?;
-
-    // Gather every item's full cached K/V (padded to the batch's longest
-    // context) and attend against it.
-    let gather_items: Vec<(&[BlockID], usize)> = items
-        .iter()
-        .map(|item| (item.read_blocks, item.read_num_tokens))
-        .collect();
-    let (k_full, v_full, _ctx_len) = kv_storage.gather_batch(layer, &gather_items)?;
-
-    let mut attn_out = gqa_attention_batch_masked(&q_roped, &k_full, &v_full, &ctx.mask)?;
-
-    // Merge the heads back into one dimension - inverse of the earlier split.
-    attn_out = attn_out
-        .transpose(1, 2)?
-        .reshape((batch, q_len, n_heads * head_dim))?;
-
-    attn_out = attn_out.broadcast_matmul(&attn_output_weight.t()?)?;
-
-    let h = x.add(&attn_out)?;
-
-    let normed2 = rms_norm(&h, ffn_norm_weight, eps)?;
-    let ffn_out = swiglu_ffn(&normed2, ffn_gate_weight, ffn_up_weight, ffn_down_weight)?;
-
-    h.add(&ffn_out)
-}
-
-// Batched version of `forward`: runs `items.len()` sequences through the
-// whole model in one call, sharing the same layer weights but each keeping
-// its own KV cache blocks and position. Every item must contribute the same
-// number of new tokens (continuous batching's decode step: exactly one each).
-// Returns logits, [batch, q_len, vocab_size].
-pub fn forward_batch(
-    config: &SmollLM230MConfig,
-    items: &[BatchItem],
-    device: &Device,
-    kv_storage: &mut KvStorage,
-) -> candle_core::Result<Tensor> {
-    let q_len = items[0].tokens.len();
-    debug_assert!(
-        items.iter().all(|item| item.tokens.len() == q_len),
-        "forward_batch requires every item to contribute the same number of new tokens"
-    );
-
-    let flat_tokens: Vec<u32> = items.iter().flat_map(|item| item.tokens.iter().copied()).collect();
-    let mut x = embed(&flat_tokens, &config.tensors["token_embd.weight"], device)?;
-    x = x.reshape((items.len(), q_len, config.hidden_dim as usize))?;
-    let head_dim = (config.hidden_dim / config.n_heads) as usize;
-    let ctx = StepCtx::batch(config.rope_theta, head_dim, items, device)?;
-
-    for i in 0..config.n_layers {
-        x = transformer_block_batch(
-            &x,
-            &config.tensors[&format!("blk.{i}.attn_norm.weight")],
-            &config.tensors[&format!("blk.{i}.attn_q.weight")],
-            &config.tensors[&format!("blk.{i}.attn_k.weight")],
-            &config.tensors[&format!("blk.{i}.attn_v.weight")],
-            &config.tensors[&format!("blk.{i}.attn_output.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_norm.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_gate.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_up.weight")],
-            &config.tensors[&format!("blk.{i}.ffn_down.weight")],
-            config.n_heads as usize,
-            config.n_kv_heads as usize,
-            config.rms_eps,
-            &ctx,
-            kv_storage,
-            i as usize,
-            items,
-        )?;
+impl Model {
+    pub fn device(&self) -> &Device {
+        self.token_embd.device()
     }
 
-    let normed = rms_norm(&x, &config.tensors["output_norm.weight"], config.rms_eps)?;
-    normed.broadcast_matmul(&config.tensors["output.weight"].t()?)
+    // Embed -> N x Layer -> final hidden states [batch, q_len, hidden_dim],
+    // before the final norm and LM head.
+    fn hidden(&self, items: &[BatchItem], kv_storage: &mut KvStorage) -> Result<Tensor> {
+        let q_len = items[0].tokens.len();
+        let device = self.device();
+
+        // Turn token ids into vectors, in (batch, q_len) row-major order.
+        let flat_tokens: Vec<u32> =
+            items.iter().flat_map(|item| item.tokens.iter().copied()).collect();
+        let mut x = embed(&flat_tokens, &self.token_embd, device)?.reshape((
+            items.len(),
+            q_len,
+            self.config.hidden_dim as usize,
+        ))?;
+
+        let ctx = StepCtx::new(&self.config, items, device)?;
+        // Run through every layer in sequence, each one refining x a bit more.
+        for layer in &self.layers {
+            x = layer.forward(&x, &self.config, &ctx, kv_storage)?;
+        }
+        Ok(x)
+    }
+
+    // One final norm after the last layer, then project to vocab-sized logits.
+    fn lm_head(&self, x: &Tensor) -> Result<Tensor> {
+        let normed = rms_norm(x, &self.output_norm, self.config.rms_eps)?;
+        linear(&normed, &self.output)
+    }
+
+    // Full forward pass over a batch: returns logits, [batch, q_len, vocab_size].
+    pub fn forward(&self, items: &[BatchItem], kv_storage: &mut KvStorage) -> Result<Tensor> {
+        let x = self.hidden(items, kv_storage)?;
+        self.lm_head(&x)
+    }
+
+    // Same, but only projects each item's *last* row to logits:
+    // [batch, 1, vocab_size]. Prefill only samples from the final position, so
+    // running the vocab-sized LM head over every prompt row is wasted work.
+    // RMSNorm is row-wise, so narrowing before the norm and head gives the
+    // same last row.
+    pub fn forward_last(&self, items: &[BatchItem], kv_storage: &mut KvStorage) -> Result<Tensor> {
+        let x = self.hidden(items, kv_storage)?;
+        let last = x.narrow(1, x.dim(1)? - 1, 1)?;
+        self.lm_head(&last)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
-    use kv_cache_scheduler::block_pool::BlockID;
+    use candle_core::DType;
+
+    fn flat(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1().unwrap()
+    }
 
     #[test]
     fn rms_norm_hand_computed() {
@@ -789,16 +552,30 @@ mod tests {
     }
 
     #[test]
+    fn linear_matches_manual_matmul_for_2d_and_3d_input() {
+        let device = Device::Cpu;
+        // weight [out=2, in=3]; y = x @ weight^T.
+        let w = Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6.], (2, 3), &device).unwrap();
+        let x = Tensor::from_vec(vec![1f32, 0., 1., 0., 1., 0.], (2, 3), &device).unwrap();
+        // row0 = [1+3, 4+6] = [4, 10]; row1 = [2, 5]
+        assert_eq!(flat(&linear(&x, &w).unwrap()), [4., 10., 2., 5.]);
+        let x3 = x.reshape((1, 2, 3)).unwrap();
+        let y3 = linear(&x3, &w).unwrap();
+        assert_eq!(y3.dims(), &[1, 2, 2]);
+        assert_eq!(flat(&y3), [4., 10., 2., 5.]);
+    }
+
+    #[test]
     fn gqa_attention_hand_computed() {
         let device = Device::Cpu;
         // n_heads=2, n_kv_heads=1 (group_size=2, both Q heads share the one KV head),
-        // seq_len=2, head_dim=2.
+        // seq_len=2, head_dim=2, batch=1.
 
         // K (1 kv head): position0=[1,0], position1=[0,1]
-        let k = Tensor::from_vec(vec![1f32, 0., 0., 1.], (1, 2, 2), &device).unwrap();
+        let k = Tensor::from_vec(vec![1f32, 0., 0., 1.], (1, 1, 2, 2), &device).unwrap();
         // V (1 kv head): position0=[10,0], position1=[0,20] - distinct so we can
         // see which position's value dominates the weighted sum.
-        let v = Tensor::from_vec(vec![10f32, 0., 0., 20.], (1, 2, 2), &device).unwrap();
+        let v = Tensor::from_vec(vec![10f32, 0., 0., 20.], (1, 1, 2, 2), &device).unwrap();
 
         // Q head0: every position queries [1,0] (aligns with K's position0 direction)
         // Q head1: every position queries [0,1] (aligns with K's position1 direction)
@@ -807,13 +584,13 @@ mod tests {
                 1f32, 0., 1., 0., // head0: pos0=[1,0], pos1=[1,0]
                 0., 1., 0., 1., // head1: pos0=[0,1], pos1=[0,1]
             ],
-            (2, 2, 2),
+            (1, 2, 2, 2),
             &device,
         )
         .unwrap();
 
-        let out = gqa_attention(&q, &k, &v, 0).unwrap();
-       let out: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        let mask = batch_mask(&[0], &[2], 2, 2, &device).unwrap();
+        let out = flat(&gqa_attention(&q, &k, &v, &mask).unwrap());
 
         // Causal mask means position0 can only attend to position0, so its
         // output is always exactly V[0] regardless of head. Position1 attends
@@ -834,428 +611,238 @@ mod tests {
         }
     }
 
+    // Naive per-head reference: attention for one (batch item, Q head) using
+    // 2D ops only, with the KV head picked by index instead of by reshaping.
+    fn naive_head(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor, b: usize, h: usize, group: usize) -> Vec<f32> {
+        let head_dim = q.dim(3).unwrap();
+        let q_h = q.get(b).unwrap().get(h).unwrap(); // [q_len, head_dim]
+        let k_h = k.get(b).unwrap().get(h / group).unwrap(); // [ctx, head_dim]
+        let v_h = v.get(b).unwrap().get(h / group).unwrap();
+        let m = mask.get(b).unwrap().get(0).unwrap(); // [q_len, ctx]
+        let scores = q_h
+            .matmul(&k_h.t().unwrap())
+            .unwrap()
+            .affine(1.0 / (head_dim as f64).sqrt(), 0.0)
+            .unwrap()
+            .add(&m)
+            .unwrap();
+        flat(&softmax(&scores, 1).unwrap().matmul(&v_h).unwrap())
+    }
+
     #[test]
-    fn transformer_block_preserves_shape_and_changes_input() {
+    fn gqa_attention_matches_naive_per_head_reference() {
         let device = Device::Cpu;
-        // hidden_dim=4, n_heads=2, n_kv_heads=1, head_dim=2, ffn_dim=4, seq_len=2.
-        // This isn't a hand-computed correctness test (RMSNorm, RoPE, GQA
-        // attention, and SwiGLU are already individually verified above) - it's
-        // a wiring/shape smoke test to catch mistakes in the reshape/transpose
-        // steps that stitch those pieces together.
-        let seq_len = 2;
-        let hidden_dim = 4;
-        let n_heads = 2;
-        let n_kv_heads = 1;
-        let ffn_dim = 4;
+        // 2 sequences of different real lengths (5 and 3, padded to ctx 5),
+        // 4 Q heads over 2 KV heads (group_size 2), q_len 2 at offsets 3 and 1.
+        let (batch, n_heads, n_kv_heads, q_len, ctx_len, head_dim) = (2, 4, 2, 2, 5, 4);
+        let q = Tensor::randn(0f32, 1., (batch, n_heads, q_len, head_dim), &device).unwrap();
+        let k = Tensor::randn(0f32, 1., (batch, n_kv_heads, ctx_len, head_dim), &device).unwrap();
+        let v = Tensor::randn(0f32, 1., (batch, n_kv_heads, ctx_len, head_dim), &device).unwrap();
+        let mask = batch_mask(&[3, 1], &[5, 3], q_len, ctx_len, &device).unwrap();
 
-        let x = Tensor::from_vec(
-            vec![1f32, 2., 3., 4., 5., 6., 7., 8.],
-            (seq_len, hidden_dim),
-            &device,
-        )
-        .unwrap();
+        let out = gqa_attention(&q, &k, &v, &mask).unwrap();
+        assert_eq!(out.dims(), &[batch, n_heads, q_len, head_dim]);
 
-        let attn_norm_weight = Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap();
-        let ffn_norm_weight = Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap();
+        let group = n_heads / n_kv_heads;
+        for b in 0..batch {
+            for h in 0..n_heads {
+                let want = naive_head(&q, &k, &v, &mask, b, h, group);
+                let got = flat(&out.get(b).unwrap().get(h).unwrap());
+                for (g, w) in got.iter().zip(&want) {
+                    assert!((g - w).abs() < 1e-5, "b={b} h={h}: got {g}, want {w}");
+                }
+            }
+        }
+    }
 
-        // Non-identity but simple weights, just to exercise real matmuls.
-        let attn_q_weight = Tensor::rand(0f32, 1., (n_heads * 2, hidden_dim), &device).unwrap(); // head_dim=2
-        let attn_k_weight = Tensor::rand(0f32, 1., (n_kv_heads * 2, hidden_dim), &device).unwrap();
-        let attn_v_weight = Tensor::rand(0f32, 1., (n_kv_heads * 2, hidden_dim), &device).unwrap();
-        let attn_output_weight =
-            Tensor::rand(0f32, 1., (hidden_dim, n_heads * 2), &device).unwrap();
+    // Tiny fake model: 1 layer, hidden_dim=4, n_heads=2, n_kv_heads=1
+    // (head_dim=2), ffn_dim=4, vocab_size=5. Random weights: these tests check
+    // wiring and consistency between paths, not absolute values (each piece's
+    // math is verified individually above).
+    fn tiny_model() -> Model {
+        let device = Device::Cpu;
+        let (hidden_dim, n_heads, n_kv_heads, ffn_dim, vocab_size) = (4usize, 2usize, 1usize, 4usize, 5usize);
+        let head_dim = hidden_dim / n_heads;
+        let rand = |shape: (usize, usize)| Tensor::rand(0f32, 1., shape, &device).unwrap();
+        let ones = || Tensor::ones(hidden_dim, DType::F32, &device).unwrap();
 
-        let ffn_gate_weight = Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap();
-        let ffn_up_weight = Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap();
-        let ffn_down_weight = Tensor::rand(0f32, 1., (hidden_dim, ffn_dim), &device).unwrap();
-        // One block, big enough to hold both tokens of this call.
-        let mut kv_storage = KvStorage::new(1, 1, seq_len, n_kv_heads, 2, &device).unwrap();
-        let write_positions: Vec<(BlockID, usize)> =
-            (0..seq_len).map(|i| (BlockID(0), i)).collect();
-        let read_blocks = [BlockID(0)];
-        let ctx = StepCtx::single(10000.0, 2, seq_len, 0, seq_len, &device).unwrap();
-        let out = transformer_block(
-            &x,
-            &attn_norm_weight,
-            &attn_q_weight,
-            &attn_k_weight,
-            &attn_v_weight,
-            &attn_output_weight,
-            &ffn_norm_weight,
-            &ffn_gate_weight,
-            &ffn_up_weight,
-            &ffn_down_weight,
-            n_heads,
-            n_kv_heads,
-            1e-5,
-            &ctx,
-            &mut kv_storage,
-            0,
-            &write_positions,
-            &read_blocks,
-            seq_len,
-        )
-        .unwrap();
+        let token_embd = rand((vocab_size, hidden_dim));
+        let layer = Layer {
+            index: 0,
+            attn_norm: ones(),
+            attn_q: rand((n_heads * head_dim, hidden_dim)),
+            attn_k: rand((n_kv_heads * head_dim, hidden_dim)),
+            attn_v: rand((n_kv_heads * head_dim, hidden_dim)),
+            attn_output: rand((hidden_dim, n_heads * head_dim)),
+            ffn_norm: ones(),
+            ffn_gate: rand((ffn_dim, hidden_dim)),
+            ffn_up: rand((ffn_dim, hidden_dim)),
+            ffn_down: rand((hidden_dim, ffn_dim)),
+        };
+        Model {
+            config: Config {
+                n_layers: 1,
+                n_heads: n_heads as u32,
+                n_kv_heads: n_kv_heads as u32,
+                hidden_dim: hidden_dim as u32,
+                ffn_dim: ffn_dim as u32,
+                rope_theta: 10000.0,
+                rms_eps: 1e-5,
+                vocab_size: vocab_size as u32,
+                context_length: 8,
+                eos_token_id: 99,
+                bos_token_id: 0,
+            },
+            token_embd,
+            layers: vec![layer],
+            output_norm: ones(),
+            output: rand((vocab_size, hidden_dim)),
+        }
+    }
 
-        assert_eq!(out.dims(), &[seq_len, hidden_dim]);
+    // Prefill-shaped item for a sequence living in `blocks` (block_size slots
+    // each), covering `tokens` from position `offset`.
+    fn item<'a>(
+        tokens: &'a [u32],
+        offset: usize,
+        blocks: &'a [BlockID],
+        block_size: usize,
+        writes: &'a mut Vec<(BlockID, usize)>,
+    ) -> BatchItem<'a> {
+        *writes = (offset..offset + tokens.len())
+            .map(|p| (blocks[p / block_size], p % block_size))
+            .collect();
+        BatchItem {
+            tokens,
+            write_positions: writes,
+            read_blocks: blocks,
+            read_num_tokens: offset + tokens.len(),
+            position_offset: offset,
+        }
+    }
 
-        let out_vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
-        let in_vals: Vec<f32> = x.flatten_all().unwrap().to_vec1().unwrap();
-        assert_ne!(
-            out_vals, in_vals,
-            "block should transform its input, not pass it through unchanged"
-        );
+    #[test]
+    fn layer_forward_preserves_shape_and_changes_input() {
+        let device = Device::Cpu;
+        let model = tiny_model();
+        let mut kv = KvStorage::new(1, 1, 2, 1, 2, &device).unwrap();
+        let blocks = [BlockID(0)];
+        let mut writes = Vec::new();
+        let items = [item(&[0, 2], 0, &blocks, 2, &mut writes)];
+        let ctx = StepCtx::new(&model.config, &items, &device).unwrap();
+
+        let x = Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6., 7., 8.], (1, 2, 4), &device).unwrap();
+        let out = model.layers[0].forward(&x, &model.config, &ctx, &mut kv).unwrap();
+
+        assert_eq!(out.dims(), &[1, 2, 4]);
+        assert_ne!(flat(&out), flat(&x), "block should transform its input");
     }
 
     #[test]
     fn forward_produces_logits_of_expected_shape() {
-        use crate::weights::SmollLM230MConfig;
-        use std::collections::HashMap;
-
         let device = Device::Cpu;
-        // Tiny fake model: 1 layer, hidden_dim=4, n_heads=2, n_kv_heads=1
-        // (head_dim=2), ffn_dim=4, vocab_size=5. Same rationale as the
-        // transformer_block smoke test: this only checks wiring/shapes, since
-        // the math inside each piece is already verified above.
-        let hidden_dim = 4usize;
-        let n_heads = 2usize;
-        let n_kv_heads = 1usize;
-        let head_dim = hidden_dim / n_heads;
-        let ffn_dim = 4usize;
-        let vocab_size = 5usize;
+        let model = tiny_model();
+        let mut kv = KvStorage::new(1, 1, 2, 1, 2, &device).unwrap();
+        let blocks = [BlockID(0)];
+        let mut writes = Vec::new();
+        let items = [item(&[0, 2], 0, &blocks, 2, &mut writes)];
 
-        let mut tensors = HashMap::new();
-        tensors.insert(
-            "token_embd.weight".to_string(),
-            Tensor::rand(0f32, 1., (vocab_size, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_norm.weight".to_string(),
-            Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_q.weight".to_string(),
-            Tensor::rand(0f32, 1., (n_heads * head_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_k.weight".to_string(),
-            Tensor::rand(0f32, 1., (n_kv_heads * head_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_v.weight".to_string(),
-            Tensor::rand(0f32, 1., (n_kv_heads * head_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_output.weight".to_string(),
-            Tensor::rand(0f32, 1., (hidden_dim, n_heads * head_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_norm.weight".to_string(),
-            Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_gate.weight".to_string(),
-            Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_up.weight".to_string(),
-            Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_down.weight".to_string(),
-            Tensor::rand(0f32, 1., (hidden_dim, ffn_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "output_norm.weight".to_string(),
-            Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
-        );
-        tensors.insert(
-            "output.weight".to_string(),
-            Tensor::rand(0f32, 1., (vocab_size, hidden_dim), &device).unwrap(),
-        );
-
-        let config = SmollLM230MConfig {
-            n_layers: 1,
-            n_heads: n_heads as u32,
-            n_kv_heads: n_kv_heads as u32,
-            hidden_dim: hidden_dim as u32,
-            ffn_dim: ffn_dim as u32,
-            rope_theta: 10000.0,
-            rms_eps: 1e-5,
-            vocab_size: vocab_size as u32,
-            context_length: 8,
-            eos_token_id: 0,
-            bos_token_id: 0,
-            tensors,
-        };
-
-        let token_ids: [u32; 2] = [0, 2];
-        let mut kv_storage =
-            KvStorage::new(1, 1, token_ids.len(), n_kv_heads, head_dim, &device).unwrap();
-        let write_positions: Vec<(BlockID, usize)> =
-            (0..token_ids.len()).map(|i| (BlockID(0), i)).collect();
-        let read_blocks = [BlockID(0)];
-        let logits = forward(
-            &config,
-            &token_ids,
-            &device,
-            &mut kv_storage,
-            &write_positions,
-            &read_blocks,
-            token_ids.len(),
-            0,
-        )
-        .unwrap();
-
-        assert_eq!(logits.dims(), &[token_ids.len(), vocab_size]);
+        let logits = model.forward(&items, &mut kv).unwrap();
+        assert_eq!(logits.dims(), &[1, 2, model.config.vocab_size as usize]);
     }
 
-    // Builds the same tiny fake model as `forward_produces_logits_of_expected_shape`.
-    fn tiny_test_config() -> (SmollLM230MConfig, usize, usize) {
-        use crate::weights::SmollLM230MConfig;
-        use std::collections::HashMap;
-
-        let device = Device::Cpu;
-        let hidden_dim = 4usize;
-        let n_heads = 2usize;
-        let n_kv_heads = 1usize;
-        let head_dim = hidden_dim / n_heads;
-        let ffn_dim = 4usize;
-        let vocab_size = 5usize;
-
-        let mut tensors = HashMap::new();
-        tensors.insert(
-            "token_embd.weight".to_string(),
-            Tensor::rand(0f32, 1., (vocab_size, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_norm.weight".to_string(),
-            Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_q.weight".to_string(),
-            Tensor::rand(0f32, 1., (n_heads * head_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_k.weight".to_string(),
-            Tensor::rand(0f32, 1., (n_kv_heads * head_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_v.weight".to_string(),
-            Tensor::rand(0f32, 1., (n_kv_heads * head_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.attn_output.weight".to_string(),
-            Tensor::rand(0f32, 1., (hidden_dim, n_heads * head_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_norm.weight".to_string(),
-            Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_gate.weight".to_string(),
-            Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_up.weight".to_string(),
-            Tensor::rand(0f32, 1., (ffn_dim, hidden_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "blk.0.ffn_down.weight".to_string(),
-            Tensor::rand(0f32, 1., (hidden_dim, ffn_dim), &device).unwrap(),
-        );
-        tensors.insert(
-            "output_norm.weight".to_string(),
-            Tensor::ones(hidden_dim, candle_core::DType::F32, &device).unwrap(),
-        );
-        tensors.insert(
-            "output.weight".to_string(),
-            Tensor::rand(0f32, 1., (vocab_size, hidden_dim), &device).unwrap(),
-        );
-
-        let config = SmollLM230MConfig {
-            n_layers: 1,
-            n_heads: n_heads as u32,
-            n_kv_heads: n_kv_heads as u32,
-            hidden_dim: hidden_dim as u32,
-            ffn_dim: ffn_dim as u32,
-            rope_theta: 10000.0,
-            rms_eps: 1e-5,
-            vocab_size: vocab_size as u32,
-            context_length: 8,
-            eos_token_id: 99,
-            bos_token_id: 0,
-            tensors,
-        };
-        (config, n_kv_heads, head_dim)
-    }
-
-    // Phase 3's core correctness requirement: a batched decode step must
-    // produce byte-identical logits to running each sequence's decode step
-    // unbatched (Phase 2's path), for every sequence in the batch - batching
-    // must not change results, only how many sequences share one call.
     #[test]
     fn forward_last_matches_last_row_of_forward() {
         let device = Device::Cpu;
-        let (config, n_kv_heads, head_dim) = tiny_test_config();
+        let model = tiny_model();
         // 5 tokens over blocks of 2: exercises write_tokens splitting a
         // prefill into runs that end at block boundaries.
-        let token_ids: [u32; 5] = [1, 3, 2, 0, 4];
-        let block_size = 2;
-        let write_positions: Vec<(BlockID, usize)> = (0..token_ids.len())
-            .map(|i| (BlockID((i / block_size) as u32), i % block_size))
-            .collect();
-        let read_blocks = [BlockID(0), BlockID(1), BlockID(2)];
+        let tokens: [u32; 5] = [1, 3, 2, 0, 4];
+        let blocks = [BlockID(0), BlockID(1), BlockID(2)];
+        let mut writes = Vec::new();
+        let items = [item(&tokens, 0, &blocks, 2, &mut writes)];
 
-        let mut kv_all = KvStorage::new(1, 3, block_size, n_kv_heads, head_dim, &device).unwrap();
+        let mut kv_all = KvStorage::new(1, 3, 2, 1, 2, &device).unwrap();
         let mut kv_last = kv_all.clone();
-        let all = forward(
-            &config, &token_ids, &device, &mut kv_all, &write_positions, &read_blocks,
-            token_ids.len(), 0,
-        )
-        .unwrap();
-        let last = forward_last(
-            &config, &token_ids, &device, &mut kv_last, &write_positions, &read_blocks,
-            token_ids.len(), 0,
-        )
-        .unwrap();
+        let all = model.forward(&items, &mut kv_all).unwrap();
+        let last = model.forward_last(&items, &mut kv_last).unwrap();
 
-        assert_eq!(last.dims(), &[1, config.vocab_size as usize]);
-        let want: Vec<f32> = all.get(token_ids.len() - 1).unwrap().to_vec1().unwrap();
-        let got: Vec<f32> = last.get(0).unwrap().to_vec1().unwrap();
+        assert_eq!(last.dims(), &[1, 1, model.config.vocab_size as usize]);
+        let want = flat(&all.get(0).unwrap().get(tokens.len() - 1).unwrap());
+        let got = flat(&last);
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-5, "got {g}, want {w}");
         }
     }
 
     #[test]
-    fn kv_storage_clone_is_independent_of_original() {
+    fn batched_decode_matches_unbatched_per_sequence() {
         let device = Device::Cpu;
-        let mut original = KvStorage::new(1, 1, 2, 1, 2, &device).unwrap();
-        let snapshot = original.clone();
-        let k = Tensor::ones((1, 1, 2), candle_core::DType::F32, &device).unwrap();
-        original.write_tokens(0, &[(BlockID(0), 0)], &k, &k).unwrap();
-
-        let (k_orig, _) = original.gather(0, &[BlockID(0)], 1).unwrap();
-        let (k_snap, _) = snapshot.gather(0, &[BlockID(0)], 1).unwrap();
-        assert_eq!(k_orig.flatten_all().unwrap().to_vec1::<f32>().unwrap(), [1.0, 1.0]);
-        assert_eq!(k_snap.flatten_all().unwrap().to_vec1::<f32>().unwrap(), [0.0, 0.0]);
-    }
-
-    #[test]
-    fn forward_batch_matches_unbatched_decode_per_sequence() {
-        let device = Device::Cpu;
-        let (config, n_kv_heads, head_dim) = tiny_test_config();
-
+        let model = tiny_model();
         // 4 blocks of 4 tokens each - sequence A gets block 0, sequence B
         // gets block 1, so their KV data never overlaps.
-        let mut kv_storage = KvStorage::new(1, 4, 4, n_kv_heads, head_dim, &device).unwrap();
+        let mut kv = KvStorage::new(1, 4, 4, 1, 2, &device).unwrap();
+        let (blocks_a, blocks_b) = ([BlockID(0)], [BlockID(1)]);
 
-        let prompt_a: [u32; 2] = [0, 2];
-        let prompt_b: [u32; 2] = [1, 3];
-
-        // Prefill both sequences (unbatched, one call each) into disjoint blocks.
-        forward(
-            &config,
-            &prompt_a,
-            &device,
-            &mut kv_storage,
-            &[(BlockID(0), 0), (BlockID(0), 1)],
-            &[BlockID(0)],
-            2,
-            0,
-        )
-        .unwrap();
-        forward(
-            &config,
-            &prompt_b,
-            &device,
-            &mut kv_storage,
-            &[(BlockID(1), 0), (BlockID(1), 1)],
-            &[BlockID(1)],
-            2,
-            0,
-        )
-        .unwrap();
+        // Prefill both sequences (one call each) into disjoint blocks.
+        let (mut wa, mut wb) = (Vec::new(), Vec::new());
+        model.forward(&[item(&[0, 2], 0, &blocks_a, 4, &mut wa)], &mut kv).unwrap();
+        model.forward(&[item(&[1, 3], 0, &blocks_b, 4, &mut wb)], &mut kv).unwrap();
 
         // Snapshot post-prefill KV state so the batched and unbatched decode
         // steps below both start from the exact same cache contents.
-        let mut kv_storage_unbatched = kv_storage.clone();
-
-        let next_a: u32 = 4;
-        let next_b: u32 = 4;
+        let mut kv_unbatched = kv.clone();
 
         // Unbatched: decode each sequence's one new token with its own call.
-        let logits_a = forward(
-            &config,
-            &[next_a],
-            &device,
-            &mut kv_storage_unbatched,
-            &[(BlockID(0), 2)],
-            &[BlockID(0)],
-            3,
-            2,
-        )
-        .unwrap();
-        let logits_b = forward(
-            &config,
-            &[next_b],
-            &device,
-            &mut kv_storage_unbatched,
-            &[(BlockID(1), 2)],
-            &[BlockID(1)],
-            3,
-            2,
-        )
-        .unwrap();
+        let logits_a = model.forward(&[item(&[4], 2, &blocks_a, 4, &mut wa)], &mut kv_unbatched).unwrap();
+        let logits_b = model.forward(&[item(&[4], 2, &blocks_b, 4, &mut wb)], &mut kv_unbatched).unwrap();
 
-        // Batched: both sequences' one new token in a single forward_batch call.
-        let write_a = [(BlockID(0), 2)];
-        let write_b = [(BlockID(1), 2)];
-        let read_a = [BlockID(0)];
-        let read_b = [BlockID(1)];
+        // Batched: both sequences' one new token in a single call.
         let items = [
-            BatchItem {
-                tokens: &[next_a],
-                write_positions: &write_a,
-                read_blocks: &read_a,
-                read_num_tokens: 3,
-                position_offset: 2,
-            },
-            BatchItem {
-                tokens: &[next_b],
-                write_positions: &write_b,
-                read_blocks: &read_b,
-                read_num_tokens: 3,
-                position_offset: 2,
-            },
+            item(&[4], 2, &blocks_a, 4, &mut wa),
+            item(&[4], 2, &blocks_b, 4, &mut wb),
         ];
-        let logits_batched = forward_batch(&config, &items, &device, &mut kv_storage).unwrap();
+        let logits_batched = model.forward(&items, &mut kv).unwrap();
+        assert_eq!(logits_batched.dims(), &[2, 1, model.config.vocab_size as usize]);
 
-        assert_eq!(logits_batched.dims(), &[2, 1, config.vocab_size as usize]);
-
-        let batched_a: Vec<f32> = logits_batched
-            .get(0)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let batched_b: Vec<f32> = logits_batched
-            .get(1)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let unbatched_a: Vec<f32> = logits_a.flatten_all().unwrap().to_vec1().unwrap();
-        let unbatched_b: Vec<f32> = logits_b.flatten_all().unwrap().to_vec1().unwrap();
-
-        for (got, want) in batched_a.iter().zip(unbatched_a.iter()) {
-            assert!((got - want).abs() < 1e-4, "seq A: got {got}, want {want}");
+        for (name, row, want) in [("A", 0, &logits_a), ("B", 1, &logits_b)] {
+            let got = flat(&logits_batched.get(row).unwrap());
+            for (g, w) in got.iter().zip(flat(want).iter()) {
+                assert!((g - w).abs() < 1e-4, "seq {name}: got {g}, want {w}");
+            }
         }
-        for (got, want) in batched_b.iter().zip(unbatched_b.iter()) {
-            assert!((got - want).abs() < 1e-4, "seq B: got {got}, want {want}");
+    }
+
+    #[test]
+    fn batched_decode_with_unequal_lengths_matches_unbatched() {
+        let device = Device::Cpu;
+        let model = tiny_model();
+        // Sequences of 3 and 6 tokens (blocks of 2: 2 vs 3 blocks), so the
+        // batch pads A's context and masks it.
+        let mut kv = KvStorage::new(1, 6, 2, 1, 2, &device).unwrap();
+        let blocks_a = [BlockID(0), BlockID(1)];
+        let blocks_b = [BlockID(2), BlockID(3), BlockID(4)];
+        let (mut wa, mut wb) = (Vec::new(), Vec::new());
+        model.forward(&[item(&[0, 2, 1], 0, &blocks_a, 2, &mut wa)], &mut kv).unwrap();
+        model.forward(&[item(&[1, 3, 0, 2, 4, 1], 0, &blocks_b, 2, &mut wb)], &mut kv).unwrap();
+        let mut kv_unbatched = kv.clone();
+
+        // A's next token lands at position 3 (block 1, slot 1); B's would be
+        // position 6, so give B a block table with room via a 4th block.
+        let blocks_b = [BlockID(2), BlockID(3), BlockID(4), BlockID(5)];
+        let logits_a = model.forward(&[item(&[4], 3, &blocks_a, 2, &mut wa)], &mut kv_unbatched).unwrap();
+        let logits_b = model.forward(&[item(&[4], 6, &blocks_b, 2, &mut wb)], &mut kv_unbatched).unwrap();
+
+        let items = [
+            item(&[4], 3, &blocks_a, 2, &mut wa),
+            item(&[4], 6, &blocks_b, 2, &mut wb),
+        ];
+        let logits_batched = model.forward(&items, &mut kv).unwrap();
+        for (name, row, want) in [("A", 0, &logits_a), ("B", 1, &logits_b)] {
+            let got = flat(&logits_batched.get(row).unwrap());
+            for (g, w) in got.iter().zip(flat(want).iter()) {
+                assert!((g - w).abs() < 1e-4, "seq {name}: got {g}, want {w}");
+            }
         }
     }
 }
