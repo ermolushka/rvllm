@@ -1,4 +1,4 @@
-use candle_core::{Device, Tensor, scalar::TensorScalar};
+use candle_core::{D, Device, Tensor};
 use candle_nn::ops::{silu, softmax};
 use kv_cache_scheduler::block_pool::BlockID;
 
@@ -24,45 +24,59 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> candle_core::Result<Te
     normed.broadcast_mul(weight)
 }
 
-// Applies RoPE (rotate-half convention) to `x` of shape [n, head_dim], one row
-// per position given in `positions` (same order as `x`'s rows). Taking
-// positions explicitly rather than a contiguous range is what lets the same
-// function serve both the single-sequence path (positions = one contiguous
-// range) and the batched path (positions = one arbitrary offset per batch item).
-pub fn rope(
-    x: &Tensor,
+// RoPE cos/sin for `positions`, each [positions.len(), head_dim / 2]. Each
+// dimension-pair rotates at its own frequency - pair 0 fastest, later pairs
+// slower - so different pairs encode position at different resolutions, like
+// clock hands moving at different speeds. Depends only on positions, so it is
+// built once per forward call and shared by every layer and head.
+pub fn rope_cos_sin(
     rope_theta: f32,
-    device: &Device,
+    head_dim: usize,
     positions: &[usize],
-) -> candle_core::Result<Tensor> {
-    let (n, head_dim) = x.dims2()?;
+    device: &Device,
+) -> candle_core::Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
-
-    // Each dimension-pair rotates at its own frequency - pair 0 fastest,
-    // later pairs slower - so different pairs encode position at different
-    // resolutions, like clock hands moving at different speeds.
     let theta: Vec<f32> = (0..half)
         .map(|j| rope_theta.powf(-2.0 * j as f32 / head_dim as f32))
         .collect();
     let theta = Tensor::from_vec(theta, (1, half), device)?;
 
     let positions_f: Vec<f32> = positions.iter().map(|&p| p as f32).collect();
-    let positions = Tensor::from_vec(positions_f, (n, 1), device)?;
+    let positions = Tensor::from_vec(positions_f, (positions.len(), 1), device)?;
 
     // angle[pos, j] = pos * theta_j - how far pair j has rotated by this position.
     let angles = positions.broadcast_mul(&theta)?;
-    let cos = angles.cos()?;
-    let sin = angles.sin()?;
+    Ok((angles.cos()?, angles.sin()?))
+}
 
+// Applies RoPE (rotate-half convention) to `x` of shape [..., n, head_dim],
+// given cos/sin that broadcast against [..., n, head_dim / 2]. Because the
+// rotation is elementwise over the last dim, one call covers every head (and
+// every batch item) at once.
+pub fn rope_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+    let half = x.dim(D::Minus1)? / 2;
     // Rotate-half pairing: dim i pairs with dim i + half, not its neighbor.
-    let first = x.narrow(1, 0, half)?;
-    let second = x.narrow(1, half, half)?;
+    let first = x.narrow(D::Minus1, 0, half)?;
+    let second = x.narrow(D::Minus1, half, half)?;
 
     // Standard 2D rotation applied to each (first, second) pair.
-    let first_rot = first.mul(&cos)?.sub(&second.mul(&sin)?)?;
-    let second_rot = first.mul(&sin)?.add(&second.mul(&cos)?)?;
+    let first_rot = first.broadcast_mul(cos)?.sub(&second.broadcast_mul(sin)?)?;
+    let second_rot = first.broadcast_mul(sin)?.add(&second.broadcast_mul(cos)?)?;
 
-    Tensor::cat(&[&first_rot, &second_rot], 1)
+    Tensor::cat(&[&first_rot, &second_rot], D::Minus1)
+}
+
+// Applies RoPE to `x` of shape [n, head_dim], one row per position given in
+// `positions` (same order as `x`'s rows).
+pub fn rope(
+    x: &Tensor,
+    rope_theta: f32,
+    device: &Device,
+    positions: &[usize],
+) -> candle_core::Result<Tensor> {
+    let (_, head_dim) = x.dims2()?;
+    let (cos, sin) = rope_cos_sin(rope_theta, head_dim, positions, device)?;
+    rope_apply(x, &cos, &sin)
 }
 
 // Looks up embedding rows for `token_ids` from `embedding_weight` ([vocab_size,
@@ -108,7 +122,40 @@ pub fn swiglu_ffn(
 // v: [n_kv_heads, seq_len, head_dim]
 // returns: [n_heads, seq_len, head_dim]
 pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, position_offset: usize) -> candle_core::Result<Tensor> {
-    let (n_heads, q_seq_len, head_dim) = q.dims3()?;
+    let (_, q_seq_len, _) = q.dims3()?;
+    let (_, k_seq_len, _) = k.dims3()?;
+    let mask = causal_mask(q_seq_len, k_seq_len, position_offset, q.device())?;
+    gqa_attention_masked(q, k, v, &mask)
+}
+
+// Causal mask [q_len, k_len] for queries starting at `position_offset`: a
+// token at position i must not see future tokens (j > i), since at
+// generation time those tokens don't exist yet. -inf on those positions
+// forces softmax to assign them exactly 0 weight.
+pub fn causal_mask(
+    q_len: usize,
+    k_len: usize,
+    position_offset: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let mut mask_data = vec![0f32; q_len * k_len];
+    for i in 0..q_len {
+        for j in (position_offset + i + 1)..k_len {
+            mask_data[i * k_len + j] = f32::NEG_INFINITY;
+        }
+    }
+    Tensor::from_vec(mask_data, (q_len, k_len), device)
+}
+
+// `gqa_attention` with the causal mask supplied by the caller (built once per
+// forward call rather than once per layer).
+pub fn gqa_attention_masked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+) -> candle_core::Result<Tensor> {
+    let (n_heads, _q_seq_len, head_dim) = q.dims3()?;
     let (n_kv_heads, k_seq_len, _) = k.dims3()?;
 
     // GQA shares each KV head across several Q heads instead of 1:1 - this is
@@ -136,19 +183,7 @@ pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, position_offset: usize)
     // (near one-hot) outputs regardless of how similar the vectors really are.
     let scaled_dot_product = dot_product_scores.affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
 
-    // Causal mask: a token at position i must not see future tokens (j > i),
-    // since at generation time those tokens don't exist yet. Adding -inf to
-    // those positions forces softmax to assign them exactly 0 weight.
-    let mut mask_data = vec![0f32; q_seq_len * k_seq_len];
-    for i in 0..q_seq_len {
-        for j in 0..k_seq_len {
-            if j > position_offset + i {
-                mask_data[i * k_seq_len + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    let mask = Tensor::from_vec(mask_data, (q_seq_len, k_seq_len), q.device())?;
-    let scaled_dot_product = scaled_dot_product.broadcast_add(&mask)?;
+    let scaled_dot_product = scaled_dot_product.broadcast_add(mask)?;
 
     // Softmax turns each query's row of scores into a probability
     // distribution over key positions - "how much attention to pay to each
@@ -180,7 +215,47 @@ pub fn gqa_attention_batch(
     position_offset: &[usize],
     read_num_tokens: &[usize],
 ) -> candle_core::Result<Tensor> {
-    let (batch, n_heads, q_len, head_dim) = q.dims4()?;
+    let (_, _, q_len, _) = q.dims4()?;
+    let (_, _, ctx_len, _) = k.dims4()?;
+    let mask = batch_mask(position_offset, read_num_tokens, q_len, ctx_len, q.device())?;
+    gqa_attention_batch_masked(q, k, v, &mask)
+}
+
+// Per-batch-item mask [batch, 1, q_len, ctx_len]: causal within the
+// sequence's real tokens (as in `causal_mask`), and additionally -inf past
+// that sequence's own `read_num_tokens` - that's the batch-padding tail every
+// other sequence's longer context leaves behind for this one.
+pub fn batch_mask(
+    position_offset: &[usize],
+    read_num_tokens: &[usize],
+    q_len: usize,
+    ctx_len: usize,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let batch = position_offset.len();
+    let mut mask_data = vec![0f32; batch * q_len * ctx_len];
+    for b in 0..batch {
+        let offset = position_offset[b];
+        let valid_len = read_num_tokens[b];
+        for i in 0..q_len {
+            for j in 0..ctx_len {
+                if j >= valid_len || j > offset + i {
+                    mask_data[(b * q_len + i) * ctx_len + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+    }
+    Tensor::from_vec(mask_data, (batch, 1, q_len, ctx_len), device)
+}
+
+// `gqa_attention_batch` with the mask supplied by the caller.
+pub fn gqa_attention_batch_masked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+) -> candle_core::Result<Tensor> {
+    let (batch, n_heads, _q_len, head_dim) = q.dims4()?;
     let (_, n_kv_heads, ctx_len, _) = k.dims4()?;
     let group_size = n_heads / n_kv_heads;
 
@@ -196,27 +271,63 @@ pub fn gqa_attention_batch(
     let dot_product_scores = q.matmul(&k_repeated.transpose(2, 3)?)?;
     let scaled_dot_product = dot_product_scores.affine(1.0 / (head_dim as f64).sqrt(), 0.0)?;
 
-    // Per-batch-item mask: causal within the sequence's real tokens (as in
-    // `gqa_attention`), and additionally -inf past that sequence's own
-    // `read_num_tokens` - that's the batch-padding tail every other sequence's
-    // longer context leaves behind for this one.
-    let mut mask_data = vec![0f32; batch * q_len * ctx_len];
-    for b in 0..batch {
-        let offset = position_offset[b];
-        let valid_len = read_num_tokens[b];
-        for i in 0..q_len {
-            for j in 0..ctx_len {
-                if j >= valid_len || j > offset + i {
-                    mask_data[(b * q_len + i) * ctx_len + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-    }
-    let mask = Tensor::from_vec(mask_data, (batch, 1, q_len, ctx_len), q.device())?;
-    let scaled_dot_product = scaled_dot_product.broadcast_add(&mask)?;
+    let scaled_dot_product = scaled_dot_product.broadcast_add(mask)?;
 
     let softmax_values = softmax(&scaled_dot_product, 3)?;
     softmax_values.matmul(&v_repeated)
+}
+
+// Everything that depends only on this forward call's positions and context
+// lengths, not on the layer: RoPE cos/sin and the attention mask. Built once
+// per call and shared by every layer instead of being rebuilt per layer/head.
+pub struct StepCtx {
+    // Broadcast against [..., n, head_dim / 2]: [q_len, half] for a single
+    // sequence, [batch, 1, q_len, half] for a batch.
+    pub cos: Tensor,
+    pub sin: Tensor,
+    // [q_len, k_len] for a single sequence, [batch, 1, q_len, ctx_len] batched.
+    pub mask: Tensor,
+}
+
+impl StepCtx {
+    pub fn single(
+        rope_theta: f32,
+        head_dim: usize,
+        q_len: usize,
+        position_offset: usize,
+        k_len: usize,
+        device: &Device,
+    ) -> candle_core::Result<Self> {
+        let positions: Vec<usize> = (position_offset..position_offset + q_len).collect();
+        let (cos, sin) = rope_cos_sin(rope_theta, head_dim, &positions, device)?;
+        let mask = causal_mask(q_len, k_len, position_offset, device)?;
+        Ok(StepCtx { cos, sin, mask })
+    }
+
+    pub fn batch(
+        rope_theta: f32,
+        head_dim: usize,
+        items: &[BatchItem],
+        device: &Device,
+    ) -> candle_core::Result<Self> {
+        let q_len = items[0].tokens.len();
+        let half = head_dim / 2;
+        // Every item is at its own position, so build per-row positions in
+        // (batch, q_len) row-major order, then fold back to broadcast shape.
+        let positions: Vec<usize> = items
+            .iter()
+            .flat_map(|item| item.position_offset..item.position_offset + q_len)
+            .collect();
+        let (cos, sin) = rope_cos_sin(rope_theta, head_dim, &positions, device)?;
+        let cos = cos.reshape((items.len(), 1, q_len, half))?;
+        let sin = sin.reshape((items.len(), 1, q_len, half))?;
+
+        let position_offsets: Vec<usize> = items.iter().map(|i| i.position_offset).collect();
+        let read_num_tokens: Vec<usize> = items.iter().map(|i| i.read_num_tokens).collect();
+        let ctx_len = read_num_tokens.iter().copied().max().unwrap_or(0);
+        let mask = batch_mask(&position_offsets, &read_num_tokens, q_len, ctx_len, device)?;
+        Ok(StepCtx { cos, sin, mask })
+    }
 }
 
 // One Llama transformer block:
@@ -242,15 +353,13 @@ pub fn transformer_block(
     ffn_down_weight: &Tensor,
     n_heads: usize,
     n_kv_heads: usize,
-    rope_theta: f32,
     eps: f32,
-    device: &Device,
+    ctx: &StepCtx, // RoPE cos/sin + causal mask for this call's positions
     kv_storage: &mut KvStorage,
     layer: usize,
     write_positions: &[(BlockID, usize)], // one per token in this call
     read_blocks: &[BlockID],              // full logical block list for this sequence
     read_num_tokens: usize,               // trims gather's tail past the real seq len
-    position_offset: usize, // where in the sequence 'x' starts, mostly for RoPE
 ) -> candle_core::Result<Tensor> {
     // Normalize before attention (pre-norm), not after - this is the
     // convention Llama uses, and it's what keeps deep stacks of these blocks
@@ -276,31 +385,25 @@ pub fn transformer_block(
         .reshape((seq_len, n_kv_heads, head_dim))?
         .transpose(0, 1)?;
 
-    // RoPE has to be applied per head (it only knows how to rotate a single
-    // [seq_len, head_dim] slice), so loop over heads and restitch the results.
-    // Only Q and K get rotated - V carries content, not position.
-    let positions: Vec<usize> = (position_offset..position_offset + seq_len).collect();
-    let q_slices: Vec<Tensor> = (0..n_heads)
-        .map(|h| rope(&q.get(h)?, rope_theta, device, &positions))
-        .collect::<candle_core::Result<Vec<_>>>()?;
-    let q_roped = Tensor::stack(&q_slices, 0)?;
-    let k_slices: Vec<Tensor> = (0..n_kv_heads)
-        .map(|h| rope(&k.get(h)?, rope_theta, device, &positions))
-        .collect::<candle_core::Result<Vec<_>>>()?;
-    let k_roped = Tensor::stack(&k_slices, 0)?;
+    // RoPE rotates every head identically given the position, so one call
+    // per tensor covers all heads. Only Q and K get rotated - V carries
+    // content, not position.
+    let q_roped = rope_apply(&q, &ctx.cos, &ctx.sin)?;
+    let k_roped = rope_apply(&k, &ctx.cos, &ctx.sin)?;
 
-    // Write this call's tokens into their block slots, one token at a time -
-    // k_roped/v are [n_kv_heads, seq_len, head_dim], write_positions gives
-    // each token's (block_id, offset) in the same order.
-    for (i, &(block_id, offset)) in write_positions.iter().enumerate() {
-        let k_token = k_roped.narrow(1, i, 1)?.squeeze(1)?;
-        let v_token = v.narrow(1, i, 1)?.squeeze(1)?;
-        kv_storage.write(layer, block_id, offset, &k_token, &v_token)?;
-    }
+    // Write this call's tokens into their block slots. k_roped/v are
+    // [n_kv_heads, seq_len, head_dim]; the cache wants token-major rows, in
+    // the same order as write_positions.
+    kv_storage.write_tokens(
+        layer,
+        write_positions,
+        &k_roped.transpose(0, 1)?.contiguous()?,
+        &v.transpose(0, 1)?.contiguous()?,
+    )?;
     // Gather the full cached K/V for this sequence (trimmed to its real
     // length) and attend against it.
     let (k_full, v_full) = kv_storage.gather(layer, read_blocks, read_num_tokens)?;
-    let mut attn_out = gqa_attention(&q_roped, &k_full, &v_full, position_offset)?;
+    let mut attn_out = gqa_attention_masked(&q_roped, &k_full, &v_full, &ctx.mask)?;
 
     // Merge the heads back into one dimension - inverse of the earlier split.
     attn_out = attn_out
@@ -324,10 +427,10 @@ pub fn transformer_block(
     h.add(&ffn_out)
 }
 
-// Full forward pass: embed(tokens) -> N x transformer_block -> final norm -> LM head.
-// token_ids: input sequence. Returns logits, [seq_len, vocab_size].
+// Embed -> N x transformer_block; returns the final hidden states
+// [seq_len, hidden_dim], before the final norm and LM head.
 #[allow(clippy::too_many_arguments)]
-pub fn forward(
+fn forward_hidden(
     config: &SmollLM230MConfig,
     token_ids: &[u32],
     device: &Device,
@@ -339,6 +442,15 @@ pub fn forward(
 ) -> candle_core::Result<Tensor> {
     // Turn token ids into vectors.
     let mut x = embed(token_ids, &config.tensors["token_embd.weight"], device)?;
+    let head_dim = (config.hidden_dim / config.n_heads) as usize;
+    let ctx = StepCtx::single(
+        config.rope_theta,
+        head_dim,
+        token_ids.len(),
+        position_offset,
+        read_num_tokens,
+        device,
+    )?;
     // Run through every layer in sequence, each one refining x a bit more.
     // Pulling weights straight out of the tensor map by the same key strings
     // weights.rs used when loading them.
@@ -356,21 +468,77 @@ pub fn forward(
             &config.tensors[&format!("blk.{i}.ffn_down.weight")],
             config.n_heads as usize,
             config.n_kv_heads as usize,
-            config.rope_theta,
             config.rms_eps,
-            device,
+            &ctx,
             kv_storage,
             i as usize,
             write_positions,
             read_blocks,
             read_num_tokens,
-            position_offset,
         )?;
     }
+    Ok(x)
+}
 
-    // One final norm after the last layer, then project to vocab-sized logits.
-    let normed = rms_norm(&x, &config.tensors["output_norm.weight"], config.rms_eps)?;
-    normed.matmul(&config.tensors["output.weight"].t()?)
+// One final norm after the last layer, then project to vocab-sized logits.
+fn lm_head(config: &SmollLM230MConfig, x: &Tensor) -> candle_core::Result<Tensor> {
+    let normed = rms_norm(x, &config.tensors["output_norm.weight"], config.rms_eps)?;
+    normed.broadcast_matmul(&config.tensors["output.weight"].t()?)
+}
+
+// Full forward pass: embed(tokens) -> N x transformer_block -> final norm -> LM head.
+// token_ids: input sequence. Returns logits, [seq_len, vocab_size].
+#[allow(clippy::too_many_arguments)]
+pub fn forward(
+    config: &SmollLM230MConfig,
+    token_ids: &[u32],
+    device: &Device,
+    kv_storage: &mut KvStorage,
+    write_positions: &[(BlockID, usize)],
+    read_blocks: &[BlockID],
+    read_num_tokens: usize,
+    position_offset: usize,
+) -> candle_core::Result<Tensor> {
+    let x = forward_hidden(
+        config,
+        token_ids,
+        device,
+        kv_storage,
+        write_positions,
+        read_blocks,
+        read_num_tokens,
+        position_offset,
+    )?;
+    lm_head(config, &x)
+}
+
+// Same as `forward`, but only projects the *last* row to logits ([1,
+// vocab_size]). Prefill only samples from the final position, so running the
+// vocab-sized LM head over every prompt row is wasted work - RMSNorm is
+// row-wise, so narrowing before the norm and head gives the same last row.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_last(
+    config: &SmollLM230MConfig,
+    token_ids: &[u32],
+    device: &Device,
+    kv_storage: &mut KvStorage,
+    write_positions: &[(BlockID, usize)],
+    read_blocks: &[BlockID],
+    read_num_tokens: usize,
+    position_offset: usize,
+) -> candle_core::Result<Tensor> {
+    let x = forward_hidden(
+        config,
+        token_ids,
+        device,
+        kv_storage,
+        write_positions,
+        read_blocks,
+        read_num_tokens,
+        position_offset,
+    )?;
+    let last = x.narrow(0, x.dim(0)? - 1, 1)?;
+    lm_head(config, &last)
 }
 
 // One sequence's slice of a batched forward call - everything `forward_batch`
@@ -404,9 +572,8 @@ pub fn transformer_block_batch(
     ffn_down_weight: &Tensor,
     n_heads: usize,
     n_kv_heads: usize,
-    rope_theta: f32,
     eps: f32,
-    device: &Device,
+    ctx: &StepCtx, // RoPE cos/sin + batch mask for this call
     kv_storage: &mut KvStorage,
     layer: usize,
     items: &[BatchItem],
@@ -429,38 +596,24 @@ pub fn transformer_block_batch(
         .reshape((batch, q_len, n_kv_heads, head_dim))?
         .transpose(1, 2)?;
 
-    // Every batch item is at its own position in its own sequence, so RoPE's
-    // per-row positions have to be built per item and flattened in the same
-    // (batch, q_len) row-major order the reshape below undoes.
-    let positions: Vec<usize> = items
+    // Each item's cos/sin was built for its own position in `StepCtx::batch`;
+    // one call rotates every head of every item.
+    let q_roped = rope_apply(&q, &ctx.cos, &ctx.sin)?; // [batch, n_heads, q_len, head_dim]
+    let k_roped = rope_apply(&k, &ctx.cos, &ctx.sin)?; // [batch, n_kv_heads, q_len, head_dim]
+
+    // Write each item's new tokens into its own cache blocks. Flattening in
+    // (batch, q_len) row-major order matches the order of the concatenated
+    // per-item write_positions.
+    let flat_writes: Vec<(BlockID, usize)> = items
         .iter()
-        .flat_map(|item| item.position_offset..item.position_offset + q_len)
+        .flat_map(|item| item.write_positions.iter().copied())
         .collect();
-
-    let q_slices: Vec<Tensor> = (0..n_heads)
-        .map(|h| {
-            let slice = q.narrow(1, h, 1)?.reshape((batch * q_len, head_dim))?;
-            rope(&slice, rope_theta, device, &positions)?.reshape((batch, q_len, head_dim))
-        })
-        .collect::<candle_core::Result<Vec<_>>>()?;
-    let q_roped = Tensor::stack(&q_slices, 1)?; // [batch, n_heads, q_len, head_dim]
-
-    let k_slices: Vec<Tensor> = (0..n_kv_heads)
-        .map(|h| {
-            let slice = k.narrow(1, h, 1)?.reshape((batch * q_len, head_dim))?;
-            rope(&slice, rope_theta, device, &positions)?.reshape((batch, q_len, head_dim))
-        })
-        .collect::<candle_core::Result<Vec<_>>>()?;
-    let k_roped = Tensor::stack(&k_slices, 1)?; // [batch, n_kv_heads, q_len, head_dim]
-
-    // Write each item's new tokens into its own cache blocks.
-    for (b, item) in items.iter().enumerate() {
-        for (i, &(block_id, offset)) in item.write_positions.iter().enumerate() {
-            let k_token = k_roped.get(b)?.narrow(1, i, 1)?.squeeze(1)?; // [n_kv_heads, head_dim]
-            let v_token = v.get(b)?.narrow(1, i, 1)?.squeeze(1)?;
-            kv_storage.write(layer, block_id, offset, &k_token, &v_token)?;
-        }
-    }
+    kv_storage.write_tokens(
+        layer,
+        &flat_writes,
+        &k_roped.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
+        &v.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
+    )?;
 
     // Gather every item's full cached K/V (padded to the batch's longest
     // context) and attend against it.
@@ -470,10 +623,7 @@ pub fn transformer_block_batch(
         .collect();
     let (k_full, v_full, _ctx_len) = kv_storage.gather_batch(layer, &gather_items)?;
 
-    let position_offsets: Vec<usize> = items.iter().map(|item| item.position_offset).collect();
-    let read_num_tokens: Vec<usize> = items.iter().map(|item| item.read_num_tokens).collect();
-    let mut attn_out =
-        gqa_attention_batch(&q_roped, &k_full, &v_full, &position_offsets, &read_num_tokens)?;
+    let mut attn_out = gqa_attention_batch_masked(&q_roped, &k_full, &v_full, &ctx.mask)?;
 
     // Merge the heads back into one dimension - inverse of the earlier split.
     attn_out = attn_out
@@ -510,6 +660,8 @@ pub fn forward_batch(
     let flat_tokens: Vec<u32> = items.iter().flat_map(|item| item.tokens.iter().copied()).collect();
     let mut x = embed(&flat_tokens, &config.tensors["token_embd.weight"], device)?;
     x = x.reshape((items.len(), q_len, config.hidden_dim as usize))?;
+    let head_dim = (config.hidden_dim / config.n_heads) as usize;
+    let ctx = StepCtx::batch(config.rope_theta, head_dim, items, device)?;
 
     for i in 0..config.n_layers {
         x = transformer_block_batch(
@@ -525,9 +677,8 @@ pub fn forward_batch(
             &config.tensors[&format!("blk.{i}.ffn_down.weight")],
             config.n_heads as usize,
             config.n_kv_heads as usize,
-            config.rope_theta,
             config.rms_eps,
-            device,
+            &ctx,
             kv_storage,
             i as usize,
             items,
@@ -722,6 +873,7 @@ mod tests {
         let write_positions: Vec<(BlockID, usize)> =
             (0..seq_len).map(|i| (BlockID(0), i)).collect();
         let read_blocks = [BlockID(0)];
+        let ctx = StepCtx::single(10000.0, 2, seq_len, 0, seq_len, &device).unwrap();
         let out = transformer_block(
             &x,
             &attn_norm_weight,
@@ -735,15 +887,13 @@ mod tests {
             &ffn_down_weight,
             n_heads,
             n_kv_heads,
-            10000.0,
             1e-5,
-            &device,
+            &ctx,
             &mut kv_storage,
             0,
             &write_positions,
             &read_blocks,
             seq_len,
-            0,
         )
         .unwrap();
 
@@ -944,6 +1094,54 @@ mod tests {
     // produce byte-identical logits to running each sequence's decode step
     // unbatched (Phase 2's path), for every sequence in the batch - batching
     // must not change results, only how many sequences share one call.
+    #[test]
+    fn forward_last_matches_last_row_of_forward() {
+        let device = Device::Cpu;
+        let (config, n_kv_heads, head_dim) = tiny_test_config();
+        // 5 tokens over blocks of 2: exercises write_tokens splitting a
+        // prefill into runs that end at block boundaries.
+        let token_ids: [u32; 5] = [1, 3, 2, 0, 4];
+        let block_size = 2;
+        let write_positions: Vec<(BlockID, usize)> = (0..token_ids.len())
+            .map(|i| (BlockID((i / block_size) as u32), i % block_size))
+            .collect();
+        let read_blocks = [BlockID(0), BlockID(1), BlockID(2)];
+
+        let mut kv_all = KvStorage::new(1, 3, block_size, n_kv_heads, head_dim, &device).unwrap();
+        let mut kv_last = kv_all.clone();
+        let all = forward(
+            &config, &token_ids, &device, &mut kv_all, &write_positions, &read_blocks,
+            token_ids.len(), 0,
+        )
+        .unwrap();
+        let last = forward_last(
+            &config, &token_ids, &device, &mut kv_last, &write_positions, &read_blocks,
+            token_ids.len(), 0,
+        )
+        .unwrap();
+
+        assert_eq!(last.dims(), &[1, config.vocab_size as usize]);
+        let want: Vec<f32> = all.get(token_ids.len() - 1).unwrap().to_vec1().unwrap();
+        let got: Vec<f32> = last.get(0).unwrap().to_vec1().unwrap();
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-5, "got {g}, want {w}");
+        }
+    }
+
+    #[test]
+    fn kv_storage_clone_is_independent_of_original() {
+        let device = Device::Cpu;
+        let mut original = KvStorage::new(1, 1, 2, 1, 2, &device).unwrap();
+        let snapshot = original.clone();
+        let k = Tensor::ones((1, 1, 2), candle_core::DType::F32, &device).unwrap();
+        original.write_tokens(0, &[(BlockID(0), 0)], &k, &k).unwrap();
+
+        let (k_orig, _) = original.gather(0, &[BlockID(0)], 1).unwrap();
+        let (k_snap, _) = snapshot.gather(0, &[BlockID(0)], 1).unwrap();
+        assert_eq!(k_orig.flatten_all().unwrap().to_vec1::<f32>().unwrap(), [1.0, 1.0]);
+        assert_eq!(k_snap.flatten_all().unwrap().to_vec1::<f32>().unwrap(), [0.0, 0.0]);
+    }
+
     #[test]
     fn forward_batch_matches_unbatched_decode_per_sequence() {
         let device = Device::Cpu;

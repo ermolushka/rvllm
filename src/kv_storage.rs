@@ -2,10 +2,23 @@ use candle_core::{DType, Device, Tensor};
 use kv_cache_scheduler::block_pool::BlockID;
 
 // [num_blocks, block_size, n_kv_heads, head_dim] per layer.
-#[derive(Clone)]
 pub struct KvStorage {
     kv_k: Vec<Tensor>,
     kv_v: Vec<Tensor>,
+}
+
+// `write_tokens` mutates the cache tensors in place, and `Tensor::clone` only
+// bumps a refcount on the shared storage - so a derived `Clone` would alias
+// both copies. Deep-copy instead so a clone is an independent cache.
+impl Clone for KvStorage {
+    fn clone(&self) -> Self {
+        let deep = |ts: &[Tensor]| {
+            ts.iter()
+                .map(|t| t.copy().expect("copying a KV cache tensor"))
+                .collect()
+        };
+        KvStorage { kv_k: deep(&self.kv_k), kv_v: deep(&self.kv_v) }
+    }
 }
 
 impl KvStorage {
@@ -27,26 +40,36 @@ impl KvStorage {
         Ok(KvStorage { kv_k, kv_v })
     }
 
-    pub fn write(
+    // Writes `positions.len()` tokens' K/V into `layer`'s cache in place.
+    // k, v: [n_tokens, n_kv_heads, head_dim], row i belonging to positions[i].
+    // Consecutive tokens landing in consecutive slots of one block are
+    // copied with a single `slice_set`, so a prefill costs about one copy per
+    // block touched rather than one per token, and never copies the cache.
+    pub fn write_tokens(
         &mut self,
         layer: usize,
-        block_id: BlockID,
-        offset: usize,
+        positions: &[(BlockID, usize)],
         k: &Tensor,
         v: &Tensor,
     ) -> candle_core::Result<()> {
-        let (n_kv_heads, head_dim) = k.dims2()?;
-        let k = k.reshape((1, 1, n_kv_heads, head_dim))?;
-        let v = v.reshape((1, 1, n_kv_heads, head_dim))?;
-        let block_idx = block_id.0 as usize;
-        let ranges = [
-            block_idx..block_idx + 1,
-            offset..offset + 1,
-            0..n_kv_heads,
-            0..head_dim,
-        ];
-        self.kv_k[layer] = self.kv_k[layer].slice_assign(&ranges, &k)?;
-        self.kv_v[layer] = self.kv_v[layer].slice_assign(&ranges, &v)?;
+        let (n_tokens, n_kv_heads, head_dim) = k.dims3()?;
+        debug_assert_eq!(n_tokens, positions.len());
+        let mut start = 0;
+        while start < positions.len() {
+            let (block_id, offset) = positions[start];
+            let mut len = 1;
+            while start + len < positions.len()
+                && positions[start + len] == (block_id, offset + len)
+            {
+                len += 1;
+            }
+            let block = block_id.0 as usize;
+            let run_k = k.narrow(0, start, len)?.reshape((1, len, n_kv_heads, head_dim))?;
+            let run_v = v.narrow(0, start, len)?.reshape((1, len, n_kv_heads, head_dim))?;
+            self.kv_k[layer].narrow(0, block, 1)?.slice_set(&run_k, 1, offset)?;
+            self.kv_v[layer].narrow(0, block, 1)?.slice_set(&run_v, 1, offset)?;
+            start += len;
+        }
         Ok(())
     }
 

@@ -32,6 +32,15 @@ pub struct RunStats {
     pub prefix_hits: usize,
     pub prefix_total: usize,
     pub total_block_allocs: usize,
+    // Wall time spent inside prefill forward calls / batched decode forward
+    // calls (incl. sampling), and how many tokens each processed.
+    pub prefill_time: Duration,
+    pub prefill_tokens: usize,
+    pub decode_time: Duration,
+    pub decode_steps: usize,
+    // Per-request time-to-first-token: prefill start -> first sampled token.
+    // Same order/length as the input `requests` slice.
+    pub ttft: Vec<Duration>,
 }
 
 pub struct RunResult {
@@ -89,6 +98,11 @@ pub fn run(
 
     let started = Instant::now();
     let mut step_idx = 0usize;
+    let mut prefill_time = Duration::ZERO;
+    let mut prefill_tokens = 0usize;
+    let mut decode_time = Duration::ZERO;
+    let mut decode_steps = 0usize;
+    let mut ttft = vec![Duration::ZERO; requests.len()];
     loop {
         // 1. Admit every request whose arrival step has been reached - just
         //    hands it to the scheduler (-> `waiting`), no blocks allocated yet.
@@ -115,6 +129,7 @@ pub fn run(
                 scheduler.prefix_cache.match_prefix(&token_ids);
             let skip_tokens = (matched_blocks.len() * block_size).min(token_ids.len() - 1);
 
+            let prefill_started = Instant::now();
             scheduler.prefill(seq_id);
 
             let seq = &scheduler.sequences[&seq_id];
@@ -125,7 +140,7 @@ pub fn run(
             let read_blocks = seq.block_table.blocks().to_vec();
             let read_num_tokens = seq.block_table.num_tokens();
 
-            let logits = model::forward(
+            let logits = model::forward_last(
                 config,
                 &tokens[skip_tokens..],
                 device,
@@ -134,9 +149,13 @@ pub fn run(
                 &read_blocks,
                 read_num_tokens,
                 skip_tokens,
-            )?; // [prompt_len - skip_tokens, vocab_size]
+            )?; // [1, vocab_size]: last position only
             let (seq_len, _) = logits.dims2()?;
             let next_id = sampler.sample(&logits.get(seq_len - 1)?)?;
+            let prefill_elapsed = prefill_started.elapsed();
+            prefill_time += prefill_elapsed;
+            prefill_tokens += tokens.len() - skip_tokens;
+            ttft[req_idx_of[&seq_id]] = prefill_elapsed;
 
             state
                 .entry(seq_id)
@@ -155,6 +174,7 @@ pub fn run(
         // 3. Batched decode: every currently running sequence contributes
         //    exactly one new token to a single forward_batch call.
         if !scheduler.running.is_empty() {
+            let decode_started = Instant::now();
             let running = scheduler.running.clone();
             let position_offsets: HashMap<SequenceId, usize> = running
                 .iter()
@@ -222,6 +242,8 @@ pub fn run(
                     req.next_input = next_id;
                 }
             }
+            decode_time += decode_started.elapsed();
+            decode_steps += 1;
         }
 
         step_idx += 1;
@@ -245,6 +267,11 @@ pub fn run(
             prefix_hits: scheduler.metrics.prefix_hits,
             prefix_total: scheduler.metrics.prefix_total,
             total_block_allocs: scheduler.pool.total_allocs,
+            prefill_time,
+            prefill_tokens,
+            decode_time,
+            decode_steps,
+            ttft,
         },
     })
 }

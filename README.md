@@ -32,7 +32,7 @@ enough blocks for every request to reach `context_length` at once.
 ## Sampling
 
 `--temperature` (default `0.0`) and `--top-p` (default `1.0`) control next-token
-selection. `--temperature 0.0` is greedy argmax — deterministic, no RNG involved.
+selection. `--temperature 0.0` is greedy argmax - deterministic, no RNG involved.
 Any positive temperature enables nucleus (top-p) sampling, seeded by `--seed`
 (default `42`) for reproducible runs:
 
@@ -49,7 +49,7 @@ cargo run --release -- \
 
 ## Benchmarking
 
-`bench` sweeps batch size against synthetic requests (random token ids — content
+`bench` sweeps batch size against synthetic requests (random token ids - content
 doesn't affect throughput, only sequence length and arrival timing) and reports
 total tokens/sec, tokens/sec/request, prefix cache hit rate, and KV pool
 utilization for each batch size:
@@ -62,9 +62,9 @@ cargo run --release --bin bench -- \
   --gen-len 64
 ```
 
-For more realistic load — varied prompt/completion lengths and staggered
+For more realistic load - varied prompt/completion lengths and staggered
 arrivals, exercising continuous batching and prefix caching the way the fixed
-synthetic sweep doesn't — pass a trace file instead of a batch-size sweep:
+synthetic sweep doesn't - pass a trace file instead of a batch-size sweep:
 
 ```
 cargo run --release --bin bench -- \
@@ -79,5 +79,5 @@ cargo run --release --bin bench -- \
 {"prompt_len": 256, "gen_len": 32, "arrival_step": 5}
 ```
 
-Each config runs twice — a discarded warmup, then the measured run — so
+Each config runs twice - a discarded warmup, then the measured run - so
 reported throughput is steady-state, not first-call allocation overhead.

@@ -141,12 +141,31 @@ fn run_and_report(
     };
     let pool_utilization = stats.total_block_allocs as f64 / num_blocks as f64 * 100.0;
 
+    // Order-sensitive FNV-1a over every generated token: lets before/after
+    // runs be compared for exact greedy-output equality at a glance.
+    let mut checksum: u64 = 0xcbf29ce484222325;
+    for tok in result.generated.iter().flatten() {
+        checksum = (checksum ^ *tok as u64).wrapping_mul(0x100000001b3);
+    }
+    let mut ttft_ms: Vec<f64> = stats.ttft.iter().map(|d| d.as_secs_f64() * 1e3).collect();
+    ttft_ms.sort_by(|a, b| a.total_cmp(b));
+    let ttft_mean = ttft_ms.iter().sum::<f64>() / ttft_ms.len().max(1) as f64;
+    let ttft_max = ttft_ms.last().copied().unwrap_or(0.0);
+    let prefill_tok_s = stats.prefill_tokens as f64 / stats.prefill_time.as_secs_f64().max(1e-9);
+    let decode_ms_step =
+        stats.decode_time.as_secs_f64() * 1e3 / stats.decode_steps.max(1) as f64;
+
     let steps = stats.steps;
     let total_allocs = stats.total_block_allocs;
     println!(
         "{label:<24} batch={batch_size:<4} steps={steps:<5} tok/s(total)={total_tok_s:<9.1} \
          tok/s/req={per_req_tok_s:<8.2} prefix_hit={hit_rate:<5.1}% \
          pool_util={pool_utilization:<6.1}% ({total_allocs}/{num_blocks} blocks)"
+    );
+    println!(
+        "{:<24} ttft_ms(mean/max)={ttft_mean:.1}/{ttft_max:.1} prefill_tok/s={prefill_tok_s:.1} \
+         decode_ms/step={decode_ms_step:.2} checksum={checksum:016x}",
+        ""
     );
     Ok(())
 }
