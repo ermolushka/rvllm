@@ -48,7 +48,11 @@ fn test_cuda() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     println!("CUDA");
     // copy a rust slice to the device
-    let inp = stream.clone_htod(&[1.0f32; 100])?;
+    let h_inp = [1, 2, 3];
+    let inp = stream.clone_htod(&h_inp)?;
+    let out = stream.clone_dtoh(&inp)?;
+    assert_eq!(out, h_inp);
+
     Ok(())
 }
 #[cfg(not(feature = "cuda"))]
