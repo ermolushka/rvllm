@@ -43,7 +43,7 @@ struct Args {
 }
 
 #[cfg(feature = "cuda")]
-fn test_cuda() -> Result<(), Box<dyn std::error::Error> {
+fn test_cuda() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = cudarc::driver::CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
