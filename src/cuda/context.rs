@@ -26,6 +26,13 @@ impl CudaRuntime {
         let module = self.ctx.load_module(silu_ptx)?;
         let silu_kernel = module.load_function("silu")?;
         self.kernels_mapping.insert("silu", silu_kernel);
+
+        let silu_gate_multiply_ptx =
+            cudarc::nvrtc::compile_ptx(include_str!("kernels/silu_gate_multiply.cu"))?;
+        let module = self.ctx.load_module(silu_gate_multiply_ptx)?;
+        let silu_gate_multiply_kernel = module.load_function("silu_gate_multiply")?;
+        self.kernels_mapping
+            .insert("silu_gate_multiply", silu_gate_multiply_kernel);
         Ok(())
     }
 }
