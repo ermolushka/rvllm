@@ -138,15 +138,16 @@ pub fn run(
         // 2. Admit as many waiting requests as fit into freed/available
         //    capacity, prefilling each with its own forward call.
         while let Some(&seq_id) = scheduler.waiting.front() {
-            let needed_blocks =
-                scheduler.sequences[&seq_id].token_ids.len().div_ceil(block_size);
+            let needed_blocks = scheduler.sequences[&seq_id]
+                .token_ids
+                .len()
+                .div_ceil(block_size);
             if scheduler.pool.available() < needed_blocks {
                 break;
             }
 
             let token_ids = scheduler.sequences[&seq_id].token_ids.clone();
-            let (_matched_tokens, matched_blocks) =
-                scheduler.prefix_cache.match_prefix(&token_ids);
+            let (_matched_tokens, matched_blocks) = scheduler.prefix_cache.match_prefix(&token_ids);
             let skip_tokens = (matched_blocks.len() * block_size).min(token_ids.len() - 1);
 
             let prefill_started = Instant::now();
@@ -201,7 +202,12 @@ pub fn run(
                 if !scheduler.running.contains(&seq_id) {
                     let state = &seqs[&seq_id];
                     let real_len = state.prompt_len + state.generated.len();
-                    scheduler.sequences.get_mut(&seq_id).unwrap().token_ids.truncate(real_len);
+                    scheduler
+                        .sequences
+                        .get_mut(&seq_id)
+                        .unwrap()
+                        .token_ids
+                        .truncate(real_len);
                 }
             }
 

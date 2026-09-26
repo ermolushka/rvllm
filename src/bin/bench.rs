@@ -49,7 +49,9 @@ struct TraceEntry {
     arrival_step: usize,
 }
 
-fn parse_trace_file(path: &str) -> Result<Vec<TraceEntry>, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_trace_file(
+    path: &str,
+) -> Result<Vec<TraceEntry>, Box<dyn std::error::Error + Send + Sync>> {
     let content = fs::read_to_string(path)?;
     let mut entries = Vec::new();
     for line in content.lines() {
@@ -89,18 +91,26 @@ fn synthetic_requests(
 ) -> Vec<RequestSpec> {
     (0..batch_size)
         .map(|_| RequestSpec {
-            tokens: (0..prompt_len).map(|_| rng.random_range(0..vocab_size)).collect(),
+            tokens: (0..prompt_len)
+                .map(|_| rng.random_range(0..vocab_size))
+                .collect(),
             max_tokens: gen_len,
             arrival_step: 0,
         })
         .collect()
 }
 
-fn requests_from_trace(rng: &mut StdRng, vocab_size: u32, trace: &[TraceEntry]) -> Vec<RequestSpec> {
+fn requests_from_trace(
+    rng: &mut StdRng,
+    vocab_size: u32,
+    trace: &[TraceEntry],
+) -> Vec<RequestSpec> {
     trace
         .iter()
         .map(|t| RequestSpec {
-            tokens: (0..t.prompt_len).map(|_| rng.random_range(0..vocab_size)).collect(),
+            tokens: (0..t.prompt_len)
+                .map(|_| rng.random_range(0..vocab_size))
+                .collect(),
             max_tokens: t.gen_len,
             arrival_step: t.arrival_step,
         })
@@ -149,8 +159,7 @@ fn run_and_report(
     let ttft_mean = ttft_ms.iter().sum::<f64>() / ttft_ms.len().max(1) as f64;
     let ttft_max = ttft_ms.last().copied().unwrap_or(0.0);
     let prefill_tok_s = stats.prefill_tokens as f64 / stats.prefill_time.as_secs_f64().max(1e-9);
-    let decode_ms_step =
-        stats.decode_time.as_secs_f64() * 1e3 / stats.decode_steps.max(1) as f64;
+    let decode_ms_step = stats.decode_time.as_secs_f64() * 1e3 / stats.decode_steps.max(1) as f64;
 
     let steps = stats.steps;
     let total_allocs = stats.total_block_allocs;

@@ -309,13 +309,25 @@ impl StepCtx {
 
         let position_offsets: Vec<usize> = items.iter().map(|i| i.position_offset).collect();
         let read_num_tokens: Vec<usize> = items.iter().map(|i| i.read_num_tokens).collect();
-        let mask = batch_mask(&position_offsets, &read_num_tokens, q_len, gather.ctx_len(), device)?;
+        let mask = batch_mask(
+            &position_offsets,
+            &read_num_tokens,
+            q_len,
+            gather.ctx_len(),
+            device,
+        )?;
 
         let writes = items
             .iter()
             .flat_map(|item| item.write_positions.iter().copied())
             .collect();
-        Ok(StepCtx { cos, sin, mask, gather, writes })
+        Ok(StepCtx {
+            cos,
+            sin,
+            mask,
+            gather,
+            writes,
+        })
     }
 }
 
@@ -367,8 +379,10 @@ impl Layer {
         kv_storage.write_tokens(
             self.index,
             &ctx.writes,
-            &k.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
-            &v.transpose(1, 2)?.reshape((batch * q_len, n_kv_heads, head_dim))?,
+            &k.transpose(1, 2)?
+                .reshape((batch * q_len, n_kv_heads, head_dim))?,
+            &v.transpose(1, 2)?
+                .reshape((batch * q_len, n_kv_heads, head_dim))?,
         )?;
         // Read back every sequence's full cached K/V (padded to the batch's
         // longest context) and attend against it.
@@ -409,8 +423,10 @@ impl Model {
         let device = self.device();
 
         // Turn token ids into vectors, in (batch, q_len) row-major order.
-        let flat_tokens: Vec<u32> =
-            items.iter().flat_map(|item| item.tokens.iter().copied()).collect();
+        let flat_tokens: Vec<u32> = items
+            .iter()
+            .flat_map(|item| item.tokens.iter().copied())
+            .collect();
         let mut x = embed(&flat_tokens, &self.token_embd, device)?.reshape((
             items.len(),
             q_len,
@@ -613,7 +629,15 @@ mod tests {
 
     // Naive per-head reference: attention for one (batch item, Q head) using
     // 2D ops only, with the KV head picked by index instead of by reshaping.
-    fn naive_head(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor, b: usize, h: usize, group: usize) -> Vec<f32> {
+    fn naive_head(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: &Tensor,
+        b: usize,
+        h: usize,
+        group: usize,
+    ) -> Vec<f32> {
         let head_dim = q.dim(3).unwrap();
         let q_h = q.get(b).unwrap().get(h).unwrap(); // [q_len, head_dim]
         let k_h = k.get(b).unwrap().get(h / group).unwrap(); // [ctx, head_dim]
@@ -661,7 +685,8 @@ mod tests {
     // math is verified individually above).
     fn tiny_model() -> Model {
         let device = Device::Cpu;
-        let (hidden_dim, n_heads, n_kv_heads, ffn_dim, vocab_size) = (4usize, 2usize, 1usize, 4usize, 5usize);
+        let (hidden_dim, n_heads, n_kv_heads, ffn_dim, vocab_size) =
+            (4usize, 2usize, 1usize, 4usize, 5usize);
         let head_dim = hidden_dim / n_heads;
         let rand = |shape: (usize, usize)| Tensor::rand(0f32, 1., shape, &device).unwrap();
         let ones = || Tensor::ones(hidden_dim, DType::F32, &device).unwrap();
@@ -731,8 +756,11 @@ mod tests {
         let items = [item(&[0, 2], 0, &blocks, 2, &mut writes)];
         let ctx = StepCtx::new(&model.config, &items, &device).unwrap();
 
-        let x = Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6., 7., 8.], (1, 2, 4), &device).unwrap();
-        let out = model.layers[0].forward(&x, &model.config, &ctx, &mut kv).unwrap();
+        let x =
+            Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6., 7., 8.], (1, 2, 4), &device).unwrap();
+        let out = model.layers[0]
+            .forward(&x, &model.config, &ctx, &mut kv)
+            .unwrap();
 
         assert_eq!(out.dims(), &[1, 2, 4]);
         assert_ne!(flat(&out), flat(&x), "block should transform its input");
@@ -786,16 +814,24 @@ mod tests {
 
         // Prefill both sequences (one call each) into disjoint blocks.
         let (mut wa, mut wb) = (Vec::new(), Vec::new());
-        model.forward(&[item(&[0, 2], 0, &blocks_a, 4, &mut wa)], &mut kv).unwrap();
-        model.forward(&[item(&[1, 3], 0, &blocks_b, 4, &mut wb)], &mut kv).unwrap();
+        model
+            .forward(&[item(&[0, 2], 0, &blocks_a, 4, &mut wa)], &mut kv)
+            .unwrap();
+        model
+            .forward(&[item(&[1, 3], 0, &blocks_b, 4, &mut wb)], &mut kv)
+            .unwrap();
 
         // Snapshot post-prefill KV state so the batched and unbatched decode
         // steps below both start from the exact same cache contents.
         let mut kv_unbatched = kv.clone();
 
         // Unbatched: decode each sequence's one new token with its own call.
-        let logits_a = model.forward(&[item(&[4], 2, &blocks_a, 4, &mut wa)], &mut kv_unbatched).unwrap();
-        let logits_b = model.forward(&[item(&[4], 2, &blocks_b, 4, &mut wb)], &mut kv_unbatched).unwrap();
+        let logits_a = model
+            .forward(&[item(&[4], 2, &blocks_a, 4, &mut wa)], &mut kv_unbatched)
+            .unwrap();
+        let logits_b = model
+            .forward(&[item(&[4], 2, &blocks_b, 4, &mut wb)], &mut kv_unbatched)
+            .unwrap();
 
         // Batched: both sequences' one new token in a single call.
         let items = [
@@ -803,7 +839,10 @@ mod tests {
             item(&[4], 2, &blocks_b, 4, &mut wb),
         ];
         let logits_batched = model.forward(&items, &mut kv).unwrap();
-        assert_eq!(logits_batched.dims(), &[2, 1, model.config.vocab_size as usize]);
+        assert_eq!(
+            logits_batched.dims(),
+            &[2, 1, model.config.vocab_size as usize]
+        );
 
         for (name, row, want) in [("A", 0, &logits_a), ("B", 1, &logits_b)] {
             let got = flat(&logits_batched.get(row).unwrap());
@@ -823,15 +862,26 @@ mod tests {
         let blocks_a = [BlockID(0), BlockID(1)];
         let blocks_b = [BlockID(2), BlockID(3), BlockID(4)];
         let (mut wa, mut wb) = (Vec::new(), Vec::new());
-        model.forward(&[item(&[0, 2, 1], 0, &blocks_a, 2, &mut wa)], &mut kv).unwrap();
-        model.forward(&[item(&[1, 3, 0, 2, 4, 1], 0, &blocks_b, 2, &mut wb)], &mut kv).unwrap();
+        model
+            .forward(&[item(&[0, 2, 1], 0, &blocks_a, 2, &mut wa)], &mut kv)
+            .unwrap();
+        model
+            .forward(
+                &[item(&[1, 3, 0, 2, 4, 1], 0, &blocks_b, 2, &mut wb)],
+                &mut kv,
+            )
+            .unwrap();
         let mut kv_unbatched = kv.clone();
 
         // A's next token lands at position 3 (block 1, slot 1); B's would be
         // position 6, so give B a block table with room via a 4th block.
         let blocks_b = [BlockID(2), BlockID(3), BlockID(4), BlockID(5)];
-        let logits_a = model.forward(&[item(&[4], 3, &blocks_a, 2, &mut wa)], &mut kv_unbatched).unwrap();
-        let logits_b = model.forward(&[item(&[4], 6, &blocks_b, 2, &mut wb)], &mut kv_unbatched).unwrap();
+        let logits_a = model
+            .forward(&[item(&[4], 3, &blocks_a, 2, &mut wa)], &mut kv_unbatched)
+            .unwrap();
+        let logits_b = model
+            .forward(&[item(&[4], 6, &blocks_b, 2, &mut wb)], &mut kv_unbatched)
+            .unwrap();
 
         let items = [
             item(&[4], 3, &blocks_a, 2, &mut wa),

@@ -1,7 +1,7 @@
 use clap::Parser;
 use rvllm::engine::{self, RequestSpec};
-use rvllm::sampler::Sampler;
 use rvllm::model::Model;
+use rvllm::sampler::Sampler;
 use rvllm::tokenizer::SmollLM230MTokenizer;
 
 #[derive(Parser)]
@@ -52,8 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let block_size = args.block_size;
     let blocks_per_seq = (config.context_length as usize).div_ceil(block_size);
-    let num_blocks =
-        args.num_blocks.unwrap_or_else(|| blocks_per_seq * args.prompt.len().max(1));
+    let num_blocks = args
+        .num_blocks
+        .unwrap_or_else(|| blocks_per_seq * args.prompt.len().max(1));
 
     let requests: Vec<RequestSpec> = args
         .prompt
@@ -62,7 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|(i, prompt)| {
             let tokens = smoll_tokenizer.encode(prompt)?;
             let arrival_step = args.arrival_step.get(i).copied().unwrap_or(0);
-            Ok(RequestSpec { tokens, max_tokens: args.max_tokens, arrival_step })
+            Ok(RequestSpec {
+                tokens,
+                max_tokens: args.max_tokens,
+                arrival_step,
+            })
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 

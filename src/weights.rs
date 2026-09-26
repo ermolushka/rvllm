@@ -19,7 +19,9 @@ impl Model {
         let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path))?;
         let device = Device::Cpu;
         let mut load = |name: &str| -> Result<Tensor> {
-            content.tensor(&mut file, name, &device)?.dequantize(&device)
+            content
+                .tensor(&mut file, name, &device)?
+                .dequantize(&device)
         };
 
         let token_embd = load("token_embd.weight")?;
@@ -63,6 +65,12 @@ impl Model {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Model { config, token_embd, layers, output_norm, output })
+        Ok(Model {
+            config,
+            token_embd,
+            layers,
+            output_norm,
+            output,
+        })
     }
 }
