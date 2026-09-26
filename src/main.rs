@@ -43,13 +43,13 @@ struct Args {
 }
 
 #[cfg(feature = "cuda")]
-fn test_cuda() -> () {
+fn test_cuda() -> Result<(), Box<dyn std::error::Error> {
     let ctx = cudarc::driver::CudaContext::new(0)?;
     let stream = ctx.default_stream();
 
     // copy a rust slice to the device
     let inp = stream.clone_htod(&[1.0f32; 100])?;
-
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
