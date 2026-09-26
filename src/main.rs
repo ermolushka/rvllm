@@ -42,6 +42,16 @@ struct Args {
     debug: bool,
 }
 
+#[cfg(feature = "cuda")]
+fn test_cuda() -> () {
+    let ctx = cudarc::driver::CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+
+    // copy a rust slice to the device
+    let inp = stream.clone_htod(&[1.0f32; 100])?;
+
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let model = Model::load(&args.model)?;
