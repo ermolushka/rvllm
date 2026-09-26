@@ -42,26 +42,7 @@ struct Args {
     debug: bool,
 }
 
-#[cfg(feature = "cuda")]
-fn test_cuda() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = cudarc::driver::CudaContext::new(0)?;
-    let stream = ctx.default_stream();
-    println!("CUDA");
-    // copy a rust slice to the device
-    let h_inp = [1, 2, 3];
-    let inp = stream.clone_htod(&h_inp)?;
-    let out = stream.clone_dtoh(&inp)?;
-    assert_eq!(out, h_inp);
-
-    Ok(())
-}
-#[cfg(not(feature = "cuda"))]
-fn test_cuda() -> Result<(), Box<dyn std::error::Error>> {
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    test_cuda();
     let args = Args::parse();
     let model = Model::load(&args.model)?;
     let config = &model.config;
