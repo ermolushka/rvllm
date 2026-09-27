@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub struct CudaRuntime {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
-    pub kernels_mapping: HashMap<&'static str, CudaFunction>,
+    pub kernels_mapping: HashMap<String, CudaFunction>,
 }
 
 impl CudaRuntime {
@@ -22,17 +22,18 @@ impl CudaRuntime {
     }
     pub fn load_kernels(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // helper that takes the kernel source, compiles it with NVRTC, and loads the module
-        let silu_ptx = cudarc::nvrtc::compile_ptx(include_str!("kernels/silu.cu"))?;
-        let module = self.ctx.load_module(silu_ptx)?;
-        let silu_kernel = module.load_function("silu")?;
-        self.kernels_mapping.insert("silu", silu_kernel);
+        self.load_single_kernel("kernels/silu.cu".to_string(), "silu".to_string())?;
+        self.load_single_kernel("kernels/silu_gate_multiply.cu".to_string(), "silu_gate_multiply".to_string())?;
+        Ok(())
+    }
 
-        let silu_gate_multiply_ptx =
-            cudarc::nvrtc::compile_ptx(include_str!("kernels/silu_gate_multiply.cu"))?;
-        let module = self.ctx.load_module(silu_gate_multiply_ptx)?;
-        let silu_gate_multiply_kernel = module.load_function("silu_gate_multiply")?;
-        self.kernels_mapping
-            .insert("silu_gate_multiply", silu_gate_multiply_kernel);
+    pub fn load_single_kernel(&mut self, kernel_path: String, kernel_name: String) -> Result<(), Box<dyn std::error::Error>> {
+        let source = std::fs::read_to_string(&kernel_path)?;
+        let ptx = cudarc::nvrtc::compile_ptx(source)?;
+        let module = self.ctx.load_module(ptx)?;
+        let kernel = module.load_function(kernel_name.as_str())?;
+        self.kernels_mapping.insert(kernel_name, kernel);
+
         Ok(())
     }
 }
