@@ -57,6 +57,51 @@ pub fn silu_gate_multiply_wrapper(
     Ok(())
 }
 
+pub fn rmsnorm_wrapper(
+    cuda_runtime: &CudaRuntime,
+    x: &CudaSlice<f32>,
+    weight: &CudaSlice<f32>,
+    hidden_dim: u32,
+    eps: f32,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = x.len() as u32;
+
+    if output.len() != x.len() {
+        return Err("RMSNorm: input and output have different lengths".into());
+    }
+    if n == 0 {
+        return Err("RMSNorm: input len is 0".into());
+    }
+    if hidden_dim == 0 || n % hidden_dim != 0 {
+        return Err("RMSNorm: input length is not a multiple of hidden_dim".into());
+    }
+    if weight.len() as u32 != hidden_dim {
+        return Err("RMSNorm: weight length must equal hidden_dim".into());
+    }
+    match cuda_runtime.kernels_mapping.get("rmsnorm") {
+        Some(kernel) => {
+            let num_rows = n / hidden_dim;
+            let block_size: u32 = 256;
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(x);
+            builder.arg(weight);
+            builder.arg(output);
+            builder.arg(&hidden_dim);
+            builder.arg(&eps);
+            let cfg = LaunchConfig {
+                grid_dim: (num_rows, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: block_size * std::mem::size_of::<f32>() as u32,
+            };
+            unsafe { builder.launch(cfg) }?;
+        }
+        None => return Err("Error: kernel 'rmsnorm' not found".into()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +190,108 @@ mod tests {
         let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(2).unwrap();
         assert!(silu_wrapper(&rt, &input, &mut output).is_err());
+    }
+
+    fn rms_norm_cpu(row: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+        let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / row.len() as f32;
+        let rms = (mean_sq + eps).sqrt();
+        row.iter().zip(weight).map(|(v, w)| (v / rms) * w).collect()
+    }
+
+    #[test]
+    fn rmsnorm_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        // hidden_dim = 37 doesn't divide 256 (the kernel's block size), so this
+        // exercises the grid-stride tail in both the sum and the write-back loop.
+        // 5 rows so the "one block per row" grid dimension is actually tested,
+        // not just a single-block launch.
+        let hidden_dim = 37usize;
+        let num_rows = 5usize;
+        let eps = 1e-5f32;
+
+        let host: Vec<f32> = (0..hidden_dim * num_rows)
+            .map(|i| (i as f32 - (hidden_dim * num_rows) as f32 / 2.0) * 0.05)
+            .collect();
+        // Non-uniform weight so a row/column indexing bug (e.g. weight indexed
+        // by flat offset instead of column) shows up as a mismatch.
+        let weight: Vec<f32> = (0..hidden_dim).map(|i| 1.0 + (i as f32) * 0.1).collect();
+
+        let input = rt.stream.clone_htod(&host).unwrap();
+        let weight_dev = rt.stream.clone_htod(&weight).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
+        rmsnorm_wrapper(&rt, &input, &weight_dev, hidden_dim as u32, eps, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        for row in 0..num_rows {
+            let start = row * hidden_dim;
+            let row_in = &host[start..start + hidden_dim];
+            let want = rms_norm_cpu(row_in, &weight, eps);
+            for i in 0..hidden_dim {
+                let g = got[start + i];
+                let w = want[i];
+                let tol = 1e-5 * w.abs().max(1.0);
+                assert!((g - w).abs() < tol, "row={row} i={i}: got {g}, want {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn rmsnorm_matches_candle_reference() {
+        let Some(rt) = runtime() else { return };
+        let hidden_dim = 8usize;
+        let num_rows = 3usize;
+        let eps = 1e-5f32;
+
+        let host: Vec<f32> = (0..hidden_dim * num_rows).map(|i| (i as f32 - 12.0) * 0.3).collect();
+        let weight: Vec<f32> = (0..hidden_dim).map(|i| 0.5 + i as f32 * 0.2).collect();
+
+        let input = rt.stream.clone_htod(&host).unwrap();
+        let weight_dev = rt.stream.clone_htod(&weight).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
+        rmsnorm_wrapper(&rt, &input, &weight_dev, hidden_dim as u32, eps, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        let cpu = candle_core::Device::Cpu;
+        let x_t = candle_core::Tensor::from_slice(&host, (num_rows, hidden_dim), &cpu).unwrap();
+        let w_t = candle_core::Tensor::from_slice(&weight, hidden_dim, &cpu).unwrap();
+        let want: Vec<f32> = crate::model::rms_norm(&x_t, &w_t, eps)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        assert_eq!(got.len(), want.len());
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            let tol = 1e-5 * w.abs().max(1.0);
+            assert!((g - w).abs() < tol, "i={i}: got {g}, candle {w}");
+        }
+    }
+
+    #[test]
+    fn rmsnorm_rejects_mismatched_output_length() {
+        let Some(rt) = runtime() else { return };
+        let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let weight = rt.stream.clone_htod(&[1.0f32, 1.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(rmsnorm_wrapper(&rt, &input, &weight, 2, 1e-5, &mut output).is_err());
+    }
+
+    #[test]
+    fn rmsnorm_rejects_hidden_dim_not_dividing_input() {
+        let Some(rt) = runtime() else { return };
+        let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
+        let weight = rt.stream.clone_htod(&[1.0f32, 1.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(rmsnorm_wrapper(&rt, &input, &weight, 2, 1e-5, &mut output).is_err());
+    }
+
+    #[test]
+    fn rmsnorm_rejects_wrong_weight_length() {
+        let Some(rt) = runtime() else { return };
+        let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let weight = rt.stream.clone_htod(&[1.0f32, 1.0, 1.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(4).unwrap();
+        assert!(rmsnorm_wrapper(&rt, &input, &weight, 2, 1e-5, &mut output).is_err());
     }
 }
