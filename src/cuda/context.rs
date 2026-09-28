@@ -25,6 +25,7 @@ impl CudaRuntime {
         self.load_single_kernel("kernels/silu.cu".to_string(), "silu".to_string())?;
         self.load_single_kernel("kernels/silu_gate_multiply.cu".to_string(), "silu_gate_multiply".to_string())?;
         self.load_single_kernel("kernels/rmsnorm.cu".to_string(), "rmsnorm".to_string())?;
+        self.load_single_kernel("kernels/rope.cu".to_string(), "rope".to_string())?;
         Ok(())
     }
 

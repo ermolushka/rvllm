@@ -102,6 +102,51 @@ pub fn rmsnorm_wrapper(
     Ok(())
 }
 
+// x, out: [n_rows, head_dim] flattened. cos, sin: [n_rows, half] flattened,
+// pre-expanded on the host so row i of cos/sin lines up with row i of x.
+pub fn rope_wrapper(
+    cuda_runtime: &CudaRuntime,
+    x: &CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    head_dim: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if output.len() != x.len() {
+        return Err("RoPE: input and output have different lengths".into());
+    }
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return Err("RoPE: head_dim must be a positive even number".into());
+    }
+    let n = x.len() as u32;
+    if n == 0 || n % head_dim != 0 {
+        return Err("RoPE: input length is not a multiple of head_dim".into());
+    }
+    let half = head_dim / 2;
+    let n_rows = n / head_dim;
+    let n_pairs = n_rows * half;
+    if cos.len() as u32 != n_pairs || sin.len() as u32 != n_pairs {
+        return Err("RoPE: cos/sin length must equal n_rows * (head_dim / 2)".into());
+    }
+
+    match cuda_runtime.kernels_mapping.get("rope") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(x);
+            builder.arg(cos);
+            builder.arg(sin);
+            builder.arg(output);
+            builder.arg(&head_dim);
+            builder.arg(&half);
+            builder.arg(&n_pairs);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n_pairs)) }?;
+        }
+        None => return Err("Error: kernel 'rope' not found".into()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +338,108 @@ mod tests {
         let weight = rt.stream.clone_htod(&[1.0f32, 1.0, 1.0]).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(4).unwrap();
         assert!(rmsnorm_wrapper(&rt, &input, &weight, 2, 1e-5, &mut output).is_err());
+    }
+
+    #[test]
+    fn rope_position_one_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        // Same case as model.rs's rope_position_one_hand_computed: head_dim=4,
+        // rope_theta=10000 -> theta_0=1, theta_1=0.01. Row 0 = position 0
+        // (identity), row 1 = position 1. Rotate-half pairs are (x0,x2) and
+        // (x1,x3); both pairs' "x" component is 1, "y" component is 0.
+        let head_dim = 4u32;
+        let x: Vec<f32> = vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+        // cos/sin pre-expanded per row: row 0 is position 0 (angle 0), row 1 is
+        // position 1 (angles 1.0 and 0.01 for pair 0 and pair 1).
+        let cos: Vec<f32> = vec![0f32.cos(), 0f32.cos(), 1f32.cos(), 0.01f32.cos()];
+        let sin: Vec<f32> = vec![0f32.sin(), 0f32.sin(), 1f32.sin(), 0.01f32.sin()];
+
+        let x_dev = rt.stream.clone_htod(&x).unwrap();
+        let cos_dev = rt.stream.clone_htod(&cos).unwrap();
+        let sin_dev = rt.stream.clone_htod(&sin).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(x.len()).unwrap();
+        rope_wrapper(&rt, &x_dev, &cos_dev, &sin_dev, &mut output, head_dim).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        let expected_row0 = [1f32, 1.0, 0.0, 0.0];
+        let expected_row1 = [1f32.cos(), 0.01f32.cos(), 1f32.sin(), 0.01f32.sin()];
+        for (got, want) in got[0..4].iter().zip(expected_row0.iter()) {
+            assert!((got - want).abs() < 1e-4, "row0: got {got}, want {want}");
+        }
+        for (got, want) in got[4..8].iter().zip(expected_row1.iter()) {
+            assert!((got - want).abs() < 1e-4, "row1: got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn rope_matches_candle_reference() {
+        let Some(rt) = runtime() else { return };
+        let head_dim = 8usize;
+        let half = head_dim / 2;
+        let positions = [0usize, 1, 5, 12];
+        let rope_theta = 10000.0f32;
+
+        let host: Vec<f32> = (0..head_dim * positions.len())
+            .map(|i| (i as f32 - 16.0) * 0.1)
+            .collect();
+
+        let cpu = candle_core::Device::Cpu;
+        let x_t = candle_core::Tensor::from_slice(&host, (positions.len(), head_dim), &cpu).unwrap();
+        let want: Vec<f32> = crate::model::rope(&x_t, rope_theta, &cpu, &positions)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        // Pre-expand cos/sin per row, same as the host is responsible for doing
+        // before calling rope_wrapper.
+        let (cos_t, sin_t) = crate::model::rope_cos_sin(rope_theta, head_dim, &positions, &cpu).unwrap();
+        let cos: Vec<f32> = cos_t.flatten_all().unwrap().to_vec1().unwrap();
+        let sin: Vec<f32> = sin_t.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(cos.len(), positions.len() * half);
+
+        let x_dev = rt.stream.clone_htod(&host).unwrap();
+        let cos_dev = rt.stream.clone_htod(&cos).unwrap();
+        let sin_dev = rt.stream.clone_htod(&sin).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
+        rope_wrapper(&rt, &x_dev, &cos_dev, &sin_dev, &mut output, head_dim as u32).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        assert_eq!(got.len(), want.len());
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            let tol = 1e-4 * w.abs().max(1.0);
+            assert!((g - w).abs() < tol, "i={i}: got {g}, candle {w}");
+        }
+    }
+
+    #[test]
+    fn rope_rejects_mismatched_output_length() {
+        let Some(rt) = runtime() else { return };
+        let x = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let cos = rt.stream.clone_htod(&[1.0f32, 1.0]).unwrap();
+        let sin = rt.stream.clone_htod(&[0.0f32, 0.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(rope_wrapper(&rt, &x, &cos, &sin, &mut output, 4).is_err());
+    }
+
+    #[test]
+    fn rope_rejects_odd_head_dim() {
+        let Some(rt) = runtime() else { return };
+        let x = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
+        let cos = rt.stream.clone_htod(&[1.0f32]).unwrap();
+        let sin = rt.stream.clone_htod(&[0.0f32]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(rope_wrapper(&rt, &x, &cos, &sin, &mut output, 3).is_err());
+    }
+
+    #[test]
+    fn rope_rejects_wrong_cos_sin_length() {
+        let Some(rt) = runtime() else { return };
+        let x = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let cos = rt.stream.clone_htod(&[1.0f32]).unwrap();
+        let sin = rt.stream.clone_htod(&[0.0f32]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(4).unwrap();
+        assert!(rope_wrapper(&rt, &x, &cos, &sin, &mut output, 4).is_err());
     }
 }
