@@ -26,32 +26,36 @@ impl CudaRuntime {
         Ok(cuda_runtime)
     }
     pub fn load_kernels(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // helper that takes the kernel source, compiles it with NVRTC, and loads the module
-        self.load_single_kernel("kernels/silu.cu".to_string(), "silu".to_string())?;
+        // Embedded at compile time (relative to this file, not the process's
+        // cwd at runtime) - `std::fs::read_to_string` on a relative path was
+        // the earlier approach, but it silently depended on launching the
+        // binary from inside src/cuda/, which no normal `cargo run`/`cargo
+        // test` invocation does.
+        self.load_single_kernel(include_str!("kernels/silu.cu"), "silu".to_string())?;
         self.load_single_kernel(
-            "kernels/silu_gate_multiply.cu".to_string(),
+            include_str!("kernels/silu_gate_multiply.cu"),
             "silu_gate_multiply".to_string(),
         )?;
-        self.load_single_kernel("kernels/rmsnorm.cu".to_string(), "rmsnorm".to_string())?;
-        self.load_single_kernel("kernels/rope.cu".to_string(), "rope".to_string())?;
-        self.load_single_kernel("kernels/kv_write.cu".to_string(), "kv_write".to_string())?;
-        self.load_single_kernel("kernels/kv_gather.cu".to_string(), "kv_gather".to_string())?;
-        self.load_single_kernel("kernels/softmax.cu".to_string(), "softmax".to_string())?;
-        self.load_single_kernel("kernels/add.cu".to_string(), "add".to_string())?;
+        self.load_single_kernel(include_str!("kernels/rmsnorm.cu"), "rmsnorm".to_string())?;
+        self.load_single_kernel(include_str!("kernels/rope.cu"), "rope".to_string())?;
+        self.load_single_kernel(include_str!("kernels/kv_write.cu"), "kv_write".to_string())?;
+        self.load_single_kernel(include_str!("kernels/kv_gather.cu"), "kv_gather".to_string())?;
+        self.load_single_kernel(include_str!("kernels/softmax.cu"), "softmax".to_string())?;
+        self.load_single_kernel(include_str!("kernels/add.cu"), "add".to_string())?;
         self.load_single_kernel(
-            "kernels/embed_lookup.cu".to_string(),
+            include_str!("kernels/embed_lookup.cu"),
             "embed_lookup".to_string(),
         )?;
         self.load_single_kernel(
-            "kernels/mask_add_broadcast.cu".to_string(),
+            include_str!("kernels/mask_add_broadcast.cu"),
             "mask_add_broadcast".to_string(),
         )?;
         self.load_single_kernel(
-            "kernels/transpose_axes12.cu".to_string(),
+            include_str!("kernels/transpose_axes12.cu"),
             "transpose_axes12".to_string(),
         )?;
         self.load_single_kernel(
-            "kernels/narrow_last_row.cu".to_string(),
+            include_str!("kernels/narrow_last_row.cu"),
             "narrow_last_row".to_string(),
         )?;
         Ok(())
@@ -59,10 +63,9 @@ impl CudaRuntime {
 
     pub fn load_single_kernel(
         &mut self,
-        kernel_path: String,
+        source: &str,
         kernel_name: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let source = std::fs::read_to_string(&kernel_path)?;
         let ptx = cudarc::nvrtc::compile_ptx(source)?;
         let module = self.ctx.load_module(ptx)?;
         let kernel = module.load_function(kernel_name.as_str())?;
