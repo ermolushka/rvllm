@@ -12,7 +12,9 @@ extern "C" __global__ void softmax(
 
     // pass 1: row max, for numerical stability. Identity is -inf (not 0),
     // so a row that's legitimately all-negative still reduces correctly.
-    float partial_max = -INFINITY;
+    // NVRTC compiles without <math.h>, so INFINITY isn't defined - build
+    // -inf from its IEEE-754 bit pattern instead (0x7f800000 = +inf).
+    float partial_max = -__int_as_float(0x7f800000);
     for (unsigned int i = tid; i < row_len; i += blockDim.x) {
         partial_max = fmaxf(partial_max, row_in[i]);
     }
