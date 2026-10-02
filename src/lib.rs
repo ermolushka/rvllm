@@ -1,3 +1,5 @@
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod engine;
 pub mod kv_storage;
 pub mod model;

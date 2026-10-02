@@ -18,7 +18,11 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(temperature: f32, top_p: f32, seed: u64) -> Self {
-        Sampler { temperature, top_p, rng: StdRng::seed_from_u64(seed) }
+        Sampler {
+            temperature,
+            top_p,
+            rng: StdRng::seed_from_u64(seed),
+        }
     }
 
     pub fn sample(&mut self, logits: &Tensor) -> candle_core::Result<u32> {
@@ -28,9 +32,13 @@ impl Sampler {
 
         let logits: Vec<f32> = logits.to_vec1()?;
         let inv_temp = 1.0 / self.temperature;
-        let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b * inv_temp));
-        let mut probs: Vec<f32> =
-            logits.iter().map(|&l| (l * inv_temp - max_logit).exp()).collect();
+        let max_logit = logits
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, &b| a.max(b * inv_temp));
+        let mut probs: Vec<f32> = logits
+            .iter()
+            .map(|&l| (l * inv_temp - max_logit).exp())
+            .collect();
         let sum: f32 = probs.iter().sum();
         for p in probs.iter_mut() {
             *p /= sum;
@@ -116,8 +124,13 @@ mod tests {
     // `Sampler::sample` originally did it.
     fn full_sort_sample(logits: &[f32], temperature: f32, top_p: f32, rng: &mut StdRng) -> u32 {
         let inv_temp = 1.0 / temperature;
-        let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b * inv_temp));
-        let mut probs: Vec<f32> = logits.iter().map(|&l| (l * inv_temp - max_logit).exp()).collect();
+        let max_logit = logits
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, &b| a.max(b * inv_temp));
+        let mut probs: Vec<f32> = logits
+            .iter()
+            .map(|&l| (l * inv_temp - max_logit).exp())
+            .collect();
         let sum: f32 = probs.iter().sum();
         for p in probs.iter_mut() {
             *p /= sum;
@@ -158,10 +171,22 @@ mod tests {
         // The tail is made of distinct values on purpose: exactly-tied tokens
         // have no defined order in an unstable sort, so the same seed could
         // legitimately pick a different one of them.
-        let peaked: Vec<f32> =
-            (0..500).map(|i| if i < 3 { 8.0 - i as f32 } else { i as f32 * 1e-4 }).collect();
+        let peaked: Vec<f32> = (0..500)
+            .map(|i| {
+                if i < 3 {
+                    8.0 - i as f32
+                } else {
+                    i as f32 * 1e-4
+                }
+            })
+            .collect();
 
-        for (logits, top_p) in [(&flat, 0.95f32), (&flat, 1.0), (&peaked, 0.5), (&peaked, 0.99)] {
+        for (logits, top_p) in [
+            (&flat, 0.95f32),
+            (&flat, 1.0),
+            (&peaked, 0.5),
+            (&peaked, 0.99),
+        ] {
             let tensor = Tensor::new(logits.as_slice(), &device).unwrap();
             let mut sampler = Sampler::new(1.0, top_p, 7);
             let mut reference_rng = StdRng::seed_from_u64(7);

@@ -1,7 +1,9 @@
 use clap::Parser;
 use rvllm::engine::{self, RequestSpec};
-use rvllm::sampler::Sampler;
+#[cfg(feature = "cuda")]
+use rvllm::engine::RunResult;
 use rvllm::model::Model;
+use rvllm::sampler::Sampler;
 use rvllm::tokenizer::SmollLM230MTokenizer;
 
 #[derive(Parser)]
@@ -40,6 +42,25 @@ struct Args {
     // throughput stats. Without it, only the completion text is printed.
     #[arg(long)]
     debug: bool,
+    // "cpu" (default) or "cuda" - requires building with --features cuda.
+    #[arg(long, default_value = "cpu")]
+    device: String,
+}
+
+// Blocks needed to let every request reach its own prompt+max_tokens length
+// at once, capped at the model's context_length - sized off what the
+// requests actually need rather than the model's full context_length per
+// sequence, which would reserve far more than necessary (and on a GPU,
+// "far more than necessary" can mean OOM well before the pool is close to
+// full - see bin/bench.rs's num_blocks_for for the same fix applied there).
+fn default_num_blocks(requests: &[RequestSpec], context_length: usize, block_size: usize) -> usize {
+    let max_tokens_per_seq = requests
+        .iter()
+        .map(|r| (r.tokens.len() + r.max_tokens).min(context_length))
+        .max()
+        .unwrap_or(0);
+    let blocks_per_seq = max_tokens_per_seq.div_ceil(block_size).max(1);
+    blocks_per_seq * requests.len().max(1)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -51,9 +72,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         SmollLM230MTokenizer::from_file(&args.tokenizer, config.eos_token_id, config.bos_token_id)?;
 
     let block_size = args.block_size;
-    let blocks_per_seq = (config.context_length as usize).div_ceil(block_size);
-    let num_blocks =
-        args.num_blocks.unwrap_or_else(|| blocks_per_seq * args.prompt.len().max(1));
 
     let requests: Vec<RequestSpec> = args
         .prompt
@@ -62,12 +80,31 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|(i, prompt)| {
             let tokens = smoll_tokenizer.encode(prompt)?;
             let arrival_step = args.arrival_step.get(i).copied().unwrap_or(0);
-            Ok(RequestSpec { tokens, max_tokens: args.max_tokens, arrival_step })
+            Ok(RequestSpec {
+                tokens,
+                max_tokens: args.max_tokens,
+                arrival_step,
+            })
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
+    let num_blocks = args.num_blocks.unwrap_or_else(|| {
+        default_num_blocks(&requests, config.context_length as usize, block_size)
+    });
+
     let mut sampler = Sampler::new(args.temperature, args.top_p, args.seed);
-    let result = engine::run(&model, &requests, block_size, num_blocks, &mut sampler)?;
+    let result = if args.device == "cuda" {
+        #[cfg(feature = "cuda")]
+        {
+            run_cuda(&model, &requests, block_size, num_blocks, &mut sampler)?
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            return Err("built without the `cuda` feature; rebuild with --features cuda".into());
+        }
+    } else {
+        engine::run(&model, &requests, block_size, num_blocks, &mut sampler)?
+    };
 
     for (i, generated) in result.generated.iter().enumerate() {
         let text = smoll_tokenizer.decode(generated)?;
@@ -102,4 +139,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_cuda(
+    model: &Model,
+    requests: &[RequestSpec],
+    block_size: usize,
+    num_blocks: usize,
+    sampler: &mut Sampler,
+) -> Result<RunResult, Box<dyn std::error::Error + Send + Sync>> {
+    let cuda_runtime = rvllm::cuda::context::CudaRuntime::new(0)
+        .map_err(|e| format!("CUDA init failed: {e}"))?;
+    let cuda_model = rvllm::cuda::model::CudaModel::upload(&cuda_runtime, model)
+        .map_err(|e| format!("weight upload failed: {e}"))?;
+    rvllm::cuda::engine::run(
+        &cuda_runtime,
+        &cuda_model,
+        requests,
+        block_size,
+        num_blocks,
+        sampler,
+    )
+    .map_err(|e| e.to_string().into())
 }

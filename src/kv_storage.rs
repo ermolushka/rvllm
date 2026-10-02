@@ -17,7 +17,10 @@ impl Clone for KvStorage {
                 .map(|t| t.copy().expect("copying a KV cache tensor"))
                 .collect()
         };
-        KvStorage { kv_k: deep(&self.kv_k), kv_v: deep(&self.kv_v) }
+        KvStorage {
+            kv_k: deep(&self.kv_k),
+            kv_v: deep(&self.kv_v),
+        }
     }
 }
 
@@ -39,7 +42,11 @@ impl GatherPlan {
     pub fn new(items: &[(&[BlockID], usize)], device: &Device) -> Result<Self> {
         let batch = items.len();
         let ctx_len = items.iter().map(|&(_, n)| n).max().unwrap_or(0);
-        let max_blocks = items.iter().map(|&(blocks, _)| blocks.len()).max().unwrap_or(0);
+        let max_blocks = items
+            .iter()
+            .map(|&(blocks, _)| blocks.len())
+            .max()
+            .unwrap_or(0);
 
         let mut idx: Vec<u32> = Vec::with_capacity(batch * max_blocks);
         for &(blocks, _) in items {
@@ -51,7 +58,12 @@ impl GatherPlan {
             idx.resize(idx.len() + (max_blocks - blocks.len()), pad);
         }
         let block_idx = Tensor::from_vec(idx, batch * max_blocks, device)?;
-        Ok(GatherPlan { block_idx, batch, max_blocks, ctx_len })
+        Ok(GatherPlan {
+            block_idx,
+            batch,
+            max_blocks,
+            ctx_len,
+        })
     }
 
     // Longest real context in the batch: the `ctx_len` dim of `gather`'s output.
@@ -103,10 +115,18 @@ impl KvStorage {
                 len += 1;
             }
             let block = block_id.0 as usize;
-            let run_k = k.narrow(0, start, len)?.reshape((1, len, n_kv_heads, head_dim))?;
-            let run_v = v.narrow(0, start, len)?.reshape((1, len, n_kv_heads, head_dim))?;
-            self.kv_k[layer].narrow(0, block, 1)?.slice_set(&run_k, 1, offset)?;
-            self.kv_v[layer].narrow(0, block, 1)?.slice_set(&run_v, 1, offset)?;
+            let run_k = k
+                .narrow(0, start, len)?
+                .reshape((1, len, n_kv_heads, head_dim))?;
+            let run_v = v
+                .narrow(0, start, len)?
+                .reshape((1, len, n_kv_heads, head_dim))?;
+            self.kv_k[layer]
+                .narrow(0, block, 1)?
+                .slice_set(&run_k, 1, offset)?;
+            self.kv_v[layer]
+                .narrow(0, block, 1)?
+                .slice_set(&run_v, 1, offset)?;
             start += len;
         }
         Ok(())
@@ -122,7 +142,12 @@ impl KvStorage {
             let blocks = cache.index_select(&plan.block_idx, 0)?;
             let (_, block_size, n_kv_heads, head_dim) = blocks.dims4()?;
             blocks
-                .reshape((plan.batch, plan.max_blocks * block_size, n_kv_heads, head_dim))?
+                .reshape((
+                    plan.batch,
+                    plan.max_blocks * block_size,
+                    n_kv_heads,
+                    head_dim,
+                ))?
                 .narrow(1, 0, plan.ctx_len)?
                 .transpose(1, 2)?
                 .contiguous()
@@ -142,7 +167,9 @@ mod tests {
     // K/V rows for `n` tokens with one kv head and head_dim 2: token i holds
     // [base + i, base + i + 0.5], so every slot is distinguishable.
     fn rows(base: f32, n: usize, device: &Device) -> Tensor {
-        let data: Vec<f32> = (0..n).flat_map(|i| [base + i as f32, base + i as f32 + 0.5]).collect();
+        let data: Vec<f32> = (0..n)
+            .flat_map(|i| [base + i as f32, base + i as f32 + 0.5])
+            .collect();
         Tensor::from_vec(data, (n, 1, 2), device).unwrap()
     }
 
@@ -154,7 +181,13 @@ mod tests {
         let mut kv = KvStorage::new(1, 3, 2, 1, 2, &device).unwrap();
         let a = rows(10.0, 3, &device);
         let b = rows(20.0, 1, &device);
-        kv.write_tokens(0, &[(BlockID(0), 0), (BlockID(0), 1), (BlockID(1), 0)], &a, &a).unwrap();
+        kv.write_tokens(
+            0,
+            &[(BlockID(0), 0), (BlockID(0), 1), (BlockID(1), 0)],
+            &a,
+            &a,
+        )
+        .unwrap();
         kv.write_tokens(0, &[(BlockID(2), 0)], &b, &b).unwrap();
 
         let blocks_a = [BlockID(0), BlockID(1)];
@@ -192,7 +225,9 @@ mod tests {
         let mut original = KvStorage::new(1, 1, 2, 1, 2, &device).unwrap();
         let snapshot = original.clone();
         let t = rows(1.0, 1, &device);
-        original.write_tokens(0, &[(BlockID(0), 0)], &t, &t).unwrap();
+        original
+            .write_tokens(0, &[(BlockID(0), 0)], &t, &t)
+            .unwrap();
 
         let blocks = [BlockID(0)];
         let plan = GatherPlan::new(&[(&blocks, 1)], &device).unwrap();

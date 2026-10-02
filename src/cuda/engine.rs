@@ -1,52 +1,25 @@
-// Continuous-batching decode loop, shared by the interactive CLI (`main.rs`)
-// and the benchmark harness (`bench.rs`). Lifted out of `main.rs` unchanged
-// except: (1) parameterized over an arbitrary set of requests instead of
-// `Args`, (2) next-token selection goes through `Sampler` instead of a bare
-// `argmax`, (3) it now returns per-request outputs plus timing/pool stats
-// instead of printing them.
-
+// CUDA mirror of engine.rs's continuous-batching decode loop: same
+// Scheduler-driven admission/prefill/decode structure, but forward passes
+// go through CudaModel/CudaKvStorage. The seam PLAN.md's M6 names: logits
+// come back from CudaModel as a flat CudaSlice<f32>, copied to host once
+// per call, then wrapped per-row as a 1D CPU Tensor so the existing
+// Sampler (unchanged, CPU-only) can sample from it exactly as it does on
+// the CPU path.
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use candle_core::Result;
+use candle_core::{Device, Tensor};
 use kv_cache_scheduler::block_pool::BlockID;
 use kv_cache_scheduler::sequence::{Scheduler, SequenceId, TokenId};
 
-use crate::kv_storage::KvStorage;
-use crate::model::{BatchItem, Model};
+use crate::model::BatchItem;
 use crate::sampler::Sampler;
 
-pub struct RequestSpec {
-    pub tokens: Vec<u32>,
-    pub max_tokens: usize,
-    // Decode step at which this request becomes eligible for admission.
-    pub arrival_step: usize,
-}
+use super::context::CudaRuntime;
+use super::kv_storage::CudaKvStorage;
+use super::model::CudaModel;
 
-#[derive(Default)]
-pub struct RunStats {
-    pub steps: usize,
-    pub elapsed: Duration,
-    pub output_tokens: usize,
-    pub prefix_hits: usize,
-    pub prefix_total: usize,
-    pub total_block_allocs: usize,
-    // Wall time spent inside prefill forward calls / batched decode forward
-    // calls (incl. sampling), and how many tokens each processed.
-    pub prefill_time: Duration,
-    pub prefill_tokens: usize,
-    pub decode_time: Duration,
-    pub decode_steps: usize,
-    // Per-request time-to-first-token: prefill start -> first sampled token.
-    // Same order/length as the input `requests` slice.
-    pub ttft: Vec<Duration>,
-}
-
-pub struct RunResult {
-    // Same order/length as the input `requests` slice.
-    pub generated: Vec<Vec<u32>>,
-    pub stats: RunStats,
-}
+pub use crate::engine::{RequestSpec, RunResult, RunStats};
 
 struct PendingRequest {
     arrival_step: usize,
@@ -54,21 +27,14 @@ struct PendingRequest {
     tokens: Vec<u32>,
 }
 
-// Everything the engine tracks per sequence, keyed by the scheduler's id.
 struct SeqState {
-    // Index into the caller's `requests` slice.
     req_idx: usize,
-    // Length of the original prompt, before any generated tokens were appended.
     prompt_len: usize,
     max_tokens: usize,
     generated: Vec<u32>,
-    // Token to feed the next decode step: the last one sampled.
     next_input: u32,
 }
 
-// One running sequence's contribution to a decode step. Owned here so the
-// `BatchItem`s can borrow from it; the block table is borrowed straight from
-// the scheduler instead of copied.
 struct DecodeRow {
     seq_id: SequenceId,
     token: [u32; 1],
@@ -76,22 +42,34 @@ struct DecodeRow {
     position_offset: usize,
 }
 
+// Copies one row of a flat [rows, vocab_size] device buffer already on the
+// host back into a 1D CPU Tensor, the shape `Sampler::sample` expects.
+fn row_tensor(host: &[f32], row: usize, vocab_size: usize) -> candle_core::Result<Tensor> {
+    Tensor::from_slice(
+        &host[row * vocab_size..(row + 1) * vocab_size],
+        vocab_size,
+        &Device::Cpu,
+    )
+}
+
 pub fn run(
-    model: &Model,
+    cuda_runtime: &CudaRuntime,
+    model: &CudaModel,
     requests: &[RequestSpec],
     block_size: usize,
     num_blocks: usize,
     sampler: &mut Sampler,
-) -> Result<RunResult> {
+) -> Result<RunResult, Box<dyn std::error::Error>> {
     let config = &model.config;
+    let vocab_size = config.vocab_size as usize;
 
-    let mut kv_storage = KvStorage::new(
+    let mut kv_storage = CudaKvStorage::new(
+        cuda_runtime,
         config.n_layers as usize,
         num_blocks,
         block_size,
         config.n_kv_heads as usize,
         config.head_dim(),
-        model.device(),
     )?;
     let mut scheduler = Scheduler::new(num_blocks as u32, block_size);
 
@@ -116,8 +94,6 @@ pub fn run(
     let mut decode_steps = 0usize;
     let mut ttft = vec![Duration::ZERO; requests.len()];
     loop {
-        // 1. Admit every request whose arrival step has been reached - just
-        //    hands it to the scheduler (-> `waiting`), no blocks allocated yet.
         while pending.front().is_some_and(|r| r.arrival_step <= step_idx) {
             let req = pending.pop_front().unwrap();
             let prompt_len = req.tokens.len();
@@ -135,8 +111,6 @@ pub fn run(
             );
         }
 
-        // 2. Admit as many waiting requests as fit into freed/available
-        //    capacity, prefilling each with its own forward call.
         while let Some(&seq_id) = scheduler.waiting.front() {
             let needed_blocks = scheduler.sequences[&seq_id]
                 .token_ids
@@ -159,8 +133,6 @@ pub fn run(
                 .map(|i| seq.block_table.logical_to_physical(i))
                 .collect();
 
-            // Only the tokens past the cached prefix run through the model,
-            // but attention reads the sequence's whole block table.
             let item = BatchItem {
                 tokens: &tokens[skip_tokens..],
                 write_positions: &write_positions,
@@ -168,8 +140,9 @@ pub fn run(
                 read_num_tokens: seq.block_table.num_tokens(),
                 position_offset: skip_tokens,
             };
-            let logits = model.forward_last(&[item], &mut kv_storage)?; // [1, 1, vocab_size]
-            let next_id = sampler.sample(&logits.get(0)?.get(0)?)?;
+            let logits = model.forward_last(cuda_runtime, &[item], &mut kv_storage)?;
+            let host = cuda_runtime.stream.clone_dtoh(&logits)?;
+            let next_id = sampler.sample(&row_tensor(&host, 0, vocab_size)?)?;
             let prefill_elapsed = prefill_started.elapsed();
             prefill_time += prefill_elapsed;
             prefill_tokens += tokens.len() - skip_tokens;
@@ -183,8 +156,6 @@ pub fn run(
             break;
         }
 
-        // 3. Batched decode: every currently running sequence contributes
-        //    exactly one new token to a single forward call.
         if !scheduler.running.is_empty() {
             let decode_started = Instant::now();
             let running = scheduler.running.clone();
@@ -195,9 +166,6 @@ pub fn run(
 
             scheduler.step();
 
-            // A sequence that dropped out of `running` was preempted (its
-            // blocks evicted): rewind its token list to the real tokens so
-            // it re-prefills cleanly when readmitted.
             for &seq_id in &running {
                 if !scheduler.running.contains(&seq_id) {
                     let state = &seqs[&seq_id];
@@ -230,7 +198,7 @@ pub fn run(
                 });
             }
 
-            let logits = {
+            let host = {
                 let items: Vec<BatchItem> = rows
                     .iter()
                     .map(|row| {
@@ -244,11 +212,12 @@ pub fn run(
                         }
                     })
                     .collect();
-                model.forward(&items, &mut kv_storage)? // [batch, 1, vocab_size]
+                let logits = model.forward(cuda_runtime, &items, &mut kv_storage)?;
+                cuda_runtime.stream.clone_dtoh(&logits)?
             };
 
             for (i, row) in rows.iter().enumerate() {
-                let next_id = sampler.sample(&logits.get(i)?.get(0)?)?;
+                let next_id = sampler.sample(&row_tensor(&host, i, vocab_size)?)?;
                 let req = seqs.get_mut(&row.seq_id).unwrap();
                 req.generated.push(next_id);
                 let finished =

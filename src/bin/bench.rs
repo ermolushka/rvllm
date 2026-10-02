@@ -41,6 +41,9 @@ struct Args {
     // under more varied load than the fixed-length sweep.
     #[arg(long)]
     trace_file: Option<String>,
+    // "cpu" (default) or "cuda" - requires building with --features cuda.
+    #[arg(long, default_value = "cpu")]
+    device: String,
 }
 
 struct TraceEntry {
@@ -49,7 +52,9 @@ struct TraceEntry {
     arrival_step: usize,
 }
 
-fn parse_trace_file(path: &str) -> Result<Vec<TraceEntry>, Box<dyn std::error::Error + Send + Sync>> {
+fn parse_trace_file(
+    path: &str,
+) -> Result<Vec<TraceEntry>, Box<dyn std::error::Error + Send + Sync>> {
     let content = fs::read_to_string(path)?;
     let mut entries = Vec::new();
     for line in content.lines() {
@@ -89,43 +94,38 @@ fn synthetic_requests(
 ) -> Vec<RequestSpec> {
     (0..batch_size)
         .map(|_| RequestSpec {
-            tokens: (0..prompt_len).map(|_| rng.random_range(0..vocab_size)).collect(),
+            tokens: (0..prompt_len)
+                .map(|_| rng.random_range(0..vocab_size))
+                .collect(),
             max_tokens: gen_len,
             arrival_step: 0,
         })
         .collect()
 }
 
-fn requests_from_trace(rng: &mut StdRng, vocab_size: u32, trace: &[TraceEntry]) -> Vec<RequestSpec> {
+fn requests_from_trace(
+    rng: &mut StdRng,
+    vocab_size: u32,
+    trace: &[TraceEntry],
+) -> Vec<RequestSpec> {
     trace
         .iter()
         .map(|t| RequestSpec {
-            tokens: (0..t.prompt_len).map(|_| rng.random_range(0..vocab_size)).collect(),
+            tokens: (0..t.prompt_len)
+                .map(|_| rng.random_range(0..vocab_size))
+                .collect(),
             max_tokens: t.gen_len,
             arrival_step: t.arrival_step,
         })
         .collect()
 }
 
-fn run_and_report(
+fn report(
     label: &str,
-    model: &Model,
-    requests: &[RequestSpec],
-    block_size: usize,
-    seed: u64,
+    result: &engine::RunResult,
+    batch_size: usize,
+    num_blocks: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let batch_size = requests.len();
-    let blocks_per_seq = (model.config.context_length as usize).div_ceil(block_size);
-    let num_blocks = blocks_per_seq * batch_size.max(1);
-
-    // Warmup run (discarded) so the measured run isn't paying for first-touch
-    // allocation of the KV storage tensors, per the plan's "steady-state
-    // throughput once warmup is excluded".
-    let mut warmup_sampler = Sampler::new(0.0, 1.0, seed);
-    engine::run(model, requests, block_size, num_blocks, &mut warmup_sampler)?;
-
-    let mut sampler = Sampler::new(0.0, 1.0, seed);
-    let result = engine::run(model, requests, block_size, num_blocks, &mut sampler)?;
     let stats = &result.stats;
 
     let secs = stats.elapsed.as_secs_f64();
@@ -149,8 +149,7 @@ fn run_and_report(
     let ttft_mean = ttft_ms.iter().sum::<f64>() / ttft_ms.len().max(1) as f64;
     let ttft_max = ttft_ms.last().copied().unwrap_or(0.0);
     let prefill_tok_s = stats.prefill_tokens as f64 / stats.prefill_time.as_secs_f64().max(1e-9);
-    let decode_ms_step =
-        stats.decode_time.as_secs_f64() * 1e3 / stats.decode_steps.max(1) as f64;
+    let decode_ms_step = stats.decode_time.as_secs_f64() * 1e3 / stats.decode_steps.max(1) as f64;
 
     let steps = stats.steps;
     let total_allocs = stats.total_block_allocs;
@@ -167,9 +166,95 @@ fn run_and_report(
     Ok(())
 }
 
+// Blocks needed to let every request reach its own prompt+gen length at
+// once, not the model's full context_length per sequence - the difference
+// matters once batch sizes get large: reserving full-context_length worth
+// of blocks for every sequence regardless of how long it'll actually run is
+// cheap on CPU RAM but can blow a GPU's fixed VRAM budget well before the
+// pool is anywhere near full.
+fn num_blocks_for(requests: &[RequestSpec], context_length: usize, block_size: usize) -> usize {
+    let max_tokens_per_seq = requests
+        .iter()
+        .map(|r| (r.tokens.len() + r.max_tokens).min(context_length))
+        .max()
+        .unwrap_or(0);
+    let blocks_per_seq = max_tokens_per_seq.div_ceil(block_size).max(1);
+    blocks_per_seq * requests.len().max(1)
+}
+
+fn run_and_report(
+    label: &str,
+    model: &Model,
+    requests: &[RequestSpec],
+    block_size: usize,
+    seed: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let batch_size = requests.len();
+    let num_blocks = num_blocks_for(requests, model.config.context_length as usize, block_size);
+
+    // Warmup run (discarded) so the measured run isn't paying for first-touch
+    // allocation of the KV storage tensors, per the plan's "steady-state
+    // throughput once warmup is excluded".
+    let mut warmup_sampler = Sampler::new(0.0, 1.0, seed);
+    engine::run(model, requests, block_size, num_blocks, &mut warmup_sampler)?;
+
+    let mut sampler = Sampler::new(0.0, 1.0, seed);
+    let result = engine::run(model, requests, block_size, num_blocks, &mut sampler)?;
+    report(label, &result, batch_size, num_blocks)
+}
+
+#[cfg(feature = "cuda")]
+fn run_and_report_cuda(
+    label: &str,
+    cuda_runtime: &rvllm::cuda::context::CudaRuntime,
+    cuda_model: &rvllm::cuda::model::CudaModel,
+    requests: &[RequestSpec],
+    block_size: usize,
+    seed: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use rvllm::cuda::engine as cuda_engine;
+
+    let batch_size = requests.len();
+    let num_blocks = num_blocks_for(requests, cuda_model.config.context_length as usize, block_size);
+
+    let mut warmup_sampler = Sampler::new(0.0, 1.0, seed);
+    cuda_engine::run(
+        cuda_runtime,
+        cuda_model,
+        requests,
+        block_size,
+        num_blocks,
+        &mut warmup_sampler,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut sampler = Sampler::new(0.0, 1.0, seed);
+    let result = cuda_engine::run(
+        cuda_runtime,
+        cuda_model,
+        requests,
+        block_size,
+        num_blocks,
+        &mut sampler,
+    )
+    .map_err(|e| e.to_string())?;
+    report(label, &result, batch_size, num_blocks)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
     let model = Model::load(&args.model)?;
+
+    if args.device == "cuda" {
+        #[cfg(feature = "cuda")]
+        {
+            return main_cuda(&args, &model);
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            return Err("built without the `cuda` feature; rebuild with --features cuda".into());
+        }
+    }
 
     let mut rng = StdRng::seed_from_u64(args.seed);
 
@@ -202,6 +287,64 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         run_and_report(
             &format!("batch_size={batch_size}"),
             &model,
+            &requests,
+            args.block_size,
+            args.seed,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn main_cuda(args: &Args, model: &Model) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cuda_runtime =
+        rvllm::cuda::context::CudaRuntime::new(0).map_err(|e| format!("CUDA init failed: {e}"))?;
+    let cuda_model = rvllm::cuda::model::CudaModel::upload(&cuda_runtime, model)
+        .map_err(|e| format!("weight upload failed: {e}"))?;
+
+    let mut rng = StdRng::seed_from_u64(args.seed);
+
+    if let Some(trace_path) = &args.trace_file {
+        let trace = parse_trace_file(trace_path)?;
+        let requests = requests_from_trace(&mut rng, model.config.vocab_size, &trace);
+        println!(
+            "trace: {} requests from {trace_path} (cuda)",
+            requests.len()
+        );
+        run_and_report_cuda(
+            "trace",
+            &cuda_runtime,
+            &cuda_model,
+            &requests,
+            args.block_size,
+            args.seed,
+        )?;
+        return Ok(());
+    }
+
+    let batch_sizes: Vec<usize> = args
+        .batch_sizes
+        .split(',')
+        .map(|s| s.trim().parse())
+        .collect::<Result<_, _>>()?;
+
+    println!(
+        "synthetic sweep (cuda): prompt_len={} gen_len={} block_size={}",
+        args.prompt_len, args.gen_len, args.block_size
+    );
+    for &batch_size in &batch_sizes {
+        let requests = synthetic_requests(
+            &mut rng,
+            model.config.vocab_size,
+            batch_size,
+            args.prompt_len,
+            args.gen_len,
+        );
+        run_and_report_cuda(
+            &format!("batch_size={batch_size}"),
+            &cuda_runtime,
+            &cuda_model,
             &requests,
             args.block_size,
             args.seed,

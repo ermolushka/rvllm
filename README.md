@@ -27,7 +27,9 @@ cargo run --release -- \
 arrival: that request only becomes eligible for admission at decode step `n`
 (default 0, i.e. immediately). `--block-size` and `--num-blocks` control the
 KV cache's paging granularity and total capacity; `--num-blocks` defaults to
-enough blocks for every request to reach `context_length` at once.
+enough blocks for every request to reach its own `prompt + max_tokens`
+length at once (capped at `context_length`), and can be set explicitly to
+reserve more or less.
 
 By default only the completion text is printed (one per request, in `--prompt`
 order). Pass `--debug` to also print each prompt with a labelled completion,
@@ -86,3 +88,48 @@ cargo run --release --bin bench -- \
 
 Each config runs twice - a discarded warmup, then the measured run - so
 reported throughput is steady-state, not first-call allocation overhead.
+
+## CUDA support
+
+Requires an NVIDIA GPU, a CUDA 13.0-compatible driver (`nvidia-smi` shows the
+driver version), and building with the `cuda` feature, which pulls in
+`cudarc` and compiles every kernel under `src/cuda/kernels/*.cu` via NVRTC at
+runtime - no separate build step, no `nvcc` needed.
+
+```
+cargo build --release --features cuda
+cargo test --features cuda          # kernel/model unit tests; each skips
+                                     # instead of failing if no CUDA device
+                                     # is present (e.g. on a Mac)
+```
+
+Builds and runs unchanged on machines without a GPU - the feature is opt-in,
+and the default (CPU/Candle) path is untouched by it.
+
+Both binaries take `--device cuda` to run through the custom-written CUDA
+inference path (`cuda::model::CudaModel` + `cuda::engine::run`) instead of
+the CPU/Candle one, instead of `cargo build`'s `--features cuda` alone -
+that just makes the CUDA code available in the binary, `--device cuda` is
+what actually switches to it at runtime. Omitting it (or building without
+the feature at all) always uses the CPU path.
+
+Interactive CLI, same flags as the CPU examples above, run through CUDA:
+
+```
+cargo run --release --features cuda -- \
+  --model ../SmolLM2-360M.Q8_0.gguf \
+  --tokenizer tokenizer.json \
+  --prompt "The capital of France is" \
+  --max-tokens 20 \
+  --device cuda
+```
+
+`bench`, same stats/report format as the CPU sweep, so a CPU run and a CUDA
+run are directly comparable:
+
+```
+cargo run --release --features cuda --bin bench -- \
+  --model ../SmolLM2-360M.Q8_0.gguf \
+  --batch-sizes 1,4,8,16,32 \
+  --device cuda
+```
