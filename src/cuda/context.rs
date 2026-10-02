@@ -23,13 +23,23 @@ impl CudaRuntime {
     pub fn load_kernels(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // helper that takes the kernel source, compiles it with NVRTC, and loads the module
         self.load_single_kernel("kernels/silu.cu".to_string(), "silu".to_string())?;
-        self.load_single_kernel("kernels/silu_gate_multiply.cu".to_string(), "silu_gate_multiply".to_string())?;
+        self.load_single_kernel(
+            "kernels/silu_gate_multiply.cu".to_string(),
+            "silu_gate_multiply".to_string(),
+        )?;
         self.load_single_kernel("kernels/rmsnorm.cu".to_string(), "rmsnorm".to_string())?;
         self.load_single_kernel("kernels/rope.cu".to_string(), "rope".to_string())?;
+        self.load_single_kernel("kernels/kv_write.cu".to_string(), "kv_write".to_string())?;
+        self.load_single_kernel("kernels/kv_gather.cu".to_string(), "kv_gather".to_string())?;
+        self.load_single_kernel("kernels/softmax.cu".to_string(), "softmax".to_string())?;
         Ok(())
     }
 
-    pub fn load_single_kernel(&mut self, kernel_path: String, kernel_name: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn load_single_kernel(
+        &mut self,
+        kernel_path: String,
+        kernel_name: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let source = std::fs::read_to_string(&kernel_path)?;
         let ptx = cudarc::nvrtc::compile_ptx(source)?;
         let module = self.ctx.load_module(ptx)?;

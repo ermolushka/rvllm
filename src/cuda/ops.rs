@@ -147,6 +147,186 @@ pub fn rope_wrapper(
     Ok(())
 }
 
+// k, v: [n_tokens, n_kv_heads, head_dim] flattened. block_ids, offsets: one
+// entry per token, giving its destination slot in out_k/out_v (which are
+// [num_blocks, block_size, n_kv_heads, head_dim] flattened, caller-owned
+// cache buffers mutated in place).
+pub fn kv_write_wrapper(
+    cuda_runtime: &CudaRuntime,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    block_ids: &CudaSlice<u32>,
+    offsets: &CudaSlice<u32>,
+    out_k: &mut CudaSlice<f32>,
+    out_v: &mut CudaSlice<f32>,
+    n_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if k.len() != v.len() {
+        return Err("kv_write: k and v have different lengths".into());
+    }
+    let n = k.len() as u32;
+    if n == 0 {
+        return Err("kv_write: k/v len is 0".into());
+    }
+    if n_kv_heads == 0 || head_dim == 0 || block_size == 0 {
+        return Err("kv_write: n_kv_heads/head_dim/block_size must be positive".into());
+    }
+    let per_token = n_kv_heads * head_dim;
+    if n % per_token != 0 {
+        return Err("kv_write: k/v length is not a multiple of n_kv_heads * head_dim".into());
+    }
+    let n_tokens = n / per_token;
+    if block_ids.len() as u32 != n_tokens || offsets.len() as u32 != n_tokens {
+        return Err("kv_write: block_ids/offsets length must equal n_tokens".into());
+    }
+    if out_k.len() != out_v.len() {
+        return Err("kv_write: out_k and out_v have different lengths".into());
+    }
+    let slot_size = block_size * per_token;
+    if out_k.len() as u32 % slot_size != 0 {
+        return Err(
+            "kv_write: out_k/out_v length is not a multiple of block_size * n_kv_heads * head_dim"
+                .into(),
+        );
+    }
+
+    match cuda_runtime.kernels_mapping.get("kv_write") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(k);
+            builder.arg(v);
+            builder.arg(block_ids);
+            builder.arg(offsets);
+            builder.arg(out_k);
+            builder.arg(out_v);
+            builder.arg(&n_kv_heads);
+            builder.arg(&head_dim);
+            builder.arg(&block_size);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'kv_write' not found".into()),
+    }
+    Ok(())
+}
+
+// cache: [num_blocks, block_size, n_kv_heads, head_dim] flattened, one
+// layer's K (or V) storage. block_idx: [batch * max_blocks] flattened,
+// built by the caller (CPU's GatherPlan equivalent) - sequence i's block
+// table, padded to max_blocks by repeating its last block. output:
+// [batch, n_kv_heads, ctx_len, head_dim] flattened, already in the
+// transposed layout attention expects (no separate transpose step).
+pub fn kv_gather_wrapper(
+    cuda_runtime: &CudaRuntime,
+    cache: &CudaSlice<f32>,
+    block_idx: &CudaSlice<u32>,
+    output: &mut CudaSlice<f32>,
+    batch: u32,
+    max_blocks: u32,
+    ctx_len: u32,
+    block_size: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if batch == 0
+        || max_blocks == 0
+        || ctx_len == 0
+        || block_size == 0
+        || n_kv_heads == 0
+        || head_dim == 0
+    {
+        return Err(
+            "kv_gather: batch/max_blocks/ctx_len/block_size/n_kv_heads/head_dim must be positive"
+                .into(),
+        );
+    }
+    if block_idx.len() as u32 != batch * max_blocks {
+        return Err("kv_gather: block_idx length must equal batch * max_blocks".into());
+    }
+    let slot_size = block_size * n_kv_heads * head_dim;
+    if cache.is_empty() || cache.len() as u32 % slot_size != 0 {
+        return Err(
+            "kv_gather: cache length is not a multiple of block_size * n_kv_heads * head_dim"
+                .into(),
+        );
+    }
+    let n = batch * n_kv_heads * ctx_len * head_dim;
+    if output.len() as u32 != n {
+        return Err(
+            "kv_gather: output length must equal batch * n_kv_heads * ctx_len * head_dim".into(),
+        );
+    }
+    // every position read must fall inside a real block slot
+    if ctx_len > max_blocks * block_size {
+        return Err("kv_gather: ctx_len must not exceed max_blocks * block_size".into());
+    }
+
+    match cuda_runtime.kernels_mapping.get("kv_gather") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(cache);
+            builder.arg(block_idx);
+            builder.arg(output);
+            builder.arg(&batch);
+            builder.arg(&max_blocks);
+            builder.arg(&ctx_len);
+            builder.arg(&block_size);
+            builder.arg(&n_kv_heads);
+            builder.arg(&head_dim);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'kv_gather' not found".into()),
+    }
+    Ok(())
+}
+
+// x, out: [n_rows, row_len] flattened, last-dim softmax (matches
+// candle_nn::ops::softmax(&scores, D::Minus1)). Masked positions are
+// expected to carry a literal f32::NEG_INFINITY, same convention as
+// model.rs's batch_mask - exp(-inf - finite) == 0, no special-casing needed.
+pub fn softmax_wrapper(
+    cuda_runtime: &CudaRuntime,
+    x: &CudaSlice<f32>,
+    row_len: u32,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = x.len() as u32;
+
+    if output.len() != x.len() {
+        return Err("Softmax: input and output have different lengths".into());
+    }
+    if n == 0 {
+        return Err("Softmax: input len is 0".into());
+    }
+    if row_len == 0 || n % row_len != 0 {
+        return Err("Softmax: input length is not a multiple of row_len".into());
+    }
+    match cuda_runtime.kernels_mapping.get("softmax") {
+        Some(kernel) => {
+            let num_rows = n / row_len;
+            let block_size: u32 = 256;
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(x);
+            builder.arg(output);
+            builder.arg(&row_len);
+            let cfg = LaunchConfig {
+                grid_dim: (num_rows, 1, 1),
+                block_dim: (block_size, 1, 1),
+                shared_mem_bytes: block_size * std::mem::size_of::<f32>() as u32,
+            };
+            unsafe { builder.launch(cfg) }?;
+        }
+        None => return Err("Error: kernel 'softmax' not found".into()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,7 +386,12 @@ mod tests {
         let cpu = candle_core::Device::Cpu;
         let gate_t = candle_core::Tensor::from_slice(&gate, gate.len(), &cpu).unwrap();
         let up_t = candle_core::Tensor::from_slice(&up, up.len(), &cpu).unwrap();
-        let want: Vec<f32> = candle_nn::ops::silu(&gate_t).unwrap().mul(&up_t).unwrap().to_vec1().unwrap();
+        let want: Vec<f32> = candle_nn::ops::silu(&gate_t)
+            .unwrap()
+            .mul(&up_t)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
 
         assert_eq!(got.len(), want.len());
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
@@ -264,7 +449,15 @@ mod tests {
         let input = rt.stream.clone_htod(&host).unwrap();
         let weight_dev = rt.stream.clone_htod(&weight).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
-        rmsnorm_wrapper(&rt, &input, &weight_dev, hidden_dim as u32, eps, &mut output).unwrap();
+        rmsnorm_wrapper(
+            &rt,
+            &input,
+            &weight_dev,
+            hidden_dim as u32,
+            eps,
+            &mut output,
+        )
+        .unwrap();
         let got = rt.stream.clone_dtoh(&output).unwrap();
 
         for row in 0..num_rows {
@@ -287,13 +480,23 @@ mod tests {
         let num_rows = 3usize;
         let eps = 1e-5f32;
 
-        let host: Vec<f32> = (0..hidden_dim * num_rows).map(|i| (i as f32 - 12.0) * 0.3).collect();
+        let host: Vec<f32> = (0..hidden_dim * num_rows)
+            .map(|i| (i as f32 - 12.0) * 0.3)
+            .collect();
         let weight: Vec<f32> = (0..hidden_dim).map(|i| 0.5 + i as f32 * 0.2).collect();
 
         let input = rt.stream.clone_htod(&host).unwrap();
         let weight_dev = rt.stream.clone_htod(&weight).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
-        rmsnorm_wrapper(&rt, &input, &weight_dev, hidden_dim as u32, eps, &mut output).unwrap();
+        rmsnorm_wrapper(
+            &rt,
+            &input,
+            &weight_dev,
+            hidden_dim as u32,
+            eps,
+            &mut output,
+        )
+        .unwrap();
         let got = rt.stream.clone_dtoh(&output).unwrap();
 
         let cpu = candle_core::Device::Cpu;
@@ -384,7 +587,8 @@ mod tests {
             .collect();
 
         let cpu = candle_core::Device::Cpu;
-        let x_t = candle_core::Tensor::from_slice(&host, (positions.len(), head_dim), &cpu).unwrap();
+        let x_t =
+            candle_core::Tensor::from_slice(&host, (positions.len(), head_dim), &cpu).unwrap();
         let want: Vec<f32> = crate::model::rope(&x_t, rope_theta, &cpu, &positions)
             .unwrap()
             .flatten_all()
@@ -394,7 +598,8 @@ mod tests {
 
         // Pre-expand cos/sin per row, same as the host is responsible for doing
         // before calling rope_wrapper.
-        let (cos_t, sin_t) = crate::model::rope_cos_sin(rope_theta, head_dim, &positions, &cpu).unwrap();
+        let (cos_t, sin_t) =
+            crate::model::rope_cos_sin(rope_theta, head_dim, &positions, &cpu).unwrap();
         let cos: Vec<f32> = cos_t.flatten_all().unwrap().to_vec1().unwrap();
         let sin: Vec<f32> = sin_t.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(cos.len(), positions.len() * half);
@@ -403,7 +608,15 @@ mod tests {
         let cos_dev = rt.stream.clone_htod(&cos).unwrap();
         let sin_dev = rt.stream.clone_htod(&sin).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
-        rope_wrapper(&rt, &x_dev, &cos_dev, &sin_dev, &mut output, head_dim as u32).unwrap();
+        rope_wrapper(
+            &rt,
+            &x_dev,
+            &cos_dev,
+            &sin_dev,
+            &mut output,
+            head_dim as u32,
+        )
+        .unwrap();
         let got = rt.stream.clone_dtoh(&output).unwrap();
 
         assert_eq!(got.len(), want.len());
@@ -441,5 +654,374 @@ mod tests {
         let sin = rt.stream.clone_htod(&[0.0f32]).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(4).unwrap();
         assert!(rope_wrapper(&rt, &x, &cos, &sin, &mut output, 4).is_err());
+    }
+
+    // Same layout as kv_storage.rs's write_tokens_then_gather_round_trips_across_blocks:
+    // 3 blocks of 2 slots. Sequence A: 3 tokens over blocks 0,1. Sequence B: 1
+    // token in block 2. n_kv_heads=1, head_dim=2, one distinguishable value
+    // per token so cross-wiring between tokens would show up as a mismatch.
+    #[test]
+    fn kv_write_round_trips_across_blocks() {
+        let Some(rt) = runtime() else { return };
+        let n_kv_heads = 1u32;
+        let head_dim = 2u32;
+        let block_size = 2u32;
+        let num_blocks = 3u32;
+
+        // Sequence A: tokens at (block 0, offset 0), (block 0, offset 1),
+        // (block 1, offset 0). Sequence B: token at (block 2, offset 0).
+        let k: Vec<f32> = vec![10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 20.0, 20.5];
+        let v = k.clone();
+        let block_ids: Vec<u32> = vec![0, 0, 1, 2];
+        let offsets: Vec<u32> = vec![0, 1, 0, 0];
+
+        let k_dev = rt.stream.clone_htod(&k).unwrap();
+        let v_dev = rt.stream.clone_htod(&v).unwrap();
+        let block_ids_dev = rt.stream.clone_htod(&block_ids).unwrap();
+        let offsets_dev = rt.stream.clone_htod(&offsets).unwrap();
+        let cache_len = (num_blocks * block_size * n_kv_heads * head_dim) as usize;
+        let mut out_k = rt.stream.alloc_zeros::<f32>(cache_len).unwrap();
+        let mut out_v = rt.stream.alloc_zeros::<f32>(cache_len).unwrap();
+
+        kv_write_wrapper(
+            &rt,
+            &k_dev,
+            &v_dev,
+            &block_ids_dev,
+            &offsets_dev,
+            &mut out_k,
+            &mut out_v,
+            n_kv_heads,
+            head_dim,
+            block_size,
+        )
+        .unwrap();
+
+        let got_k = rt.stream.clone_dtoh(&out_k).unwrap();
+        let got_v = rt.stream.clone_dtoh(&out_v).unwrap();
+        assert_eq!(got_k, got_v);
+        // Block 0: offset 0 and offset 1 both written (sequence A's first two tokens).
+        assert_eq!(&got_k[0..4], &[10.0, 10.5, 11.0, 11.5]);
+        // Block 1: offset 0 written (sequence A's third token), offset 1 untouched.
+        assert_eq!(&got_k[4..8], &[12.0, 12.5, 0.0, 0.0]);
+        // Block 2: offset 0 written (sequence B's token), offset 1 untouched.
+        assert_eq!(&got_k[8..12], &[20.0, 20.5, 0.0, 0.0]);
+    }
+
+    // Same case as kv_storage.rs's write_tokens_leaves_other_slots_untouched:
+    // a single write into one slot of a cache must not disturb any other slot.
+    #[test]
+    fn kv_write_leaves_other_slots_untouched() {
+        let Some(rt) = runtime() else { return };
+        let n_kv_heads = 1u32;
+        let head_dim = 2u32;
+        let block_size = 4u32;
+
+        let k = vec![1.0f32, 1.5];
+        let v = k.clone();
+        let block_ids: Vec<u32> = vec![0];
+        let offsets: Vec<u32> = vec![2];
+
+        let k_dev = rt.stream.clone_htod(&k).unwrap();
+        let v_dev = rt.stream.clone_htod(&v).unwrap();
+        let block_ids_dev = rt.stream.clone_htod(&block_ids).unwrap();
+        let offsets_dev = rt.stream.clone_htod(&offsets).unwrap();
+        let cache_len = (block_size * n_kv_heads * head_dim) as usize;
+        let mut out_k = rt.stream.alloc_zeros::<f32>(cache_len).unwrap();
+        let mut out_v = rt.stream.alloc_zeros::<f32>(cache_len).unwrap();
+
+        kv_write_wrapper(
+            &rt,
+            &k_dev,
+            &v_dev,
+            &block_ids_dev,
+            &offsets_dev,
+            &mut out_k,
+            &mut out_v,
+            n_kv_heads,
+            head_dim,
+            block_size,
+        )
+        .unwrap();
+
+        let got = rt.stream.clone_dtoh(&out_k).unwrap();
+        assert_eq!(got, [0.0, 0.0, 0.0, 0.0, 1.0, 1.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn kv_write_rejects_mismatched_kv_lengths() {
+        let Some(rt) = runtime() else { return };
+        let k = rt.stream.clone_htod(&[1.0f32, 2.0]).unwrap();
+        let v = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let block_ids = rt.stream.clone_htod(&[0u32]).unwrap();
+        let offsets = rt.stream.clone_htod(&[0u32]).unwrap();
+        let mut out_k = rt.stream.alloc_zeros::<f32>(8).unwrap();
+        let mut out_v = rt.stream.alloc_zeros::<f32>(8).unwrap();
+        assert!(
+            kv_write_wrapper(
+                &rt, &k, &v, &block_ids, &offsets, &mut out_k, &mut out_v, 1, 2, 4
+            )
+            .is_err()
+        );
+    }
+
+    // Same layout as kv_storage.rs's write_tokens_then_gather_round_trips_across_blocks:
+    // 3 blocks of 2 slots. Sequence A: 3 tokens over blocks 0,1. Sequence B: 1
+    // token in block 2. Writes via kv_write, then reads the whole batch back
+    // via kv_gather in one call.
+    #[test]
+    fn kv_write_then_gather_round_trips_across_blocks() {
+        let Some(rt) = runtime() else { return };
+        let n_kv_heads = 1u32;
+        let head_dim = 2u32;
+        let block_size = 2u32;
+        let num_blocks = 3u32;
+
+        let k: Vec<f32> = vec![10.0, 10.5, 11.0, 11.5, 12.0, 12.5, 20.0, 20.5];
+        let v = k.clone();
+        let block_ids: Vec<u32> = vec![0, 0, 1, 2];
+        let offsets: Vec<u32> = vec![0, 1, 0, 0];
+
+        let k_dev = rt.stream.clone_htod(&k).unwrap();
+        let v_dev = rt.stream.clone_htod(&v).unwrap();
+        let block_ids_dev = rt.stream.clone_htod(&block_ids).unwrap();
+        let offsets_dev = rt.stream.clone_htod(&offsets).unwrap();
+        let cache_len = (num_blocks * block_size * n_kv_heads * head_dim) as usize;
+        let mut cache_k = rt.stream.alloc_zeros::<f32>(cache_len).unwrap();
+        let mut cache_v = rt.stream.alloc_zeros::<f32>(cache_len).unwrap();
+        kv_write_wrapper(
+            &rt,
+            &k_dev,
+            &v_dev,
+            &block_ids_dev,
+            &offsets_dev,
+            &mut cache_k,
+            &mut cache_v,
+            n_kv_heads,
+            head_dim,
+            block_size,
+        )
+        .unwrap();
+
+        // Sequence A's block table [0, 1] (ctx_len 3), sequence B's [2]
+        // (ctx_len 1), padded to max_blocks=2 by repeating B's last block.
+        let batch = 2u32;
+        let max_blocks = 2u32;
+        let ctx_len = 3u32;
+        let block_idx: Vec<u32> = vec![0, 1, 2, 2];
+        let block_idx_dev = rt.stream.clone_htod(&block_idx).unwrap();
+        let out_len = (batch * n_kv_heads * ctx_len * head_dim) as usize;
+        let mut out_k = rt.stream.alloc_zeros::<f32>(out_len).unwrap();
+        let mut out_v = rt.stream.alloc_zeros::<f32>(out_len).unwrap();
+
+        kv_gather_wrapper(
+            &rt,
+            &cache_k,
+            &block_idx_dev,
+            &mut out_k,
+            batch,
+            max_blocks,
+            ctx_len,
+            block_size,
+            n_kv_heads,
+            head_dim,
+        )
+        .unwrap();
+        kv_gather_wrapper(
+            &rt,
+            &cache_v,
+            &block_idx_dev,
+            &mut out_v,
+            batch,
+            max_blocks,
+            ctx_len,
+            block_size,
+            n_kv_heads,
+            head_dim,
+        )
+        .unwrap();
+
+        let got_k = rt.stream.clone_dtoh(&out_k).unwrap();
+        let got_v = rt.stream.clone_dtoh(&out_v).unwrap();
+        assert_eq!(got_k, got_v);
+        // [batch=2, n_kv_heads=1, ctx_len=3, head_dim=2]
+        // Sequence A's three real tokens, in order.
+        assert_eq!(&got_k[..6], &[10.0, 10.5, 11.0, 11.5, 12.0, 12.5]);
+        // Sequence B's one real token; the rest is masked padding, not checked.
+        assert_eq!(&got_k[6..8], &[20.0, 20.5]);
+    }
+
+    #[test]
+    fn kv_gather_rejects_wrong_block_idx_length() {
+        let Some(rt) = runtime() else { return };
+        let cache = rt.stream.alloc_zeros::<f32>(8).unwrap();
+        let block_idx = rt.stream.clone_htod(&[0u32, 1]).unwrap(); // should be batch*max_blocks=4
+        let mut output = rt.stream.alloc_zeros::<f32>(4).unwrap();
+        assert!(kv_gather_wrapper(&rt, &cache, &block_idx, &mut output, 2, 2, 2, 2, 1, 1).is_err());
+    }
+
+    #[test]
+    fn kv_gather_rejects_wrong_output_length() {
+        let Some(rt) = runtime() else { return };
+        let cache = rt.stream.alloc_zeros::<f32>(8).unwrap();
+        let block_idx = rt.stream.clone_htod(&[0u32, 1, 0, 1]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap(); // should be 4
+        assert!(kv_gather_wrapper(&rt, &cache, &block_idx, &mut output, 2, 2, 2, 2, 1, 1).is_err());
+    }
+
+    #[test]
+    fn kv_gather_rejects_ctx_len_exceeding_capacity() {
+        let Some(rt) = runtime() else { return };
+        let cache = rt.stream.alloc_zeros::<f32>(8).unwrap();
+        let block_idx = rt.stream.clone_htod(&[0u32, 1]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(10).unwrap();
+        // max_blocks=1, block_size=2 -> capacity 2, ctx_len=5 is too long
+        assert!(kv_gather_wrapper(&rt, &cache, &block_idx, &mut output, 2, 1, 5, 2, 1, 1).is_err());
+    }
+
+    fn softmax_cpu(row: &[f32]) -> Vec<f32> {
+        let row_max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp: Vec<f32> = row.iter().map(|&v| (v - row_max).exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        exp.iter().map(|&e| e / sum).collect()
+    }
+
+    #[test]
+    fn softmax_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        // Same case as model.rs's gqa_attention test: scores [1, 0] scaled by
+        // 1/sqrt(2) -> softmax([0.7071, 0.0]) = [0.6698, 0.3302].
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        let host: Vec<f32> = vec![inv_sqrt2, 0.0];
+
+        let input = rt.stream.clone_htod(&host).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
+        softmax_wrapper(&rt, &input, host.len() as u32, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        let want = [0.6698f32, 0.3302];
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-3, "got {got:?}, want {want:?}");
+        }
+    }
+
+    #[test]
+    fn softmax_masks_with_neg_infinity() {
+        let Some(rt) = runtime() else { return };
+        // Same masking convention as model.rs's batch_mask: disallowed
+        // positions carry a literal f32::NEG_INFINITY additive mask before
+        // softmax. Row: two real scores, two masked-out tail positions.
+        let neg_inf = f32::NEG_INFINITY;
+        let host: Vec<f32> = vec![1.0, 2.0, neg_inf, neg_inf];
+        let row_len = host.len() as u32;
+
+        let input = rt.stream.clone_htod(&host).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
+        softmax_wrapper(&rt, &input, row_len, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        let want = softmax_cpu(&host);
+        // Masked positions get exactly 0, not just something small.
+        assert_eq!(got[2], 0.0);
+        assert_eq!(got[3], 0.0);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-5, "got {got:?}, want {want:?}");
+        }
+        let sum: f32 = got.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "row sum {sum} != 1.0");
+    }
+
+    #[test]
+    fn softmax_matches_hand_computed_multi_row_tail() {
+        let Some(rt) = runtime() else { return };
+        // row_len = 37 doesn't divide 256 (the kernel's block size), so this
+        // exercises the grid-stride tail in all three passes. 5 rows so the
+        // "one block per row" grid dimension is actually exercised.
+        let row_len = 37usize;
+        let num_rows = 5usize;
+
+        let host: Vec<f32> = (0..row_len * num_rows)
+            .map(|i| ((i % row_len) as f32 - (row_len as f32) / 2.0) * 0.1)
+            .collect();
+
+        let input = rt.stream.clone_htod(&host).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
+        softmax_wrapper(&rt, &input, row_len as u32, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        for row in 0..num_rows {
+            let start = row * row_len;
+            let want = softmax_cpu(&host[start..start + row_len]);
+            for i in 0..row_len {
+                let g = got[start + i];
+                let w = want[i];
+                assert!((g - w).abs() < 1e-5, "row={row} i={i}: got {g}, want {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn softmax_matches_candle_reference() {
+        let Some(rt) = runtime() else { return };
+        let row_len = 8usize;
+        let num_rows = 3usize;
+
+        let host: Vec<f32> = (0..row_len * num_rows)
+            .map(|i| (i as f32 - 12.0) * 0.3)
+            .collect();
+
+        let input = rt.stream.clone_htod(&host).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(host.len()).unwrap();
+        softmax_wrapper(&rt, &input, row_len as u32, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        let cpu = candle_core::Device::Cpu;
+        let x_t = candle_core::Tensor::from_slice(&host, (num_rows, row_len), &cpu).unwrap();
+        let want: Vec<f32> = candle_nn::ops::softmax(&x_t, candle_core::D::Minus1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        assert_eq!(got.len(), want.len());
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            let tol = 1e-5 * w.abs().max(1.0);
+            assert!((g - w).abs() < tol, "i={i}: got {g}, candle {w}");
+        }
+    }
+
+    #[test]
+    fn softmax_rejects_mismatched_output_length() {
+        let Some(rt) = runtime() else { return };
+        let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(softmax_wrapper(&rt, &input, 2, &mut output).is_err());
+    }
+
+    #[test]
+    fn softmax_rejects_row_len_not_dividing_input() {
+        let Some(rt) = runtime() else { return };
+        let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(softmax_wrapper(&rt, &input, 2, &mut output).is_err());
+    }
+
+    #[test]
+    fn kv_write_rejects_wrong_position_list_length() {
+        let Some(rt) = runtime() else { return };
+        // 2 tokens' worth of k/v but only 1 position entry.
+        let k = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let v = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let block_ids = rt.stream.clone_htod(&[0u32]).unwrap();
+        let offsets = rt.stream.clone_htod(&[0u32]).unwrap();
+        let mut out_k = rt.stream.alloc_zeros::<f32>(8).unwrap();
+        let mut out_v = rt.stream.alloc_zeros::<f32>(8).unwrap();
+        assert!(
+            kv_write_wrapper(
+                &rt, &k, &v, &block_ids, &offsets, &mut out_k, &mut out_v, 1, 2, 4
+            )
+            .is_err()
+        );
     }
 }
