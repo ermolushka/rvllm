@@ -1,3 +1,4 @@
+use cudarc::cublas::CudaBlas;
 use cudarc::driver::CudaContext;
 use cudarc::driver::safe::{CudaFunction, CudaStream};
 use std::collections::HashMap;
@@ -7,15 +8,19 @@ pub struct CudaRuntime {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     pub kernels_mapping: HashMap<String, CudaFunction>,
+    pub blas: CudaBlas,
 }
 
 impl CudaRuntime {
     pub fn new(device_id: usize) -> Result<Self, Box<dyn std::error::Error>> {
         let ctx = cudarc::driver::CudaContext::new(device_id)?;
+        let stream = ctx.default_stream();
+        let blas = CudaBlas::new(stream.clone())?;
         let mut cuda_runtime = Self {
-            stream: ctx.default_stream(),
+            stream,
             ctx,
             kernels_mapping: HashMap::new(),
+            blas,
         };
         cuda_runtime.load_kernels()?;
         Ok(cuda_runtime)
@@ -32,6 +37,23 @@ impl CudaRuntime {
         self.load_single_kernel("kernels/kv_write.cu".to_string(), "kv_write".to_string())?;
         self.load_single_kernel("kernels/kv_gather.cu".to_string(), "kv_gather".to_string())?;
         self.load_single_kernel("kernels/softmax.cu".to_string(), "softmax".to_string())?;
+        self.load_single_kernel("kernels/add.cu".to_string(), "add".to_string())?;
+        self.load_single_kernel(
+            "kernels/embed_lookup.cu".to_string(),
+            "embed_lookup".to_string(),
+        )?;
+        self.load_single_kernel(
+            "kernels/mask_add_broadcast.cu".to_string(),
+            "mask_add_broadcast".to_string(),
+        )?;
+        self.load_single_kernel(
+            "kernels/transpose_axes12.cu".to_string(),
+            "transpose_axes12".to_string(),
+        )?;
+        self.load_single_kernel(
+            "kernels/narrow_last_row.cu".to_string(),
+            "narrow_last_row".to_string(),
+        )?;
         Ok(())
     }
 

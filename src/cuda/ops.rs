@@ -327,6 +327,189 @@ pub fn softmax_wrapper(
     Ok(())
 }
 
+pub fn add_wrapper(
+    cuda_runtime: &CudaRuntime,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = a.len() as u32;
+    if a.len() != b.len() || a.len() != output.len() {
+        return Err("add: a/b/output have different lengths".into());
+    }
+    if n == 0 {
+        return Err("add: input len is 0".into());
+    }
+    match cuda_runtime.kernels_mapping.get("add") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+            builder.arg(a);
+            builder.arg(b);
+            builder.arg(output);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'add' not found".into()),
+    }
+    Ok(())
+}
+
+// token_ids: [n_tokens]. embedding: [vocab_size, hidden_dim] flattened.
+// output: [n_tokens, hidden_dim] flattened.
+pub fn embed_lookup_wrapper(
+    cuda_runtime: &CudaRuntime,
+    token_ids: &CudaSlice<u32>,
+    embedding: &CudaSlice<f32>,
+    hidden_dim: u32,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if hidden_dim == 0 {
+        return Err("embed_lookup: hidden_dim must be positive".into());
+    }
+    if embedding.is_empty() || embedding.len() as u32 % hidden_dim != 0 {
+        return Err("embed_lookup: embedding length is not a multiple of hidden_dim".into());
+    }
+    let n = token_ids.len() as u32 * hidden_dim;
+    if output.len() as u32 != n {
+        return Err("embed_lookup: output length must equal n_tokens * hidden_dim".into());
+    }
+    if n == 0 {
+        return Err("embed_lookup: token_ids is empty".into());
+    }
+    match cuda_runtime.kernels_mapping.get("embed_lookup") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+            builder.arg(token_ids);
+            builder.arg(embedding);
+            builder.arg(output);
+            builder.arg(&hidden_dim);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'embed_lookup' not found".into()),
+    }
+    Ok(())
+}
+
+// scores: [batch, n_kv_heads, group_size, q_len, ctx_len] flattened, mutated
+// in place. mask: [batch, q_len, ctx_len] flattened.
+pub fn mask_add_broadcast_wrapper(
+    cuda_runtime: &CudaRuntime,
+    scores: &mut CudaSlice<f32>,
+    mask: &CudaSlice<f32>,
+    n_kv_heads: u32,
+    group_size: u32,
+    q_len: u32,
+    ctx_len: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if n_kv_heads == 0 || group_size == 0 || q_len == 0 || ctx_len == 0 {
+        return Err(
+            "mask_add_broadcast: n_kv_heads/group_size/q_len/ctx_len must be positive".into(),
+        );
+    }
+    let per_batch = n_kv_heads * group_size * q_len * ctx_len;
+    let n = scores.len() as u32;
+    if n == 0 || n % per_batch != 0 {
+        return Err(
+            "mask_add_broadcast: scores length is not a multiple of n_kv_heads * group_size * q_len * ctx_len"
+                .into(),
+        );
+    }
+    let batch = n / per_batch;
+    if mask.len() as u32 != batch * q_len * ctx_len {
+        return Err("mask_add_broadcast: mask length must equal batch * q_len * ctx_len".into());
+    }
+    match cuda_runtime.kernels_mapping.get("mask_add_broadcast") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+            builder.arg(scores);
+            builder.arg(mask);
+            builder.arg(&n_kv_heads);
+            builder.arg(&group_size);
+            builder.arg(&q_len);
+            builder.arg(&ctx_len);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'mask_add_broadcast' not found".into()),
+    }
+    Ok(())
+}
+
+// Swaps the middle two axes of a 4D tensor: input [d0, d1, d2, d3] ->
+// output [d0, d2, d1, d3] (both flattened).
+pub fn transpose_axes12_wrapper(
+    cuda_runtime: &CudaRuntime,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    d0: u32,
+    d1: u32,
+    d2: u32,
+    d3: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if d0 == 0 || d1 == 0 || d2 == 0 || d3 == 0 {
+        return Err("transpose_axes12: d0/d1/d2/d3 must be positive".into());
+    }
+    let n = d0 * d1 * d2 * d3;
+    if input.len() as u32 != n {
+        return Err("transpose_axes12: input length must equal d0*d1*d2*d3".into());
+    }
+    if output.len() as u32 != n {
+        return Err("transpose_axes12: output length must equal d0*d1*d2*d3".into());
+    }
+    match cuda_runtime.kernels_mapping.get("transpose_axes12") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+            builder.arg(input);
+            builder.arg(output);
+            builder.arg(&d0);
+            builder.arg(&d1);
+            builder.arg(&d2);
+            builder.arg(&d3);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'transpose_axes12' not found".into()),
+    }
+    Ok(())
+}
+
+// x: [batch, q_len, hidden_dim] flattened. output: [batch, hidden_dim]
+// flattened, each batch item's last row only.
+pub fn narrow_last_row_wrapper(
+    cuda_runtime: &CudaRuntime,
+    x: &CudaSlice<f32>,
+    q_len: u32,
+    hidden_dim: u32,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if q_len == 0 || hidden_dim == 0 {
+        return Err("narrow_last_row: q_len/hidden_dim must be positive".into());
+    }
+    let per_batch = q_len * hidden_dim;
+    if x.is_empty() || x.len() as u32 % per_batch != 0 {
+        return Err("narrow_last_row: x length is not a multiple of q_len * hidden_dim".into());
+    }
+    let batch = x.len() as u32 / per_batch;
+    let n = batch * hidden_dim;
+    if output.len() as u32 != n {
+        return Err("narrow_last_row: output length must equal batch * hidden_dim".into());
+    }
+    match cuda_runtime.kernels_mapping.get("narrow_last_row") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+            builder.arg(x);
+            builder.arg(output);
+            builder.arg(&q_len);
+            builder.arg(&hidden_dim);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'narrow_last_row' not found".into()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,6 +1188,169 @@ mod tests {
         let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
         assert!(softmax_wrapper(&rt, &input, 2, &mut output).is_err());
+    }
+
+    #[test]
+    fn add_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        let a: Vec<f32> = (0..1027).map(|i| i as f32 * 0.5).collect();
+        let b: Vec<f32> = (0..1027).map(|i| (i as f32 - 500.0) * 0.1).collect();
+        let a_dev = rt.stream.clone_htod(&a).unwrap();
+        let b_dev = rt.stream.clone_htod(&b).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(a.len()).unwrap();
+        add_wrapper(&rt, &a_dev, &b_dev, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+        for i in 0..a.len() {
+            let want = a[i] + b[i];
+            assert!(
+                (got[i] - want).abs() < 1e-5,
+                "i={i}: got {}, want {want}",
+                got[i]
+            );
+        }
+    }
+
+    #[test]
+    fn add_rejects_mismatched_lengths() {
+        let Some(rt) = runtime() else { return };
+        let a = rt.stream.clone_htod(&[1.0f32, 2.0]).unwrap();
+        let b = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(2).unwrap();
+        assert!(add_wrapper(&rt, &a, &b, &mut output).is_err());
+    }
+
+    #[test]
+    fn embed_lookup_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        let hidden_dim = 3u32;
+        // vocab_size=4: row i = [i, i+0.5, i+0.25]
+        let embedding: Vec<f32> = (0..4)
+            .flat_map(|i| [i as f32, i as f32 + 0.5, i as f32 + 0.25])
+            .collect();
+        let token_ids: Vec<u32> = vec![2, 0, 3, 2];
+
+        let embedding_dev = rt.stream.clone_htod(&embedding).unwrap();
+        let token_ids_dev = rt.stream.clone_htod(&token_ids).unwrap();
+        let mut output = rt
+            .stream
+            .alloc_zeros::<f32>(token_ids.len() * hidden_dim as usize)
+            .unwrap();
+        embed_lookup_wrapper(&rt, &token_ids_dev, &embedding_dev, hidden_dim, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+
+        let want: Vec<f32> = token_ids
+            .iter()
+            .flat_map(|&t| {
+                let t = t as usize;
+                embedding[t * 3..t * 3 + 3].to_vec()
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn embed_lookup_rejects_wrong_output_length() {
+        let Some(rt) = runtime() else { return };
+        let embedding = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let token_ids = rt.stream.clone_htod(&[0u32, 1]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap(); // should be 4
+        assert!(embed_lookup_wrapper(&rt, &token_ids, &embedding, 2, &mut output).is_err());
+    }
+
+    #[test]
+    fn mask_add_broadcast_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        // batch=1, n_kv_heads=1, group_size=2, q_len=1, ctx_len=2.
+        let (n_kv_heads, group_size, q_len, ctx_len) = (1u32, 2u32, 1u32, 2u32);
+        let scores: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0]; // group0, group1 each [ctx0, ctx1]
+        let mask: Vec<f32> = vec![0.0, f32::NEG_INFINITY]; // same mask for both groups
+
+        let mut scores_dev = rt.stream.clone_htod(&scores).unwrap();
+        let mask_dev = rt.stream.clone_htod(&mask).unwrap();
+        mask_add_broadcast_wrapper(
+            &rt,
+            &mut scores_dev,
+            &mask_dev,
+            n_kv_heads,
+            group_size,
+            q_len,
+            ctx_len,
+        )
+        .unwrap();
+        let got = rt.stream.clone_dtoh(&scores_dev).unwrap();
+
+        assert_eq!(got[0], 1.0);
+        assert!(got[1].is_infinite() && got[1].is_sign_negative());
+        assert_eq!(got[2], 3.0);
+        assert!(got[3].is_infinite() && got[3].is_sign_negative());
+    }
+
+    #[test]
+    fn mask_add_broadcast_rejects_wrong_mask_length() {
+        let Some(rt) = runtime() else { return };
+        let mut scores = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let mask = rt.stream.clone_htod(&[0.0f32]).unwrap(); // should be 2 (batch=1 * q_len=1 * ctx_len=2)
+        assert!(mask_add_broadcast_wrapper(&rt, &mut scores, &mask, 1, 2, 1, 2).is_err());
+    }
+
+    #[test]
+    fn transpose_axes12_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        // [d0=1, d1=2, d2=3, d3=1] -> [1, 3, 2, 1]: a plain matrix transpose,
+        // input row-major 2x3, output should be its 3x2 transpose.
+        let input: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [[1,2,3],[4,5,6]]
+        let input_dev = rt.stream.clone_htod(&input).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(6).unwrap();
+        transpose_axes12_wrapper(&rt, &input_dev, &mut output, 1, 2, 3, 1).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+        // transpose of [[1,2,3],[4,5,6]] is [[1,4],[2,5],[3,6]]
+        assert_eq!(got, [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn transpose_axes12_is_its_own_inverse() {
+        let Some(rt) = runtime() else { return };
+        let (d0, d1, d2, d3) = (2u32, 3u32, 4u32, 5u32);
+        let n = (d0 * d1 * d2 * d3) as usize;
+        let input: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let input_dev = rt.stream.clone_htod(&input).unwrap();
+        let mut mid = rt.stream.alloc_zeros::<f32>(n).unwrap();
+        transpose_axes12_wrapper(&rt, &input_dev, &mut mid, d0, d1, d2, d3).unwrap();
+        let mut back = rt.stream.alloc_zeros::<f32>(n).unwrap();
+        // mid's dims are [d0, d2, d1, d3]; swapping its middle two axes again
+        // (passing d2, d1 this time) undoes the first transpose.
+        transpose_axes12_wrapper(&rt, &mid, &mut back, d0, d2, d1, d3).unwrap();
+        let got = rt.stream.clone_dtoh(&back).unwrap();
+        assert_eq!(got, input);
+    }
+
+    #[test]
+    fn transpose_axes12_rejects_wrong_length() {
+        let Some(rt) = runtime() else { return };
+        let input = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(3).unwrap();
+        assert!(transpose_axes12_wrapper(&rt, &input, &mut output, 1, 2, 2, 1).is_err());
+    }
+
+    #[test]
+    fn narrow_last_row_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        let (q_len, hidden_dim) = (3u32, 2u32);
+        // batch=2: item0 rows [1,1][2,2][3,3], item1 rows [4,4][5,5][6,6].
+        let x: Vec<f32> = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0];
+        let x_dev = rt.stream.clone_htod(&x).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(4).unwrap();
+        narrow_last_row_wrapper(&rt, &x_dev, q_len, hidden_dim, &mut output).unwrap();
+        let got = rt.stream.clone_dtoh(&output).unwrap();
+        assert_eq!(got, [3.0, 3.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn narrow_last_row_rejects_wrong_output_length() {
+        let Some(rt) = runtime() else { return };
+        let x = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let mut output = rt.stream.alloc_zeros::<f32>(1).unwrap(); // should be 2
+        assert!(narrow_last_row_wrapper(&rt, &x, 2, 2, &mut output).is_err());
     }
 
     #[test]

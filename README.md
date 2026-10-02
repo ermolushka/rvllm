@@ -86,3 +86,33 @@ cargo run --release --bin bench -- \
 
 Each config runs twice - a discarded warmup, then the measured run - so
 reported throughput is steady-state, not first-call allocation overhead.
+
+## CUDA support
+
+Requires an NVIDIA GPU, a CUDA 13.0-compatible driver (`nvidia-smi` shows the
+driver version), and building with the `cuda` feature, which pulls in
+`cudarc` and compiles every kernel under `src/cuda/kernels/*.cu` via NVRTC at
+runtime - no separate build step, no `nvcc` needed.
+
+```
+cargo build --release --features cuda
+cargo test --features cuda          # kernel/model unit tests; each skips
+                                     # instead of failing if no CUDA device
+                                     # is present (e.g. on a Mac)
+```
+
+Builds and runs unchanged on machines without a GPU - the feature is opt-in,
+and the default (CPU/Candle) path is untouched by it.
+
+Only `bench` has a CUDA path so far (`main`'s interactive CLI is CPU-only).
+Pass `--device cuda` to run the same benchmark sweep through the custom-written
+CUDA inference path (`cuda::model::CudaModel` + `cuda::engine::run`) instead
+of the CPU/Candle one - same stats, same report format, so a CPU run and a
+CUDA run are directly comparable:
+
+```
+cargo run --release --features cuda --bin bench -- \
+  --model ../SmolLM2-360M.Q8_0.gguf \
+  --batch-sizes 1,4,8,16,32 \
+  --device cuda
+```
