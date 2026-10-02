@@ -166,6 +166,22 @@ fn report(
     Ok(())
 }
 
+// Blocks needed to let every request reach its own prompt+gen length at
+// once, not the model's full context_length per sequence - the difference
+// matters once batch sizes get large: reserving full-context_length worth
+// of blocks for every sequence regardless of how long it'll actually run is
+// cheap on CPU RAM but can blow a GPU's fixed VRAM budget well before the
+// pool is anywhere near full.
+fn num_blocks_for(requests: &[RequestSpec], context_length: usize, block_size: usize) -> usize {
+    let max_tokens_per_seq = requests
+        .iter()
+        .map(|r| (r.tokens.len() + r.max_tokens).min(context_length))
+        .max()
+        .unwrap_or(0);
+    let blocks_per_seq = max_tokens_per_seq.div_ceil(block_size).max(1);
+    blocks_per_seq * requests.len().max(1)
+}
+
 fn run_and_report(
     label: &str,
     model: &Model,
@@ -174,8 +190,7 @@ fn run_and_report(
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let batch_size = requests.len();
-    let blocks_per_seq = (model.config.context_length as usize).div_ceil(block_size);
-    let num_blocks = blocks_per_seq * batch_size.max(1);
+    let num_blocks = num_blocks_for(requests, model.config.context_length as usize, block_size);
 
     // Warmup run (discarded) so the measured run isn't paying for first-touch
     // allocation of the KV storage tensors, per the plan's "steady-state
@@ -200,8 +215,7 @@ fn run_and_report_cuda(
     use rvllm::cuda::engine as cuda_engine;
 
     let batch_size = requests.len();
-    let blocks_per_seq = (cuda_model.config.context_length as usize).div_ceil(block_size);
-    let num_blocks = blocks_per_seq * batch_size.max(1);
+    let num_blocks = num_blocks_for(requests, cuda_model.config.context_length as usize, block_size);
 
     let mut warmup_sampler = Sampler::new(0.0, 1.0, seed);
     cuda_engine::run(

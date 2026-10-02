@@ -27,7 +27,9 @@ cargo run --release -- \
 arrival: that request only becomes eligible for admission at decode step `n`
 (default 0, i.e. immediately). `--block-size` and `--num-blocks` control the
 KV cache's paging granularity and total capacity; `--num-blocks` defaults to
-enough blocks for every request to reach `context_length` at once.
+enough blocks for every request to reach its own `prompt + max_tokens`
+length at once (capped at `context_length`), and can be set explicitly to
+reserve more or less.
 
 By default only the completion text is printed (one per request, in `--prompt`
 order). Pass `--debug` to also print each prompt with a labelled completion,
@@ -104,11 +106,26 @@ cargo test --features cuda          # kernel/model unit tests; each skips
 Builds and runs unchanged on machines without a GPU - the feature is opt-in,
 and the default (CPU/Candle) path is untouched by it.
 
-Only `bench` has a CUDA path so far (`main`'s interactive CLI is CPU-only).
-Pass `--device cuda` to run the same benchmark sweep through the custom-written
-CUDA inference path (`cuda::model::CudaModel` + `cuda::engine::run`) instead
-of the CPU/Candle one - same stats, same report format, so a CPU run and a
-CUDA run are directly comparable:
+Both binaries take `--device cuda` to run through the custom-written CUDA
+inference path (`cuda::model::CudaModel` + `cuda::engine::run`) instead of
+the CPU/Candle one, instead of `cargo build`'s `--features cuda` alone -
+that just makes the CUDA code available in the binary, `--device cuda` is
+what actually switches to it at runtime. Omitting it (or building without
+the feature at all) always uses the CPU path.
+
+Interactive CLI, same flags as the CPU examples above, run through CUDA:
+
+```
+cargo run --release --features cuda -- \
+  --model ../SmolLM2-360M.Q8_0.gguf \
+  --tokenizer tokenizer.json \
+  --prompt "The capital of France is" \
+  --max-tokens 20 \
+  --device cuda
+```
+
+`bench`, same stats/report format as the CPU sweep, so a CPU run and a CUDA
+run are directly comparable:
 
 ```
 cargo run --release --features cuda --bin bench -- \
