@@ -58,6 +58,10 @@ impl CudaRuntime {
             include_str!("kernels/narrow_last_row.cu"),
             "narrow_last_row".to_string(),
         )?;
+        self.load_single_kernel(
+            include_str!("kernels/f32_to_f16.cu"),
+            "f32_to_f16".to_string(),
+        )?;
         Ok(())
     }
 

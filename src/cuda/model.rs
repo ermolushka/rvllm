@@ -6,6 +6,7 @@
 // Model - same reasoning as CudaKvStorage/CudaWeights: the CPU path is
 // Candle-Tensor-typed end to end, this one is CudaSlice-typed end to end.
 use cudarc::driver::CudaSlice;
+use half::f16;
 use kv_cache_scheduler::block_pool::BlockID;
 
 use crate::model::{BatchItem, Config, Model};
@@ -175,6 +176,7 @@ fn layer_forward(
     ctx: &CudaStepCtx,
     kv_storage: &mut CudaKvStorage,
     x: &CudaSlice<f32>,
+    x16: &mut CudaSlice<f16>,
 ) -> Result<CudaSlice<f32>, Box<dyn std::error::Error>> {
     let hidden_dim = config.hidden_dim as usize;
     let n_heads = config.n_heads as usize;
@@ -201,10 +203,11 @@ fn layer_forward(
     // Project into Q/K/V, naturally [batch, q_len, heads, head_dim] flat
     // (reshape is free - a plain GEMM output, no data movement needed).
     let mut q_proj = stream.alloc_zeros::<f32>(rows * n_heads * head_dim)?;
-    // y = x @ weight^T
-    cublas_ops::linear(
+    // y = x @ weight^T. q/k/v read the same input, so narrow it to F16 once.
+    cublas_ops::to_f16(cuda_runtime, &normed, x16)?;
+    cublas_ops::linear_f16(
         cuda_runtime,
-        &normed,
+        x16,
         &weights.attn_q,
         rows,
         hidden_dim,
@@ -212,9 +215,9 @@ fn layer_forward(
         &mut q_proj,
     )?;
     let mut k_proj = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
-    cublas_ops::linear(
+    cublas_ops::linear_f16(
         cuda_runtime,
-        &normed,
+        x16,
         &weights.attn_k,
         rows,
         hidden_dim,
@@ -222,9 +225,9 @@ fn layer_forward(
         &mut k_proj,
     )?;
     let mut v_proj = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
-    cublas_ops::linear(
+    cublas_ops::linear_f16(
         cuda_runtime,
-        &normed,
+        x16,
         &weights.attn_v,
         rows,
         hidden_dim,
@@ -386,6 +389,7 @@ fn layer_forward(
         n_heads * head_dim,
         hidden_dim,
         &mut attn_proj,
+        x16,
     )?;
 
     let mut h = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
@@ -401,9 +405,10 @@ fn layer_forward(
         &mut normed2,
     )?;
     let mut gate = stream.alloc_zeros::<f32>(rows * ffn_dim)?;
-    cublas_ops::linear(
+    cublas_ops::to_f16(cuda_runtime, &normed2, x16)?;
+    cublas_ops::linear_f16(
         cuda_runtime,
-        &normed2,
+        x16,
         &weights.ffn_gate,
         rows,
         hidden_dim,
@@ -411,9 +416,9 @@ fn layer_forward(
         &mut gate,
     )?;
     let mut up = stream.alloc_zeros::<f32>(rows * ffn_dim)?;
-    cublas_ops::linear(
+    cublas_ops::linear_f16(
         cuda_runtime,
-        &normed2,
+        x16,
         &weights.ffn_up,
         rows,
         hidden_dim,
@@ -431,6 +436,7 @@ fn layer_forward(
         ffn_dim,
         hidden_dim,
         &mut ffn_out,
+        x16,
     )?;
 
     let mut out = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
@@ -481,6 +487,13 @@ impl CudaModel {
             &mut x,
         )?;
 
+        // One F16 activation scratch for the whole pass, big enough for the
+        // widest linear input (hidden, attention-out or ffn width).
+        let widest = hidden_dim
+            .max(self.config.n_heads as usize * self.config.head_dim())
+            .max(self.config.ffn_dim as usize);
+        let mut x16 = cuda_runtime.stream.alloc_zeros::<f16>(rows * widest)?;
+
         let step_ctx = CudaStepCtx::new(cuda_runtime, &self.config, items)?;
         for (i, layer) in self.weights.layers.iter().enumerate() {
             x = layer_forward(
@@ -491,6 +504,7 @@ impl CudaModel {
                 &step_ctx,
                 kv_storage,
                 &x,
+                &mut x16,
             )?;
         }
         Ok((x, batch, q_len))
@@ -513,6 +527,7 @@ impl CudaModel {
             self.config.rms_eps,
             &mut normed,
         )?;
+        let mut x16 = cuda_runtime.stream.alloc_zeros::<f16>(rows * hidden_dim)?;
         let mut logits = cuda_runtime.stream.alloc_zeros::<f32>(rows * vocab_size)?;
         cublas_ops::linear(
             cuda_runtime,
@@ -522,6 +537,7 @@ impl CudaModel {
             hidden_dim,
             vocab_size,
             &mut logits,
+            &mut x16,
         )?;
         Ok(logits)
     }
