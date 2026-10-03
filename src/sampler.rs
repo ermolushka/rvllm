@@ -25,12 +25,36 @@ impl Sampler {
         }
     }
 
+    // True when sampling is a plain argmax, so callers can take the argmax
+    // somewhere cheaper (e.g. on the GPU) and skip moving the logits.
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
     pub fn sample(&mut self, logits: &Tensor) -> candle_core::Result<u32> {
         if self.temperature <= 0.0 {
             return logits.argmax(0)?.to_scalar::<u32>();
         }
+        Ok(self.sample_slice(&logits.to_vec1::<f32>()?))
+    }
 
-        let logits: Vec<f32> = logits.to_vec1()?;
+    // Same as `sample` but straight from a host slice, skipping the Candle
+    // tensor. Greedy is a plain scan (first maximum wins, like argmax), which
+    // matters when sampling many rows per step: building a tensor per row
+    // cost far more than the argmax itself.
+    pub fn sample_slice(&mut self, logits: &[f32]) -> u32 {
+        if self.temperature <= 0.0 {
+            let mut best = 0usize;
+            let mut best_value = f32::NEG_INFINITY;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > best_value {
+                    best_value = v;
+                    best = i;
+                }
+            }
+            return best as u32;
+        }
+
         let inv_temp = 1.0 / self.temperature;
         let max_logit = logits
             .iter()
@@ -77,10 +101,10 @@ impl Sampler {
         for &idx in kept {
             acc += probs[idx];
             if acc >= r {
-                return Ok(idx as u32);
+                return idx as u32;
             }
         }
-        Ok(*kept.last().unwrap() as u32)
+        *kept.last().unwrap() as u32
     }
 }
 
@@ -95,6 +119,22 @@ mod tests {
         let logits = Tensor::new(&[0.1f32, 0.9, 0.05, -0.2], &device).unwrap();
         let mut sampler = Sampler::new(0.0, 1.0, 42);
         assert_eq!(sampler.sample(&logits).unwrap(), 1);
+    }
+
+    #[test]
+    fn sample_slice_matches_sample_greedy_and_seeded() {
+        let device = Device::Cpu;
+        let values = [0.3f32, 2.0, -1.0, 2.0, 0.7, 1.5];
+        let logits = Tensor::new(&values, &device).unwrap();
+        // Tie between index 1 and 3: both pick the first maximum.
+        let mut a = Sampler::new(0.0, 1.0, 1);
+        let mut b = Sampler::new(0.0, 1.0, 1);
+        assert_eq!(a.sample(&logits).unwrap(), b.sample_slice(&values));
+        let mut c = Sampler::new(0.8, 0.9, 5);
+        let mut d = Sampler::new(0.8, 0.9, 5);
+        for _ in 0..20 {
+            assert_eq!(c.sample(&logits).unwrap(), d.sample_slice(&values));
+        }
     }
 
     #[test]

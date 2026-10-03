@@ -354,6 +354,43 @@ pub fn add_wrapper(
     Ok(())
 }
 
+// Per-row argmax of a flat [rows, row_len] buffer: out[row] is the index of
+// that row's maximum (lowest index on ties). Lets greedy decoding copy back
+// `rows` integers instead of the whole logits matrix.
+pub fn argmax_wrapper(
+    cuda_runtime: &CudaRuntime,
+    x: &CudaSlice<f32>,
+    row_len: u32,
+    output: &mut CudaSlice<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = x.len() as u32;
+    if row_len == 0 || n == 0 || n % row_len != 0 {
+        return Err("argmax: input length must be a positive multiple of row_len".into());
+    }
+    let num_rows = n / row_len;
+    if output.len() as u32 != num_rows {
+        return Err("argmax: output length must equal the number of rows".into());
+    }
+    match cuda_runtime.kernels_mapping.get("argmax") {
+        Some(kernel) => {
+            let block_size: u32 = 256;
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+            builder.arg(x);
+            builder.arg(output);
+            builder.arg(&row_len);
+            let cfg = LaunchConfig {
+                grid_dim: (num_rows, 1, 1),
+                block_dim: (block_size, 1, 1),
+                // one f32 value + one u32 index per thread
+                shared_mem_bytes: block_size * 8,
+            };
+            unsafe { builder.launch(cfg) }?;
+        }
+        None => return Err("Error: kernel 'argmax' not found".into()),
+    }
+    Ok(())
+}
+
 // Narrows an F32 buffer to F16 (round to nearest even). `output` may be longer
 // than `input` (a reused scratch buffer); only the first input.len() elements
 // are written.
@@ -1245,6 +1282,39 @@ mod tests {
         let b = rt.stream.clone_htod(&[1.0f32, 2.0, 3.0]).unwrap();
         let mut output = rt.stream.alloc_zeros::<f32>(2).unwrap();
         assert!(add_wrapper(&rt, &a, &b, &mut output).is_err());
+    }
+
+    #[test]
+    fn argmax_matches_hand_computed() {
+        let Some(rt) = runtime() else { return };
+        // row 0: unique max; row 1: tie between 1 and 3 (lowest wins), NaN
+        // ignored; row 2: all -inf falls back to 0; row 3: max beyond one
+        // block's worth of columns.
+        let neg_inf = f32::NEG_INFINITY;
+        let row_len = 600usize;
+        let mut data = vec![0.0f32; 4 * row_len];
+        data[0] = 1.0;
+        data[1] = 5.0;
+        data[2] = -2.0;
+        data[row_len] = f32::NAN;
+        data[row_len + 1] = 3.0;
+        data[row_len + 3] = 3.0;
+        for v in &mut data[2 * row_len..3 * row_len] {
+            *v = neg_inf;
+        }
+        data[3 * row_len + 599] = 9.0;
+        // rows 0 and 1 are zero-filled past the set values, so keep the
+        // maxima above zero by lowering the filler.
+        for r in [0usize, 1] {
+            for v in &mut data[r * row_len + 4..(r + 1) * row_len] {
+                *v = -1.0;
+            }
+        }
+        let x = rt.stream.clone_htod(&data).unwrap();
+        let mut out = rt.stream.alloc_zeros::<u32>(4).unwrap();
+        argmax_wrapper(&rt, &x, row_len as u32, &mut out).unwrap();
+        let got = rt.stream.clone_dtoh(&out).unwrap();
+        assert_eq!(got, [1, 1, 0, 599]);
     }
 
     #[test]

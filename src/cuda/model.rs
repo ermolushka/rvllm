@@ -167,6 +167,89 @@ impl CudaStepCtx {
 //   h   = x + attention(rms_norm(x, attn_norm))
 //   out = h + swiglu_ffn(rms_norm(h, ffn_norm))
 // x: [batch * q_len, hidden_dim] flattened; returns the same shape.
+// Every intermediate a layer needs, allocated once per forward pass (sizes
+// depend on the batch and context length, so not once per model) and reused
+// by all layers, instead of ~25 fresh allocations per layer. Zero-initialized
+// once; k_full/v_full padding slots keep whatever finite values earlier
+// layers left there, which the attention mask hides.
+struct Workspace {
+    normed: CudaSlice<f32>,
+    q_proj: CudaSlice<f32>,
+    k_proj: CudaSlice<f32>,
+    v_proj: CudaSlice<f32>,
+    q_t: CudaSlice<f32>,
+    k_t: CudaSlice<f32>,
+    v_t: CudaSlice<f32>,
+    q_roped: CudaSlice<f32>,
+    k_roped: CudaSlice<f32>,
+    k_tok: CudaSlice<f32>,
+    v_tok: CudaSlice<f32>,
+    k_full: CudaSlice<f32>,
+    v_full: CudaSlice<f32>,
+    scores: CudaSlice<f32>,
+    probs: CudaSlice<f32>,
+    attn_out: CudaSlice<f32>,
+    attn_out_t: CudaSlice<f32>,
+    attn_proj: CudaSlice<f32>,
+    h: CudaSlice<f32>,
+    normed2: CudaSlice<f32>,
+    gate: CudaSlice<f32>,
+    up: CudaSlice<f32>,
+    ffn_mid: CudaSlice<f32>,
+    ffn_out: CudaSlice<f32>,
+    // F16 copy of the current linear input, sized for the widest one.
+    x16: CudaSlice<f16>,
+}
+
+impl Workspace {
+    fn new(
+        cuda_runtime: &CudaRuntime,
+        config: &Config,
+        ctx: &CudaStepCtx,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let hidden_dim = config.hidden_dim as usize;
+        let n_heads = config.n_heads as usize;
+        let n_kv_heads = config.n_kv_heads as usize;
+        let head_dim = config.head_dim();
+        let ffn_dim = config.ffn_dim as usize;
+        let rows = ctx.batch * ctx.q_len;
+        let attn_rows = (n_heads / n_kv_heads) * ctx.q_len;
+        let q_size = rows * n_heads * head_dim;
+        let kv_size = rows * n_kv_heads * head_dim;
+        let full_size = ctx.batch * n_kv_heads * ctx.ctx_len * head_dim;
+        let scores_size = ctx.batch * n_kv_heads * attn_rows * ctx.ctx_len;
+        let widest = hidden_dim.max(n_heads * head_dim).max(ffn_dim);
+        let stream = &cuda_runtime.stream;
+        Ok(Workspace {
+            normed: stream.alloc_zeros(rows * hidden_dim)?,
+            q_proj: stream.alloc_zeros(q_size)?,
+            k_proj: stream.alloc_zeros(kv_size)?,
+            v_proj: stream.alloc_zeros(kv_size)?,
+            q_t: stream.alloc_zeros(q_size)?,
+            k_t: stream.alloc_zeros(kv_size)?,
+            v_t: stream.alloc_zeros(kv_size)?,
+            q_roped: stream.alloc_zeros(q_size)?,
+            k_roped: stream.alloc_zeros(kv_size)?,
+            k_tok: stream.alloc_zeros(kv_size)?,
+            v_tok: stream.alloc_zeros(kv_size)?,
+            k_full: stream.alloc_zeros(full_size)?,
+            v_full: stream.alloc_zeros(full_size)?,
+            scores: stream.alloc_zeros(scores_size)?,
+            probs: stream.alloc_zeros(scores_size)?,
+            attn_out: stream.alloc_zeros(q_size)?,
+            attn_out_t: stream.alloc_zeros(q_size)?,
+            attn_proj: stream.alloc_zeros(rows * hidden_dim)?,
+            h: stream.alloc_zeros(rows * hidden_dim)?,
+            normed2: stream.alloc_zeros(rows * hidden_dim)?,
+            gate: stream.alloc_zeros(rows * ffn_dim)?,
+            up: stream.alloc_zeros(rows * ffn_dim)?,
+            ffn_mid: stream.alloc_zeros(rows * ffn_dim)?,
+            ffn_out: stream.alloc_zeros(rows * hidden_dim)?,
+            x16: stream.alloc_zeros(rows * widest)?,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layer_forward(
     cuda_runtime: &CudaRuntime,
@@ -176,8 +259,9 @@ fn layer_forward(
     ctx: &CudaStepCtx,
     kv_storage: &mut CudaKvStorage,
     x: &CudaSlice<f32>,
-    x16: &mut CudaSlice<f16>,
-) -> Result<CudaSlice<f32>, Box<dyn std::error::Error>> {
+    out: &mut CudaSlice<f32>,
+    ws: &mut Workspace,
+) -> Result<(), Box<dyn std::error::Error>> {
     let hidden_dim = config.hidden_dim as usize;
     let n_heads = config.n_heads as usize;
     let n_kv_heads = config.n_kv_heads as usize;
@@ -188,23 +272,21 @@ fn layer_forward(
     let q_len = ctx.q_len;
     let ctx_len = ctx.ctx_len;
     let rows = batch * q_len;
-    let stream = &cuda_runtime.stream;
+    let x16 = &mut ws.x16;
 
-    let mut normed = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
     ops::rmsnorm_wrapper(
         cuda_runtime,
         x,
         &weights.attn_norm,
         hidden_dim as u32,
         config.rms_eps,
-        &mut normed,
+        &mut ws.normed,
     )?;
 
     // Project into Q/K/V, naturally [batch, q_len, heads, head_dim] flat
     // (reshape is free - a plain GEMM output, no data movement needed).
-    let mut q_proj = stream.alloc_zeros::<f32>(rows * n_heads * head_dim)?;
     // y = x @ weight^T. q/k/v read the same input, so narrow it to F16 once.
-    cublas_ops::to_f16(cuda_runtime, &normed, x16)?;
+    cublas_ops::to_f16(cuda_runtime, &ws.normed, x16)?;
     cublas_ops::linear_f16(
         cuda_runtime,
         x16,
@@ -212,9 +294,8 @@ fn layer_forward(
         rows,
         hidden_dim,
         n_heads * head_dim,
-        &mut q_proj,
+        &mut ws.q_proj,
     )?;
-    let mut k_proj = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
     cublas_ops::linear_f16(
         cuda_runtime,
         x16,
@@ -222,9 +303,8 @@ fn layer_forward(
         rows,
         hidden_dim,
         n_kv_heads * head_dim,
-        &mut k_proj,
+        &mut ws.k_proj,
     )?;
-    let mut v_proj = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
     cublas_ops::linear_f16(
         cuda_runtime,
         x16,
@@ -232,36 +312,33 @@ fn layer_forward(
         rows,
         hidden_dim,
         n_kv_heads * head_dim,
-        &mut v_proj,
+        &mut ws.v_proj,
     )?;
 
     // [batch, q_len, heads, head_dim] -> [batch, heads, q_len, head_dim] -
     // real data movement here, unlike Candle's free `.transpose(1, 2)`.
-    let mut q_t = stream.alloc_zeros::<f32>(rows * n_heads * head_dim)?;
     ops::transpose_axes12_wrapper(
         cuda_runtime,
-        &q_proj,
-        &mut q_t,
+        &ws.q_proj,
+        &mut ws.q_t,
         batch as u32,
         q_len as u32,
         n_heads as u32,
         head_dim as u32,
     )?;
-    let mut k_t = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
     ops::transpose_axes12_wrapper(
         cuda_runtime,
-        &k_proj,
-        &mut k_t,
+        &ws.k_proj,
+        &mut ws.k_t,
         batch as u32,
         q_len as u32,
         n_kv_heads as u32,
         head_dim as u32,
     )?;
-    let mut v_t = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
     ops::transpose_axes12_wrapper(
         cuda_runtime,
-        &v_proj,
-        &mut v_t,
+        &ws.v_proj,
+        &mut ws.v_t,
         batch as u32,
         q_len as u32,
         n_kv_heads as u32,
@@ -269,42 +346,38 @@ fn layer_forward(
     )?;
 
     // RoPE rotates Q and K given position; V carries content, not position.
-    let mut q_roped = stream.alloc_zeros::<f32>(rows * n_heads * head_dim)?;
     ops::rope_wrapper(
         cuda_runtime,
-        &q_t,
+        &ws.q_t,
         &ctx.cos_q,
         &ctx.sin_q,
-        &mut q_roped,
+        &mut ws.q_roped,
         head_dim as u32,
     )?;
-    let mut k_roped = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
     ops::rope_wrapper(
         cuda_runtime,
-        &k_t,
+        &ws.k_t,
         &ctx.cos_k,
         &ctx.sin_k,
-        &mut k_roped,
+        &mut ws.k_roped,
         head_dim as u32,
     )?;
 
     // Cache wants token-major rows [batch * q_len, n_kv_heads, head_dim] -
     // transpose back out of head-major layout before writing.
-    let mut k_tok = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
     ops::transpose_axes12_wrapper(
         cuda_runtime,
-        &k_roped,
-        &mut k_tok,
+        &ws.k_roped,
+        &mut ws.k_tok,
         batch as u32,
         n_kv_heads as u32,
         q_len as u32,
         head_dim as u32,
     )?;
-    let mut v_tok = stream.alloc_zeros::<f32>(rows * n_kv_heads * head_dim)?;
     ops::transpose_axes12_wrapper(
         cuda_runtime,
-        &v_t,
-        &mut v_tok,
+        &ws.v_t,
+        &mut ws.v_tok,
         batch as u32,
         n_kv_heads as u32,
         q_len as u32,
@@ -315,27 +388,23 @@ fn layer_forward(
         layer_idx,
         &ctx.block_ids,
         &ctx.offsets,
-        &k_tok,
-        &v_tok,
+        &ws.k_tok,
+        &ws.v_tok,
     )?;
 
-    let mut k_full = stream.alloc_zeros::<f32>(batch * n_kv_heads * ctx_len * head_dim)?;
-    let mut v_full = stream.alloc_zeros::<f32>(batch * n_kv_heads * ctx_len * head_dim)?;
     kv_storage.gather(
         cuda_runtime,
         layer_idx,
         &ctx.gather,
-        &mut k_full,
-        &mut v_full,
+        &mut ws.k_full,
+        &mut ws.v_full,
     )?;
 
-    let attn_rows = group_size * q_len;
-    let mut scores = stream.alloc_zeros::<f32>(batch * n_kv_heads * attn_rows * ctx_len)?;
     cublas_ops::attention_scores(
         cuda_runtime,
-        &q_roped,
-        &k_full,
-        &mut scores,
+        &ws.q_roped,
+        &ws.k_full,
+        &mut ws.scores,
         batch,
         n_kv_heads,
         group_size,
@@ -345,21 +414,19 @@ fn layer_forward(
     )?;
     ops::mask_add_broadcast_wrapper(
         cuda_runtime,
-        &mut scores,
+        &mut ws.scores,
         &ctx.mask,
         n_kv_heads as u32,
         group_size as u32,
         q_len as u32,
         ctx_len as u32,
     )?;
-    let mut probs = stream.alloc_zeros::<f32>(batch * n_kv_heads * attn_rows * ctx_len)?;
-    ops::softmax_wrapper(cuda_runtime, &scores, ctx_len as u32, &mut probs)?;
-    let mut attn_out = stream.alloc_zeros::<f32>(batch * n_kv_heads * attn_rows * head_dim)?;
+    ops::softmax_wrapper(cuda_runtime, &ws.scores, ctx_len as u32, &mut ws.probs)?;
     cublas_ops::attention_apply(
         cuda_runtime,
-        &probs,
-        &v_full,
-        &mut attn_out,
+        &ws.probs,
+        &ws.v_full,
+        &mut ws.attn_out,
         batch,
         n_kv_heads,
         group_size,
@@ -370,42 +437,37 @@ fn layer_forward(
 
     // [batch, heads, q_len, head_dim] -> [batch, q_len, heads, head_dim],
     // inverse of the earlier Q/K/V split, ready to flatten into hidden_dim.
-    let mut attn_out_t = stream.alloc_zeros::<f32>(rows * n_heads * head_dim)?;
     ops::transpose_axes12_wrapper(
         cuda_runtime,
-        &attn_out,
-        &mut attn_out_t,
+        &ws.attn_out,
+        &mut ws.attn_out_t,
         batch as u32,
         n_heads as u32,
         q_len as u32,
         head_dim as u32,
     )?;
-    let mut attn_proj = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
     cublas_ops::linear(
         cuda_runtime,
-        &attn_out_t,
+        &ws.attn_out_t,
         &weights.attn_output,
         rows,
         n_heads * head_dim,
         hidden_dim,
-        &mut attn_proj,
+        &mut ws.attn_proj,
         x16,
     )?;
 
-    let mut h = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
-    ops::add_wrapper(cuda_runtime, x, &attn_proj, &mut h)?;
+    ops::add_wrapper(cuda_runtime, x, &ws.attn_proj, &mut ws.h)?;
 
-    let mut normed2 = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
     ops::rmsnorm_wrapper(
         cuda_runtime,
-        &h,
+        &ws.h,
         &weights.ffn_norm,
         hidden_dim as u32,
         config.rms_eps,
-        &mut normed2,
+        &mut ws.normed2,
     )?;
-    let mut gate = stream.alloc_zeros::<f32>(rows * ffn_dim)?;
-    cublas_ops::to_f16(cuda_runtime, &normed2, x16)?;
+    cublas_ops::to_f16(cuda_runtime, &ws.normed2, x16)?;
     cublas_ops::linear_f16(
         cuda_runtime,
         x16,
@@ -413,9 +475,8 @@ fn layer_forward(
         rows,
         hidden_dim,
         ffn_dim,
-        &mut gate,
+        &mut ws.gate,
     )?;
-    let mut up = stream.alloc_zeros::<f32>(rows * ffn_dim)?;
     cublas_ops::linear_f16(
         cuda_runtime,
         x16,
@@ -423,25 +484,22 @@ fn layer_forward(
         rows,
         hidden_dim,
         ffn_dim,
-        &mut up,
+        &mut ws.up,
     )?;
-    let mut ffn_mid = stream.alloc_zeros::<f32>(rows * ffn_dim)?;
-    ops::silu_gate_multiply_wrapper(cuda_runtime, &gate, &up, &mut ffn_mid)?;
-    let mut ffn_out = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
+    ops::silu_gate_multiply_wrapper(cuda_runtime, &ws.gate, &ws.up, &mut ws.ffn_mid)?;
     cublas_ops::linear(
         cuda_runtime,
-        &ffn_mid,
+        &ws.ffn_mid,
         &weights.ffn_down,
         rows,
         ffn_dim,
         hidden_dim,
-        &mut ffn_out,
+        &mut ws.ffn_out,
         x16,
     )?;
 
-    let mut out = stream.alloc_zeros::<f32>(rows * hidden_dim)?;
-    ops::add_wrapper(cuda_runtime, &h, &ffn_out, &mut out)?;
-    Ok(out)
+    ops::add_wrapper(cuda_runtime, &ws.h, &ws.ffn_out, out)?;
+    Ok(())
 }
 
 pub struct CudaModel {
@@ -487,16 +545,13 @@ impl CudaModel {
             &mut x,
         )?;
 
-        // One F16 activation scratch for the whole pass, big enough for the
-        // widest linear input (hidden, attention-out or ffn width).
-        let widest = hidden_dim
-            .max(self.config.n_heads as usize * self.config.head_dim())
-            .max(self.config.ffn_dim as usize);
-        let mut x16 = cuda_runtime.stream.alloc_zeros::<f16>(rows * widest)?;
-
         let step_ctx = CudaStepCtx::new(cuda_runtime, &self.config, items)?;
+        let mut ws = Workspace::new(cuda_runtime, &self.config, &step_ctx)?;
+        // Ping-pong between two hidden-state buffers: a layer reads `x` and
+        // writes `x_next`, then they swap.
+        let mut x_next = cuda_runtime.stream.alloc_zeros::<f32>(rows * hidden_dim)?;
         for (i, layer) in self.weights.layers.iter().enumerate() {
-            x = layer_forward(
+            layer_forward(
                 cuda_runtime,
                 &self.config,
                 i,
@@ -504,8 +559,10 @@ impl CudaModel {
                 &step_ctx,
                 kv_storage,
                 &x,
-                &mut x16,
+                &mut x_next,
+                &mut ws,
             )?;
+            std::mem::swap(&mut x, &mut x_next);
         }
         Ok((x, batch, q_len))
     }
