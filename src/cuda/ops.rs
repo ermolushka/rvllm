@@ -354,6 +354,33 @@ pub fn add_wrapper(
     Ok(())
 }
 
+// Narrows an F32 buffer to F16 (round to nearest even). `output` must be the
+// same length as `input`.
+pub fn f32_to_f16_wrapper(
+    cuda_runtime: &CudaRuntime,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<half::f16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = input.len() as u32;
+    if output.len() as u32 != n {
+        return Err("f32_to_f16: output length must equal input length".into());
+    }
+    if n == 0 {
+        return Err("f32_to_f16: input len is 0".into());
+    }
+    match cuda_runtime.kernels_mapping.get("f32_to_f16") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+            builder.arg(input);
+            builder.arg(output);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'f32_to_f16' not found".into()),
+    }
+    Ok(())
+}
+
 // token_ids: [n_tokens]. embedding: [vocab_size, hidden_dim] flattened.
 // output: [n_tokens, hidden_dim] flattened.
 pub fn embed_lookup_wrapper(

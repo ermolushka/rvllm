@@ -12,19 +12,29 @@
 // what cuBLAS actually needs to compute, and reading off m/n/k/lda/ldb/ldc
 // and transpose flags from that - never by reasoning in column-major
 // directly.
-use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
-use cudarc::driver::CudaSlice;
+use std::ffi::c_void;
+
+use cudarc::cublas::sys::{
+    cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType,
+};
+use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig, result};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use half::f16;
 
 use super::context::CudaRuntime;
+use super::ops;
 
-// y = x @ weight^T. x: [rows, in_features] row-major. weight: [out_features,
-// in_features] row-major (Candle Linear convention - same weight layout
-// model.rs's `linear` takes). y: [rows, out_features] row-major.
+// y = x @ weight^T. x: [rows, in_features] row-major, F32. weight:
+// [out_features, in_features] row-major, F16 (Candle Linear convention - same
+// weight layout model.rs's `linear` takes). y: [rows, out_features]
+// row-major, F32.
+// cuBLAS has no F16-weight x F32-activation GEMM, so x is narrowed to F16
+// first (tiny next to the weight read) and the GEMM accumulates in F32 with
+// an F32 output, so downstream kernels still see F32.
 pub fn linear(
     cuda_runtime: &CudaRuntime,
     x: &CudaSlice<f32>,
-    weight: &CudaSlice<f32>,
+    weight: &CudaSlice<f16>,
     rows: usize,
     in_features: usize,
     out_features: usize,
@@ -39,19 +49,38 @@ pub fn linear(
     if output.len() != rows * out_features {
         return Err("linear: output length must equal rows * out_features".into());
     }
-    let cfg = GemmConfig {
-        transa: cublasOperation_t::CUBLAS_OP_T,
-        transb: cublasOperation_t::CUBLAS_OP_N,
-        m: out_features as i32,
-        n: rows as i32,
-        k: in_features as i32,
-        alpha: 1.0f32,
-        lda: in_features as i32,
-        ldb: in_features as i32,
-        beta: 0.0f32,
-        ldc: out_features as i32,
-    };
-    unsafe { cuda_runtime.blas.gemm(cfg, weight, x, output) }?;
+    let mut x_f16 = cuda_runtime.stream.alloc_zeros::<f16>(x.len())?;
+    ops::f32_to_f16_wrapper(cuda_runtime, x, &mut x_f16)?;
+
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let stream = &cuda_runtime.stream;
+    let (w_ptr, _w_guard) = weight.device_ptr(stream);
+    let (x_ptr, _x_guard) = x_f16.device_ptr(stream);
+    let (o_ptr, _o_guard) = output.device_ptr_mut(stream);
+    unsafe {
+        result::gemm_ex(
+            *cuda_runtime.blas.handle(),
+            cublasOperation_t::CUBLAS_OP_T,
+            cublasOperation_t::CUBLAS_OP_N,
+            out_features as i32,
+            rows as i32,
+            in_features as i32,
+            (&alpha as *const f32).cast(),
+            w_ptr as *const c_void,
+            cudaDataType::CUDA_R_16F,
+            in_features as i32,
+            x_ptr as *const c_void,
+            cudaDataType::CUDA_R_16F,
+            in_features as i32,
+            (&beta as *const f32).cast(),
+            o_ptr as *mut c_void,
+            cudaDataType::CUDA_R_32F,
+            out_features as i32,
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }?;
     Ok(())
 }
 
@@ -180,7 +209,10 @@ mod tests {
     fn linear_matches_candle_reference() {
         let Some(rt) = runtime() else { return };
         // Same case as model.rs's linear_matches_manual_matmul_for_2d_and_3d_input.
-        let w: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [out=2, in=3]
+        let w: Vec<f16> = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .into_iter()
+            .map(f16::from_f32)
+            .collect(); // [out=2, in=3]
         let x: Vec<f32> = vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0]; // [rows=2, in=3]
 
         let w_dev = rt.stream.clone_htod(&w).unwrap();

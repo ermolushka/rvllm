@@ -1,10 +1,14 @@
 // One-time CPU -> CudaSlice weight upload. Weights are loaded via
 // Candle/GGUF on CPU as usual (model.rs/weights.rs, untouched), then copied
 // once into flat device buffers here. Same tensor set as `model::Layer`/
-// `model::Model`, just CudaSlice<f32>-typed instead of Candle-Tensor-typed -
+// `model::Model`, just CudaSlice-typed instead of Candle-Tensor-typed -
 // no shared trait, same reasoning as CudaKvStorage vs KvStorage.
+// The big projection matrices are narrowed to F16 on upload (decode is
+// memory bound, so this halves the bytes moved); norm weights and the token
+// embedding table stay F32.
 use candle_core::Tensor;
 use cudarc::driver::CudaSlice;
+use half::f16;
 
 use crate::model::Model;
 
@@ -12,21 +16,21 @@ use super::context::CudaRuntime;
 
 pub struct CudaLayer {
     pub attn_norm: CudaSlice<f32>,
-    pub attn_q: CudaSlice<f32>,
-    pub attn_k: CudaSlice<f32>,
-    pub attn_v: CudaSlice<f32>,
-    pub attn_output: CudaSlice<f32>,
+    pub attn_q: CudaSlice<f16>,
+    pub attn_k: CudaSlice<f16>,
+    pub attn_v: CudaSlice<f16>,
+    pub attn_output: CudaSlice<f16>,
     pub ffn_norm: CudaSlice<f32>,
-    pub ffn_gate: CudaSlice<f32>,
-    pub ffn_up: CudaSlice<f32>,
-    pub ffn_down: CudaSlice<f32>,
+    pub ffn_gate: CudaSlice<f16>,
+    pub ffn_up: CudaSlice<f16>,
+    pub ffn_down: CudaSlice<f16>,
 }
 
 pub struct CudaWeights {
     pub token_embd: CudaSlice<f32>,
     pub layers: Vec<CudaLayer>,
     pub output_norm: CudaSlice<f32>,
-    pub output: CudaSlice<f32>,
+    pub output: CudaSlice<f16>,
 }
 
 fn upload(
@@ -34,6 +38,15 @@ fn upload(
     t: &Tensor,
 ) -> Result<CudaSlice<f32>, Box<dyn std::error::Error>> {
     let host: Vec<f32> = t.flatten_all()?.to_vec1()?;
+    Ok(cuda_runtime.stream.clone_htod(&host)?)
+}
+
+fn upload_f16(
+    cuda_runtime: &CudaRuntime,
+    t: &Tensor,
+) -> Result<CudaSlice<f16>, Box<dyn std::error::Error>> {
+    let host: Vec<f32> = t.flatten_all()?.to_vec1()?;
+    let host: Vec<f16> = host.into_iter().map(f16::from_f32).collect();
     Ok(cuda_runtime.stream.clone_htod(&host)?)
 }
 
@@ -49,19 +62,19 @@ impl CudaWeights {
             .map(|l| -> Result<CudaLayer, Box<dyn std::error::Error>> {
                 Ok(CudaLayer {
                     attn_norm: upload(cuda_runtime, &l.attn_norm)?,
-                    attn_q: upload(cuda_runtime, &l.attn_q)?,
-                    attn_k: upload(cuda_runtime, &l.attn_k)?,
-                    attn_v: upload(cuda_runtime, &l.attn_v)?,
-                    attn_output: upload(cuda_runtime, &l.attn_output)?,
+                    attn_q: upload_f16(cuda_runtime, &l.attn_q)?,
+                    attn_k: upload_f16(cuda_runtime, &l.attn_k)?,
+                    attn_v: upload_f16(cuda_runtime, &l.attn_v)?,
+                    attn_output: upload_f16(cuda_runtime, &l.attn_output)?,
                     ffn_norm: upload(cuda_runtime, &l.ffn_norm)?,
-                    ffn_gate: upload(cuda_runtime, &l.ffn_gate)?,
-                    ffn_up: upload(cuda_runtime, &l.ffn_up)?,
-                    ffn_down: upload(cuda_runtime, &l.ffn_down)?,
+                    ffn_gate: upload_f16(cuda_runtime, &l.ffn_gate)?,
+                    ffn_up: upload_f16(cuda_runtime, &l.ffn_up)?,
+                    ffn_down: upload_f16(cuda_runtime, &l.ffn_down)?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_norm = upload(cuda_runtime, &model.output_norm)?;
-        let output = upload(cuda_runtime, &model.output)?;
+        let output = upload_f16(cuda_runtime, &model.output)?;
         Ok(CudaWeights {
             token_embd,
             layers,
@@ -143,10 +156,14 @@ mod tests {
             .to_vec1()
             .unwrap();
         let got_q = rt.stream.clone_dtoh(&weights.layers[0].attn_q).unwrap();
-        assert_eq!(got_q, want_q);
+        for (g, w) in got_q.iter().zip(want_q.iter()) {
+            assert!((g.to_f32() - w).abs() < 1e-3, "got {got_q:?}, want {want_q:?}");
+        }
 
         let want_out: Vec<f32> = model.output.flatten_all().unwrap().to_vec1().unwrap();
         let got_out = rt.stream.clone_dtoh(&weights.output).unwrap();
-        assert_eq!(got_out, want_out);
+        for (g, w) in got_out.iter().zip(want_out.iter()) {
+            assert!((g.to_f32() - w).abs() < 1e-3, "got {got_out:?}, want {want_out:?}");
+        }
     }
 }
