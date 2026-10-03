@@ -8,6 +8,37 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+// Where one decode step's wall time goes, summed over the run. Printed to
+// stderr at the end when RVLLM_TIMING is set. `enqueue` is CPU time spent
+// launching the forward pass; `gpu_wait` is how long the CPU then blocks for
+// the GPU to finish. If enqueue is close to enqueue + gpu_wait, the GPU is
+// being starved by launch overhead, not limited by its own work.
+#[derive(Default)]
+struct DecodeBreakdown {
+    setup: Duration,
+    enqueue: Duration,
+    gpu_wait: Duration,
+    copy: Duration,
+    sample: Duration,
+}
+
+impl DecodeBreakdown {
+    fn report(&self, steps: usize) {
+        if steps == 0 || std::env::var_os("RVLLM_TIMING").is_none() {
+            return;
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / steps as f64;
+        eprintln!(
+            "decode breakdown (ms/step over {steps} steps): setup={:.2} enqueue={:.2} gpu_wait={:.2} logits_copy={:.2} sample={:.2}",
+            ms(self.setup),
+            ms(self.enqueue),
+            ms(self.gpu_wait),
+            ms(self.copy),
+            ms(self.sample),
+        );
+    }
+}
+
 use candle_core::{Device, Tensor};
 use kv_cache_scheduler::block_pool::BlockID;
 use kv_cache_scheduler::sequence::{Scheduler, SequenceId, TokenId};
@@ -92,6 +123,7 @@ pub fn run(
     let mut prefill_tokens = 0usize;
     let mut decode_time = Duration::ZERO;
     let mut decode_steps = 0usize;
+    let mut breakdown = DecodeBreakdown::default();
     let mut ttft = vec![Duration::ZERO; requests.len()];
     loop {
         while pending.front().is_some_and(|r| r.arrival_step <= step_idx) {
@@ -198,7 +230,8 @@ pub fn run(
                 });
             }
 
-            let host = {
+            let setup_time = decode_started.elapsed();
+            let (host, enqueue_time, gpu_wait_time, copy_time) = {
                 let items: Vec<BatchItem> = rows
                     .iter()
                     .map(|row| {
@@ -212,9 +245,20 @@ pub fn run(
                         }
                     })
                     .collect();
+                let enqueue_started = Instant::now();
                 let logits = model.forward(cuda_runtime, &items, &mut kv_storage)?;
-                cuda_runtime.stream.clone_dtoh(&logits)?
+                let enqueue_time = enqueue_started.elapsed();
+                // Sync first so the time spent waiting on the GPU is separate
+                // from the logits copy (clone_dtoh would sync anyway).
+                let wait_started = Instant::now();
+                cuda_runtime.stream.synchronize()?;
+                let gpu_wait_time = wait_started.elapsed();
+                let copy_started = Instant::now();
+                let host = cuda_runtime.stream.clone_dtoh(&logits)?;
+                let copy_time = copy_started.elapsed();
+                (host, enqueue_time, gpu_wait_time, copy_time)
             };
+            let sample_started = Instant::now();
 
             for (i, row) in rows.iter().enumerate() {
                 let next_id = sampler.sample(&row_tensor(&host, i, vocab_size)?)?;
@@ -228,12 +272,19 @@ pub fn run(
                     req.next_input = next_id;
                 }
             }
+            breakdown.setup += setup_time;
+            breakdown.enqueue += enqueue_time;
+            breakdown.gpu_wait += gpu_wait_time;
+            breakdown.copy += copy_time;
+            breakdown.sample += sample_started.elapsed();
             decode_time += decode_started.elapsed();
             decode_steps += 1;
         }
 
         step_idx += 1;
     }
+
+    breakdown.report(decode_steps);
 
     let elapsed = started.elapsed();
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
