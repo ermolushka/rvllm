@@ -354,16 +354,17 @@ pub fn add_wrapper(
     Ok(())
 }
 
-// Narrows an F32 buffer to F16 (round to nearest even). `output` must be the
-// same length as `input`.
+// Narrows an F32 buffer to F16 (round to nearest even). `output` may be longer
+// than `input` (a reused scratch buffer); only the first input.len() elements
+// are written.
 pub fn f32_to_f16_wrapper(
     cuda_runtime: &CudaRuntime,
     input: &CudaSlice<f32>,
     output: &mut CudaSlice<half::f16>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let n = input.len() as u32;
-    if output.len() as u32 != n {
-        return Err("f32_to_f16: output length must equal input length".into());
+    if (output.len() as u32) < n {
+        return Err("f32_to_f16: output is shorter than input".into());
     }
     if n == 0 {
         return Err("f32_to_f16: input len is 0".into());

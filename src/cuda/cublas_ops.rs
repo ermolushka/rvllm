@@ -24,24 +24,36 @@ use half::f16;
 use super::context::CudaRuntime;
 use super::ops;
 
-// y = x @ weight^T. x: [rows, in_features] row-major, F32. weight:
+// Narrows x to F16 into `scratch` (which may be longer than x and is meant to
+// be allocated once per forward pass and reused, so no per-call allocation).
+// Call once per distinct input, then `linear_f16` for each weight that reads it.
+pub fn to_f16(
+    cuda_runtime: &CudaRuntime,
+    x: &CudaSlice<f32>,
+    scratch: &mut CudaSlice<f16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ops::f32_to_f16_wrapper(cuda_runtime, x, scratch)
+}
+
+// y = x @ weight^T. x: [rows, in_features] row-major, already narrowed to F16
+// by `to_f16` (only the first rows * in_features elements are read). weight:
 // [out_features, in_features] row-major, F16 (Candle Linear convention - same
 // weight layout model.rs's `linear` takes). y: [rows, out_features]
 // row-major, F32.
-// cuBLAS has no F16-weight x F32-activation GEMM, so x is narrowed to F16
-// first (tiny next to the weight read) and the GEMM accumulates in F32 with
-// an F32 output, so downstream kernels still see F32.
-pub fn linear(
+// cuBLAS has no F16-weight x F32-activation GEMM, so the activations are
+// narrowed first (tiny next to the weight read) and the GEMM accumulates in
+// F32 with an F32 output, so downstream kernels still see F32.
+pub fn linear_f16(
     cuda_runtime: &CudaRuntime,
-    x: &CudaSlice<f32>,
+    x16: &CudaSlice<f16>,
     weight: &CudaSlice<f16>,
     rows: usize,
     in_features: usize,
     out_features: usize,
     output: &mut CudaSlice<f32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if x.len() != rows * in_features {
-        return Err("linear: x length must equal rows * in_features".into());
+    if x16.len() < rows * in_features {
+        return Err("linear: x16 shorter than rows * in_features".into());
     }
     if weight.len() != out_features * in_features {
         return Err("linear: weight length must equal out_features * in_features".into());
@@ -49,14 +61,11 @@ pub fn linear(
     if output.len() != rows * out_features {
         return Err("linear: output length must equal rows * out_features".into());
     }
-    let mut x_f16 = cuda_runtime.stream.alloc_zeros::<f16>(x.len())?;
-    ops::f32_to_f16_wrapper(cuda_runtime, x, &mut x_f16)?;
-
     let alpha = 1.0f32;
     let beta = 0.0f32;
     let stream = &cuda_runtime.stream;
     let (w_ptr, _w_guard) = weight.device_ptr(stream);
-    let (x_ptr, _x_guard) = x_f16.device_ptr(stream);
+    let (x_ptr, _x_guard) = x16.device_ptr(stream);
     let (o_ptr, _o_guard) = output.device_ptr_mut(stream);
     unsafe {
         result::gemm_ex(
@@ -82,6 +91,33 @@ pub fn linear(
         )
     }?;
     Ok(())
+}
+
+// Convenience for a one-off projection: `to_f16` then `linear_f16`.
+#[allow(clippy::too_many_arguments)]
+pub fn linear(
+    cuda_runtime: &CudaRuntime,
+    x: &CudaSlice<f32>,
+    weight: &CudaSlice<f16>,
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    output: &mut CudaSlice<f32>,
+    scratch: &mut CudaSlice<f16>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if x.len() != rows * in_features {
+        return Err("linear: x length must equal rows * in_features".into());
+    }
+    to_f16(cuda_runtime, x, scratch)?;
+    linear_f16(
+        cuda_runtime,
+        scratch,
+        weight,
+        rows,
+        in_features,
+        out_features,
+        output,
+    )
 }
 
 // scores[b] = (1/sqrt(head_dim)) * Q[b] @ K[b]^T, batched over
@@ -218,7 +254,8 @@ mod tests {
         let w_dev = rt.stream.clone_htod(&w).unwrap();
         let x_dev = rt.stream.clone_htod(&x).unwrap();
         let mut out = rt.stream.alloc_zeros::<f32>(4).unwrap();
-        linear(&rt, &x_dev, &w_dev, 2, 3, 2, &mut out).unwrap();
+        let mut scratch = rt.stream.alloc_zeros::<f16>(8).unwrap();
+        linear(&rt, &x_dev, &w_dev, 2, 3, 2, &mut out, &mut scratch).unwrap();
         let got = rt.stream.clone_dtoh(&out).unwrap();
 
         // row0 = [1+3, 4+6] = [4, 10]; row1 = [2, 5]
