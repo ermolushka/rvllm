@@ -2,9 +2,8 @@
 // Scheduler-driven admission/prefill/decode structure, but forward passes
 // go through CudaModel/CudaKvStorage. The seam PLAN.md's M6 names: logits
 // come back from CudaModel as a flat CudaSlice<f32>, copied to host once
-// per call, then wrapped per-row as a 1D CPU Tensor so the existing
-// Sampler (unchanged, CPU-only) can sample from it exactly as it does on
-// the CPU path.
+// per call, then sampled row by row straight from the host slice with the
+// existing CPU Sampler (`sample_slice`), same logic as the CPU path.
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -39,7 +38,6 @@ impl DecodeBreakdown {
     }
 }
 
-use candle_core::{Device, Tensor};
 use kv_cache_scheduler::block_pool::BlockID;
 use kv_cache_scheduler::sequence::{Scheduler, SequenceId, TokenId};
 
@@ -71,16 +69,6 @@ struct DecodeRow {
     token: [u32; 1],
     write: [(BlockID, usize); 1],
     position_offset: usize,
-}
-
-// Copies one row of a flat [rows, vocab_size] device buffer already on the
-// host back into a 1D CPU Tensor, the shape `Sampler::sample` expects.
-fn row_tensor(host: &[f32], row: usize, vocab_size: usize) -> candle_core::Result<Tensor> {
-    Tensor::from_slice(
-        &host[row * vocab_size..(row + 1) * vocab_size],
-        vocab_size,
-        &Device::Cpu,
-    )
 }
 
 pub fn run(
@@ -174,7 +162,7 @@ pub fn run(
             };
             let logits = model.forward_last(cuda_runtime, &[item], &mut kv_storage)?;
             let host = cuda_runtime.stream.clone_dtoh(&logits)?;
-            let next_id = sampler.sample(&row_tensor(&host, 0, vocab_size)?)?;
+            let next_id = sampler.sample_slice(&host[..vocab_size]);
             let prefill_elapsed = prefill_started.elapsed();
             prefill_time += prefill_elapsed;
             prefill_tokens += tokens.len() - skip_tokens;
@@ -261,7 +249,7 @@ pub fn run(
             let sample_started = Instant::now();
 
             for (i, row) in rows.iter().enumerate() {
-                let next_id = sampler.sample(&row_tensor(&host, i, vocab_size)?)?;
+                let next_id = sampler.sample_slice(&host[i * vocab_size..(i + 1) * vocab_size]);
                 let req = seqs.get_mut(&row.seq_id).unwrap();
                 req.generated.push(next_id);
                 let finished =
