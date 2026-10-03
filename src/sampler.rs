@@ -25,6 +25,12 @@ impl Sampler {
         }
     }
 
+    // True when sampling is a plain argmax, so callers can take the argmax
+    // somewhere cheaper (e.g. on the GPU) and skip moving the logits.
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
     pub fn sample(&mut self, logits: &Tensor) -> candle_core::Result<u32> {
         if self.temperature <= 0.0 {
             return logits.argmax(0)?.to_scalar::<u32>();

@@ -47,6 +47,7 @@ use crate::sampler::Sampler;
 use super::context::CudaRuntime;
 use super::kv_storage::CudaKvStorage;
 use super::model::CudaModel;
+use super::ops;
 
 pub use crate::engine::{RequestSpec, RunResult, RunStats};
 
@@ -69,6 +70,28 @@ struct DecodeRow {
     token: [u32; 1],
     write: [(BlockID, usize); 1],
     position_offset: usize,
+}
+
+// Next token for each of `rows` logits rows. Greedy takes the argmax on the
+// GPU and copies back one integer per row, instead of the whole
+// [rows, vocab_size] logits (megabytes at larger batches) and scanning them
+// on the CPU; anything else copies the logits and samples on the host.
+fn pick_tokens(
+    cuda_runtime: &CudaRuntime,
+    logits: &cudarc::driver::CudaSlice<f32>,
+    rows: usize,
+    vocab_size: usize,
+    sampler: &mut Sampler,
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    if sampler.is_greedy() {
+        let mut ids = cuda_runtime.stream.alloc_zeros::<u32>(rows)?;
+        ops::argmax_wrapper(cuda_runtime, logits, vocab_size as u32, &mut ids)?;
+        return Ok(cuda_runtime.stream.clone_dtoh(&ids)?);
+    }
+    let host = cuda_runtime.stream.clone_dtoh(logits)?;
+    Ok((0..rows)
+        .map(|i| sampler.sample_slice(&host[i * vocab_size..(i + 1) * vocab_size]))
+        .collect())
 }
 
 pub fn run(
@@ -161,8 +184,7 @@ pub fn run(
                 position_offset: skip_tokens,
             };
             let logits = model.forward_last(cuda_runtime, &[item], &mut kv_storage)?;
-            let host = cuda_runtime.stream.clone_dtoh(&logits)?;
-            let next_id = sampler.sample_slice(&host[..vocab_size]);
+            let next_id = pick_tokens(cuda_runtime, &logits, 1, vocab_size, sampler)?[0];
             let prefill_elapsed = prefill_started.elapsed();
             prefill_time += prefill_elapsed;
             prefill_tokens += tokens.len() - skip_tokens;
@@ -219,7 +241,7 @@ pub fn run(
             }
 
             let setup_time = decode_started.elapsed();
-            let (host, enqueue_time, gpu_wait_time, copy_time) = {
+            let (next_ids, enqueue_time, gpu_wait_time, copy_time, sample_time) = {
                 let items: Vec<BatchItem> = rows
                     .iter()
                     .map(|row| {
@@ -235,21 +257,43 @@ pub fn run(
                     .collect();
                 let enqueue_started = Instant::now();
                 let logits = model.forward(cuda_runtime, &items, &mut kv_storage)?;
+                // Greedy: queue the per-row argmax right behind the forward
+                // pass so only `rows` integers need to come back.
+                let greedy_ids = if sampler.is_greedy() {
+                    let mut ids = cuda_runtime.stream.alloc_zeros::<u32>(rows.len())?;
+                    ops::argmax_wrapper(cuda_runtime, &logits, vocab_size as u32, &mut ids)?;
+                    Some(ids)
+                } else {
+                    None
+                };
                 let enqueue_time = enqueue_started.elapsed();
                 // Sync first so the time spent waiting on the GPU is separate
-                // from the logits copy (clone_dtoh would sync anyway).
+                // from the copy (clone_dtoh would sync anyway).
                 let wait_started = Instant::now();
                 cuda_runtime.stream.synchronize()?;
                 let gpu_wait_time = wait_started.elapsed();
                 let copy_started = Instant::now();
-                let host = cuda_runtime.stream.clone_dtoh(&logits)?;
-                let copy_time = copy_started.elapsed();
-                (host, enqueue_time, gpu_wait_time, copy_time)
+                match greedy_ids {
+                    Some(ids) => {
+                        let next_ids = cuda_runtime.stream.clone_dtoh(&ids)?;
+                        (next_ids, enqueue_time, gpu_wait_time, copy_started.elapsed(), Duration::ZERO)
+                    }
+                    None => {
+                        let host = cuda_runtime.stream.clone_dtoh(&logits)?;
+                        let copy_time = copy_started.elapsed();
+                        let sample_started = Instant::now();
+                        let next_ids: Vec<u32> = (0..rows.len())
+                            .map(|i| {
+                                sampler.sample_slice(&host[i * vocab_size..(i + 1) * vocab_size])
+                            })
+                            .collect();
+                        (next_ids, enqueue_time, gpu_wait_time, copy_time, sample_started.elapsed())
+                    }
+                }
             };
-            let sample_started = Instant::now();
 
             for (i, row) in rows.iter().enumerate() {
-                let next_id = sampler.sample_slice(&host[i * vocab_size..(i + 1) * vocab_size]);
+                let next_id = next_ids[i];
                 let req = seqs.get_mut(&row.seq_id).unwrap();
                 req.generated.push(next_id);
                 let finished =
@@ -264,7 +308,7 @@ pub fn run(
             breakdown.enqueue += enqueue_time;
             breakdown.gpu_wait += gpu_wait_time;
             breakdown.copy += copy_time;
-            breakdown.sample += sample_started.elapsed();
+            breakdown.sample += sample_time;
             decode_time += decode_started.elapsed();
             decode_steps += 1;
         }
