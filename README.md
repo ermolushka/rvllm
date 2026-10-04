@@ -3,6 +3,17 @@
 Two modes, one engine: `rvllm cli` for asking questions in the terminal and
 `rvllm serve` for an OpenAI-compatible HTTP server.
 
+## Supported models
+
+Only one model is supported right now: **SmolLM2-360M** (`SmolLM2-360M.Q8_0.gguf`
+with its `tokenizer.json`). It is the only model this has been developed and
+tested against. The loader reads Llama-style GGUF metadata (`llama.*` keys) and
+dequantizes everything to F32 on load (F16 on the GPU), so other Llama-architecture
+models might load, but nothing else is tested, and the tokenizer wrapper and the
+hardcoded ChatML chat template are specific to SmolLM2. The `-Instruct` variant of
+the same model is the one to use for `--chat` and `/v1/chat/completions`; the base
+model works for plain completions but isn't chat-tuned.
+
 ## CLI mode
 
 Interactive question -> answer loop (answers stream as they are generated;
