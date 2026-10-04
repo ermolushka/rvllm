@@ -5,14 +5,23 @@ Two modes, one engine: `rvllm cli` for asking questions in the terminal and
 
 ## Supported models
 
-Only one model is supported right now: **SmolLM2-360M** (`SmolLM2-360M.Q8_0.gguf`
-with its `tokenizer.json`). It is the only model this has been developed and
-tested against. The loader reads Llama-style GGUF metadata (`llama.*` keys) and
-dequantizes everything to F32 on load (F16 on the GPU), so other Llama-architecture
-models might load, but nothing else is tested, and the tokenizer wrapper and the
-hardcoded ChatML chat template are specific to SmolLM2. The `-Instruct` variant of
-the same model is the one to use for `--chat` and `/v1/chat/completions`; the base
-model works for plain completions but isn't chat-tuned.
+Only the SmolLM2-360M family is supported right now, in Q8_0 GGUF form with its
+`tokenizer.json`:
+
+- `SmolLM2-360M.Q8_0.gguf` (base): plain completions.
+- `SmolLM2-360M-Instruct` Q8_0 GGUF (use the Instruct repo's `tokenizer.json`):
+  chat, via `--chat` and `/v1/chat/completions`. Tested end to end, including
+  multi-turn history and stopping on `<|im_end|>`.
+
+These are the only models this has been developed and tested against. The loader
+reads Llama-style GGUF metadata (`llama.*` keys) and dequantizes everything to F32
+on load (F16 on the GPU), so other Llama-architecture models might load, but
+nothing else is tested, and the tokenizer wrapper and the hardcoded ChatML chat
+template are specific to SmolLM2. Base models aren't chat-tuned, so don't expect
+sensible answers from `--chat` with the base file.
+
+GGUF files store Q/K weights in llama.cpp's interleaved RoPE layout; the loader
+reorders them to the rotate-half layout the kernels use (`weights.rs`).
 
 ## CLI mode
 

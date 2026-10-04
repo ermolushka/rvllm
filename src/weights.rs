@@ -10,6 +10,22 @@ fn metadata<'a>(content: &'a gguf_file::Content, key: &str) -> Result<&'a gguf_f
     }
 }
 
+// llama.cpp's converter reorders each head's Q/K output rows so that RoPE
+// rotates *adjacent* pairs (row 2j with row 2j+1). This engine's RoPE uses the
+// rotate-half convention (row j with row j + head_dim/2), which is how
+// HuggingFace checkpoints are laid out. Undo the reordering at load time:
+// within each head, even rows move to the first half and odd rows to the
+// second. Without this, attention degrades as the context gets longer.
+// `w` is [n_heads * head_dim, in_features].
+fn unpermute_rope_rows(w: &Tensor, n_heads: usize) -> Result<Tensor> {
+    let (rows, cols) = w.dims2()?;
+    let half = rows / n_heads / 2;
+    w.reshape((n_heads, half, 2, cols))?
+        .transpose(1, 2)?
+        .contiguous()?
+        .reshape((rows, cols))
+}
+
 impl Model {
     // Reads the model's hyperparameters and every weight tensor from a GGUF
     // file, dequantizing everything to F32 (no quantized matmul yet). Weights
@@ -53,8 +69,14 @@ impl Model {
                 Ok(Layer {
                     index: i,
                     attn_norm: load(&format!("blk.{i}.attn_norm.weight"))?,
-                    attn_q: load(&format!("blk.{i}.attn_q.weight"))?,
-                    attn_k: load(&format!("blk.{i}.attn_k.weight"))?,
+                    attn_q: unpermute_rope_rows(
+                        &load(&format!("blk.{i}.attn_q.weight"))?,
+                        config.n_heads as usize,
+                    )?,
+                    attn_k: unpermute_rope_rows(
+                        &load(&format!("blk.{i}.attn_k.weight"))?,
+                        config.n_kv_heads as usize,
+                    )?,
                     attn_v: load(&format!("blk.{i}.attn_v.weight"))?,
                     attn_output: load(&format!("blk.{i}.attn_output.weight"))?,
                     ffn_norm: load(&format!("blk.{i}.ffn_norm.weight"))?,
@@ -72,5 +94,34 @@ impl Model {
             output_norm,
             output,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // llama.cpp's convert_hf_to_gguf.py `permute`, on a [rows, cols] matrix.
+    fn llama_cpp_permute(w: &Tensor, n_heads: usize) -> Result<Tensor> {
+        let (rows, cols) = w.dims2()?;
+        w.reshape((n_heads, 2, rows / n_heads / 2, cols))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((rows, cols))
+    }
+
+    #[test]
+    fn unpermute_inverts_llama_cpp_layout() -> Result<()> {
+        // 2 heads x head_dim 4, 3 columns; each row's values identify it.
+        let data: Vec<f32> = (0..8).flat_map(|r| [r as f32; 3]).collect();
+        let hf = Tensor::from_vec(data, (8, 3), &Device::Cpu)?;
+        let gguf = llama_cpp_permute(&hf, 2)?;
+        // Per head, GGUF order is [0, 2, 1, 3] of the HF rows.
+        let row_ids = |t: &Tensor| -> Result<Vec<f32>> {
+            Ok(t.narrow(1, 0, 1)?.flatten_all()?.to_vec1()?)
+        };
+        assert_eq!(row_ids(&gguf)?, vec![0., 2., 1., 3., 4., 6., 5., 7.]);
+        assert_eq!(row_ids(&unpermute_rope_rows(&gguf, 2)?)?, row_ids(&hf)?);
+        Ok(())
     }
 }
