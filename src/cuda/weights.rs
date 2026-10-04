@@ -157,13 +157,19 @@ mod tests {
             .unwrap();
         let got_q = rt.stream.clone_dtoh(&weights.layers[0].attn_q).unwrap();
         for (g, w) in got_q.iter().zip(want_q.iter()) {
-            assert!((g.to_f32() - w).abs() < 1e-3, "got {got_q:?}, want {want_q:?}");
+            assert!(
+                (g.to_f32() - w).abs() < 1e-3,
+                "got {got_q:?}, want {want_q:?}"
+            );
         }
 
         let want_out: Vec<f32> = model.output.flatten_all().unwrap().to_vec1().unwrap();
         let got_out = rt.stream.clone_dtoh(&weights.output).unwrap();
         for (g, w) in got_out.iter().zip(want_out.iter()) {
-            assert!((g.to_f32() - w).abs() < 1e-3, "got {got_out:?}, want {want_out:?}");
+            assert!(
+                (g.to_f32() - w).abs() < 1e-3,
+                "got {got_out:?}, want {want_out:?}"
+            );
         }
     }
 }

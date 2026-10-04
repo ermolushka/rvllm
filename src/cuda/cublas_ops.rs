@@ -14,9 +14,7 @@
 // directly.
 use std::ffi::c_void;
 
-use cudarc::cublas::sys::{
-    cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType,
-};
+use cudarc::cublas::sys::{cublasComputeType_t, cublasGemmAlgo_t, cublasOperation_t, cudaDataType};
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig, result};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::f16;

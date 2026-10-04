@@ -39,7 +39,10 @@ impl CudaRuntime {
         self.load_single_kernel(include_str!("kernels/rmsnorm.cu"), "rmsnorm".to_string())?;
         self.load_single_kernel(include_str!("kernels/rope.cu"), "rope".to_string())?;
         self.load_single_kernel(include_str!("kernels/kv_write.cu"), "kv_write".to_string())?;
-        self.load_single_kernel(include_str!("kernels/kv_gather.cu"), "kv_gather".to_string())?;
+        self.load_single_kernel(
+            include_str!("kernels/kv_gather.cu"),
+            "kv_gather".to_string(),
+        )?;
         self.load_single_kernel(include_str!("kernels/softmax.cu"), "softmax".to_string())?;
         self.load_single_kernel(include_str!("kernels/add.cu"), "add".to_string())?;
         self.load_single_kernel(

@@ -1,20 +1,31 @@
-// CUDA mirror of engine.rs's continuous-batching decode loop: same
-// Scheduler-driven admission/prefill/decode structure, but forward passes
-// go through CudaModel/CudaKvStorage. The seam PLAN.md's M6 names: logits
-// come back from CudaModel as a flat CudaSlice<f32>, copied to host once
-// per call, then sampled row by row straight from the host slice with the
-// existing CPU Sampler (`sample_slice`), same logic as the CPU path.
-use std::collections::{HashMap, VecDeque};
+// CUDA `Backend` for engine.rs: the same Scheduler-driven loop as the CPU
+// path, with forward passes going through CudaModel/CudaKvStorage. Logits come
+// back from CudaModel as a flat CudaSlice<f32>; token selection happens here.
+
+use std::fmt::Display;
 use std::time::{Duration, Instant};
 
+use crate::engine::{Backend, BoxError};
+use crate::model::{BatchItem, Config};
+use crate::sampler::Sampler;
+
+use super::context::CudaRuntime;
+use super::kv_storage::CudaKvStorage;
+use super::model::CudaModel;
+use super::ops;
+
+fn boxed<E: Display>(e: E) -> BoxError {
+    e.to_string().into()
+}
+
 // Where one decode step's wall time goes, summed over the run. Printed to
-// stderr at the end when RVLLM_TIMING is set. `enqueue` is CPU time spent
-// launching the forward pass; `gpu_wait` is how long the CPU then blocks for
-// the GPU to finish. If enqueue is close to enqueue + gpu_wait, the GPU is
-// being starved by launch overhead, not limited by its own work.
+// stderr when the backend is dropped if RVLLM_TIMING is set. `enqueue` is CPU
+// time spent launching the forward pass; `gpu_wait` is how long the CPU then
+// blocks for the GPU to finish. If enqueue is close to enqueue + gpu_wait, the
+// GPU is being starved by launch overhead, not limited by its own work.
 #[derive(Default)]
 struct DecodeBreakdown {
-    setup: Duration,
+    steps: usize,
     enqueue: Duration,
     gpu_wait: Duration,
     copy: Duration,
@@ -22,14 +33,14 @@ struct DecodeBreakdown {
 }
 
 impl DecodeBreakdown {
-    fn report(&self, steps: usize) {
-        if steps == 0 || std::env::var_os("RVLLM_TIMING").is_none() {
+    fn report(&self) {
+        if self.steps == 0 || std::env::var_os("RVLLM_TIMING").is_none() {
             return;
         }
-        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / steps as f64;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / self.steps as f64;
         eprintln!(
-            "decode breakdown (ms/step over {steps} steps): setup={:.2} enqueue={:.2} gpu_wait={:.2} logits_copy={:.2} sample={:.2}",
-            ms(self.setup),
+            "decode breakdown (ms/step over {} steps): enqueue={:.2} gpu_wait={:.2} logits_copy={:.2} sample={:.2}",
+            self.steps,
             ms(self.enqueue),
             ms(self.gpu_wait),
             ms(self.copy),
@@ -38,308 +49,114 @@ impl DecodeBreakdown {
     }
 }
 
-use kv_cache_scheduler::block_pool::BlockID;
-use kv_cache_scheduler::sequence::{Scheduler, SequenceId, TokenId};
-
-use crate::model::BatchItem;
-use crate::sampler::Sampler;
-
-use super::context::CudaRuntime;
-use super::kv_storage::CudaKvStorage;
-use super::model::CudaModel;
-use super::ops;
-
-pub use crate::engine::{RequestSpec, RunResult, RunStats};
-
-struct PendingRequest {
-    arrival_step: usize,
-    req_idx: usize,
-    tokens: Vec<u32>,
+pub struct CudaBackend<'a> {
+    runtime: &'a CudaRuntime,
+    model: &'a CudaModel,
+    kv_storage: CudaKvStorage,
+    breakdown: DecodeBreakdown,
 }
 
-struct SeqState {
-    req_idx: usize,
-    prompt_len: usize,
-    max_tokens: usize,
-    generated: Vec<u32>,
-    next_input: u32,
-}
-
-struct DecodeRow {
-    seq_id: SequenceId,
-    token: [u32; 1],
-    write: [(BlockID, usize); 1],
-    position_offset: usize,
-}
-
-// Next token for each of `rows` logits rows. Greedy takes the argmax on the
-// GPU and copies back one integer per row, instead of the whole
-// [rows, vocab_size] logits (megabytes at larger batches) and scanning them
-// on the CPU; anything else copies the logits and samples on the host.
-fn pick_tokens(
-    cuda_runtime: &CudaRuntime,
-    logits: &cudarc::driver::CudaSlice<f32>,
-    rows: usize,
-    vocab_size: usize,
-    sampler: &mut Sampler,
-) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    if sampler.is_greedy() {
-        let mut ids = cuda_runtime.stream.alloc_zeros::<u32>(rows)?;
-        ops::argmax_wrapper(cuda_runtime, logits, vocab_size as u32, &mut ids)?;
-        return Ok(cuda_runtime.stream.clone_dtoh(&ids)?);
-    }
-    let host = cuda_runtime.stream.clone_dtoh(logits)?;
-    Ok((0..rows)
-        .map(|i| sampler.sample_slice(&host[i * vocab_size..(i + 1) * vocab_size]))
-        .collect())
-}
-
-pub fn run(
-    cuda_runtime: &CudaRuntime,
-    model: &CudaModel,
-    requests: &[RequestSpec],
-    block_size: usize,
-    num_blocks: usize,
-    sampler: &mut Sampler,
-) -> Result<RunResult, Box<dyn std::error::Error>> {
-    let config = &model.config;
-    let vocab_size = config.vocab_size as usize;
-
-    let mut kv_storage = CudaKvStorage::new(
-        cuda_runtime,
-        config.n_layers as usize,
-        num_blocks,
-        block_size,
-        config.n_kv_heads as usize,
-        config.head_dim(),
-    )?;
-    let mut scheduler = Scheduler::new(num_blocks as u32, block_size);
-
-    let mut pending: VecDeque<PendingRequest> = requests
-        .iter()
-        .enumerate()
-        .map(|(i, r)| PendingRequest {
-            arrival_step: r.arrival_step,
-            req_idx: i,
-            tokens: r.tokens.clone(),
+impl<'a> CudaBackend<'a> {
+    pub fn new(
+        runtime: &'a CudaRuntime,
+        model: &'a CudaModel,
+        block_size: usize,
+        num_blocks: usize,
+    ) -> Result<Self, BoxError> {
+        let config = &model.config;
+        let kv_storage = CudaKvStorage::new(
+            runtime,
+            config.n_layers as usize,
+            num_blocks,
+            block_size,
+            config.n_kv_heads as usize,
+            config.head_dim(),
+        )
+        .map_err(boxed)?;
+        Ok(CudaBackend {
+            runtime,
+            model,
+            kv_storage,
+            breakdown: DecodeBreakdown::default(),
         })
-        .collect();
-    pending.make_contiguous().sort_by_key(|r| r.arrival_step);
+    }
+}
 
-    let mut seqs: HashMap<SequenceId, SeqState> = HashMap::new();
+impl Drop for CudaBackend<'_> {
+    fn drop(&mut self) {
+        self.breakdown.report();
+    }
+}
 
-    let started = Instant::now();
-    let mut step_idx = 0usize;
-    let mut prefill_time = Duration::ZERO;
-    let mut prefill_tokens = 0usize;
-    let mut decode_time = Duration::ZERO;
-    let mut decode_steps = 0usize;
-    let mut breakdown = DecodeBreakdown::default();
-    let mut ttft = vec![Duration::ZERO; requests.len()];
-    loop {
-        while pending.front().is_some_and(|r| r.arrival_step <= step_idx) {
-            let req = pending.pop_front().unwrap();
-            let prompt_len = req.tokens.len();
-            let seq_id =
-                scheduler.add_request(req.tokens.iter().map(|&t| TokenId(t as i32)).collect());
-            seqs.insert(
-                seq_id,
-                SeqState {
-                    req_idx: req.req_idx,
-                    prompt_len,
-                    max_tokens: requests[req.req_idx].max_tokens,
-                    generated: Vec::new(),
-                    next_input: 0,
-                },
-            );
+impl Backend for CudaBackend<'_> {
+    fn config(&self) -> &Config {
+        &self.model.config
+    }
+
+    // Greedy takes the argmax on the GPU and copies back one integer per row,
+    // instead of the whole [rows, vocab_size] logits (megabytes at larger
+    // batches) and scanning them on the CPU; anything else copies the logits
+    // and samples on the host.
+    fn forward_sample(
+        &mut self,
+        items: &[BatchItem],
+        last_only: bool,
+        samplers: &mut [&mut Sampler],
+    ) -> Result<Vec<u32>, BoxError> {
+        let rows = items.len();
+        let vocab_size = self.model.config.vocab_size as usize;
+        let runtime = self.runtime;
+
+        let enqueue_started = Instant::now();
+        let logits = if last_only {
+            self.model
+                .forward_last(runtime, items, &mut self.kv_storage)
+        } else {
+            self.model.forward(runtime, items, &mut self.kv_storage)
         }
+        .map_err(boxed)?;
+        // Queue the per-row argmax right behind the forward pass.
+        let greedy_ids = if samplers.iter().all(|s| s.is_greedy()) {
+            let mut ids = runtime.stream.alloc_zeros::<u32>(rows).map_err(boxed)?;
+            ops::argmax_wrapper(runtime, &logits, vocab_size as u32, &mut ids).map_err(boxed)?;
+            Some(ids)
+        } else {
+            None
+        };
+        let enqueue = enqueue_started.elapsed();
 
-        while let Some(&seq_id) = scheduler.waiting.front() {
-            let needed_blocks = scheduler.sequences[&seq_id]
-                .token_ids
-                .len()
-                .div_ceil(block_size);
-            if scheduler.pool.available() < needed_blocks {
-                break;
+        // Sync first so the time spent waiting on the GPU is separate from the
+        // copy (clone_dtoh would sync anyway).
+        let wait_started = Instant::now();
+        runtime.stream.synchronize().map_err(boxed)?;
+        let gpu_wait = wait_started.elapsed();
+
+        let copy_started = Instant::now();
+        let (next, copy, sample) = match greedy_ids {
+            Some(ids) => {
+                let next = runtime.stream.clone_dtoh(&ids).map_err(boxed)?;
+                (next, copy_started.elapsed(), Duration::ZERO)
             }
-
-            let token_ids = scheduler.sequences[&seq_id].token_ids.clone();
-            let (_matched_tokens, matched_blocks) = scheduler.prefix_cache.match_prefix(&token_ids);
-            let skip_tokens = (matched_blocks.len() * block_size).min(token_ids.len() - 1);
-
-            let prefill_started = Instant::now();
-            scheduler.prefill(seq_id);
-
-            let seq = &scheduler.sequences[&seq_id];
-            let tokens: Vec<u32> = seq.token_ids.iter().map(|t| t.0 as u32).collect();
-            let write_positions: Vec<(BlockID, usize)> = (skip_tokens..tokens.len())
-                .map(|i| seq.block_table.logical_to_physical(i))
-                .collect();
-
-            let item = BatchItem {
-                tokens: &tokens[skip_tokens..],
-                write_positions: &write_positions,
-                read_blocks: seq.block_table.blocks(),
-                read_num_tokens: seq.block_table.num_tokens(),
-                position_offset: skip_tokens,
-            };
-            let logits = model.forward_last(cuda_runtime, &[item], &mut kv_storage)?;
-            let next_id = pick_tokens(cuda_runtime, &logits, 1, vocab_size, sampler)?[0];
-            let prefill_elapsed = prefill_started.elapsed();
-            prefill_time += prefill_elapsed;
-            prefill_tokens += tokens.len() - skip_tokens;
-
-            let state = seqs.get_mut(&seq_id).unwrap();
-            ttft[state.req_idx] = prefill_elapsed;
-            state.next_input = next_id;
-        }
-
-        if scheduler.running.is_empty() && scheduler.waiting.is_empty() && pending.is_empty() {
-            break;
-        }
-
-        if !scheduler.running.is_empty() {
-            let decode_started = Instant::now();
-            let running = scheduler.running.clone();
-            let position_offsets: HashMap<SequenceId, usize> = running
-                .iter()
-                .map(|&id| (id, scheduler.sequences[&id].block_table.num_tokens()))
-                .collect();
-
-            scheduler.step();
-
-            for &seq_id in &running {
-                if !scheduler.running.contains(&seq_id) {
-                    let state = &seqs[&seq_id];
-                    let real_len = state.prompt_len + state.generated.len();
-                    scheduler
-                        .sequences
-                        .get_mut(&seq_id)
-                        .unwrap()
-                        .token_ids
-                        .truncate(real_len);
-                }
-            }
-
-            let mut rows: Vec<DecodeRow> = Vec::with_capacity(running.len());
-            for &seq_id in &running {
-                if !scheduler.running.contains(&seq_id) {
-                    continue;
-                }
-                let next_input = seqs[&seq_id].next_input;
-                let seq = scheduler.sequences.get_mut(&seq_id).unwrap();
-                if let Some(t) = seq.token_ids.last_mut() {
-                    *t = TokenId(next_input as i32);
-                }
-                let position_offset = position_offsets[&seq_id];
-                rows.push(DecodeRow {
-                    seq_id,
-                    token: [next_input],
-                    write: [seq.block_table.logical_to_physical(position_offset)],
-                    position_offset,
-                });
-            }
-
-            let setup_time = decode_started.elapsed();
-            let (next_ids, enqueue_time, gpu_wait_time, copy_time, sample_time) = {
-                let items: Vec<BatchItem> = rows
-                    .iter()
-                    .map(|row| {
-                        let table = &scheduler.sequences[&row.seq_id].block_table;
-                        BatchItem {
-                            tokens: &row.token,
-                            write_positions: &row.write,
-                            read_blocks: table.blocks(),
-                            read_num_tokens: table.num_tokens(),
-                            position_offset: row.position_offset,
-                        }
-                    })
+            None => {
+                let host = runtime.stream.clone_dtoh(&logits).map_err(boxed)?;
+                let copy = copy_started.elapsed();
+                let sample_started = Instant::now();
+                let next = samplers
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, s)| s.sample_slice(&host[i * vocab_size..(i + 1) * vocab_size]))
                     .collect();
-                let enqueue_started = Instant::now();
-                let logits = model.forward(cuda_runtime, &items, &mut kv_storage)?;
-                // Greedy: queue the per-row argmax right behind the forward
-                // pass so only `rows` integers need to come back.
-                let greedy_ids = if sampler.is_greedy() {
-                    let mut ids = cuda_runtime.stream.alloc_zeros::<u32>(rows.len())?;
-                    ops::argmax_wrapper(cuda_runtime, &logits, vocab_size as u32, &mut ids)?;
-                    Some(ids)
-                } else {
-                    None
-                };
-                let enqueue_time = enqueue_started.elapsed();
-                // Sync first so the time spent waiting on the GPU is separate
-                // from the copy (clone_dtoh would sync anyway).
-                let wait_started = Instant::now();
-                cuda_runtime.stream.synchronize()?;
-                let gpu_wait_time = wait_started.elapsed();
-                let copy_started = Instant::now();
-                match greedy_ids {
-                    Some(ids) => {
-                        let next_ids = cuda_runtime.stream.clone_dtoh(&ids)?;
-                        (next_ids, enqueue_time, gpu_wait_time, copy_started.elapsed(), Duration::ZERO)
-                    }
-                    None => {
-                        let host = cuda_runtime.stream.clone_dtoh(&logits)?;
-                        let copy_time = copy_started.elapsed();
-                        let sample_started = Instant::now();
-                        let next_ids: Vec<u32> = (0..rows.len())
-                            .map(|i| {
-                                sampler.sample_slice(&host[i * vocab_size..(i + 1) * vocab_size])
-                            })
-                            .collect();
-                        (next_ids, enqueue_time, gpu_wait_time, copy_time, sample_started.elapsed())
-                    }
-                }
-            };
-
-            for (i, row) in rows.iter().enumerate() {
-                let next_id = next_ids[i];
-                let req = seqs.get_mut(&row.seq_id).unwrap();
-                req.generated.push(next_id);
-                let finished =
-                    next_id == config.eos_token_id || req.generated.len() >= req.max_tokens;
-                if finished {
-                    scheduler.finish_sequence(row.seq_id);
-                } else {
-                    req.next_input = next_id;
-                }
+                (next, copy, sample_started.elapsed())
             }
-            breakdown.setup += setup_time;
-            breakdown.enqueue += enqueue_time;
-            breakdown.gpu_wait += gpu_wait_time;
-            breakdown.copy += copy_time;
-            breakdown.sample += sample_time;
-            decode_time += decode_started.elapsed();
-            decode_steps += 1;
+        };
+
+        if !last_only {
+            self.breakdown.steps += 1;
+            self.breakdown.enqueue += enqueue;
+            self.breakdown.gpu_wait += gpu_wait;
+            self.breakdown.copy += copy;
+            self.breakdown.sample += sample;
         }
-
-        step_idx += 1;
+        Ok(next)
     }
-
-    breakdown.report(decode_steps);
-
-    let elapsed = started.elapsed();
-    let mut generated: Vec<Vec<u32>> = vec![Vec::new(); requests.len()];
-    let mut output_tokens = 0usize;
-    for state in seqs.into_values() {
-        output_tokens += state.generated.len();
-        generated[state.req_idx] = state.generated;
-    }
-
-    Ok(RunResult {
-        generated,
-        stats: RunStats {
-            steps: step_idx,
-            elapsed,
-            output_tokens,
-            prefix_hits: scheduler.metrics.prefix_hits,
-            prefix_total: scheduler.metrics.prefix_total,
-            total_block_allocs: scheduler.pool.total_allocs,
-            prefill_time,
-            prefill_tokens,
-            decode_time,
-            decode_steps,
-            ttft,
-        },
-    })
 }

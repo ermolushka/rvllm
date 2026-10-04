@@ -10,6 +10,24 @@ use rand::{Rng, SeedableRng};
 // already cover `top_p` of the probability mass.
 const INITIAL_CANDIDATES: usize = 64;
 
+// Per-request sampling settings. Each request owns its own `Sampler` (and so
+// its own RNG stream), which keeps a seeded request reproducible no matter
+// what else is in the batch with it.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: u64,
+}
+
+impl SamplingParams {
+    pub const GREEDY: SamplingParams = SamplingParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        seed: 0,
+    };
+}
+
 pub struct Sampler {
     temperature: f32,
     top_p: f32,
@@ -23,6 +41,10 @@ impl Sampler {
             top_p,
             rng: StdRng::seed_from_u64(seed),
         }
+    }
+
+    pub fn from_params(params: SamplingParams) -> Self {
+        Sampler::new(params.temperature, params.top_p, params.seed)
     }
 
     // True when sampling is a plain argmax, so callers can take the argmax
