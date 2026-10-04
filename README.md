@@ -1,20 +1,28 @@
 # rvllm
 
-Single request:
+Two modes, one engine: `rvllm cli` for asking questions in the terminal and
+`rvllm serve` for an OpenAI-compatible HTTP server.
+
+## CLI mode
+
+Interactive question -> answer loop (answers stream as they are generated;
+Ctrl-D or `exit` quits):
 
 ```
-cargo run --release -- \
+cargo run --release -- cli \
   --model ../SmolLM2-360M.Q8_0.gguf \
-  --tokenizer tokenizer.json \
-  --prompt "The capital of France is" \
-  --max-tokens 20
+  --tokenizer tokenizer.json
 ```
 
-Multiple concurrent requests (continuous batching - pass `--prompt` once per
-request, all sharing one KV block pool):
+Pass `--chat` to wrap input in the ChatML template (use this with `-Instruct`
+models); the conversation history is then kept between questions.
+
+With `--prompt` the CLI runs the given prompts once and exits. Multiple
+`--prompt`s run concurrently through continuous batching, all sharing one KV
+block pool:
 
 ```
-cargo run --release -- \
+cargo run --release -- cli \
   --model ../SmolLM2-360M.Q8_0.gguf \
   --tokenizer tokenizer.json \
   --prompt "The capital of France is" \
@@ -36,15 +44,64 @@ order). Pass `--debug` to also print each prompt with a labelled completion,
 plus the prefix cache hit rate, total block allocations, and step count /
 throughput (tok/s) for the run.
 
-## Sampling
-
-`--temperature` (default `0.0`) and `--top-p` (default `1.0`) control next-token
-selection. `--temperature 0.0` is greedy argmax - deterministic, no RNG involved.
-Any positive temperature enables nucleus (top-p) sampling, seeded by `--seed`
-(default `42`) for reproducible runs:
+## Server mode
 
 ```
-cargo run --release -- \
+cargo run --release -- serve \
+  --model ../SmolLM2-360M.Q8_0.gguf \
+  --tokenizer tokenizer.json \
+  --port 8000
+```
+
+```
+curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Say hi"}],
+  "max_tokens": 32, "stream": true
+}'
+```
+
+Endpoints: `POST /v1/completions`, `POST /v1/chat/completions` (both with
+`stream: true` SSE support, `stream_options.include_usage`, `stop`,
+`temperature`, `top_p`, `seed`, `max_tokens`), `GET /v1/models`,
+`GET /health` (live running/waiting counts). Only `n = 1` is supported, and
+completions take a single prompt. Any OpenAI client works by pointing its base
+URL at `http://localhost:8000/v1`.
+
+### How concurrent clients are handled
+
+All HTTP connections are served by tokio, but inference runs on one engine
+thread that continuously batches whatever is in flight:
+
+- **Shared batching.** Two agent sessions hitting the endpoint at once simply
+  share decode steps; a request arriving mid-generation joins the very next
+  step. Each request samples with its own RNG, so a seeded request gives the
+  same output regardless of what else is running.
+- **Queue.** At most `--max-running` (default 8) sequences decode together.
+  Further requests wait in a FIFO queue and start as slots free up (or as KV
+  blocks free up; when the pool is exhausted mid-flight the engine preempts
+  the least recently used sequence and re-prefills it later).
+- **Backpressure.** Once `--max-running + --max-queue` (default 8 + 64)
+  requests are in flight, new ones get `429` with `Retry-After: 1` instead of
+  piling up.
+- **Cancellation.** If a client disconnects, its request is aborted and its KV
+  blocks and queue slot are released immediately.
+
+KV capacity is `--num-blocks` blocks of `--block-size` tokens; by default
+`--max-running` x `--tokens-per-seq` (2048) tokens. A single request can use
+at most the whole pool (and never more than the model's context length).
+`--default-max-tokens`, `--default-temperature` and `--default-top-p` apply
+to requests that omit them. SmolLM2 base models aren't chat-tuned: for real
+chat use a `-Instruct` GGUF (the chat template is ChatML).
+
+## Sampling
+
+`--temperature` (default `0.0` in `cli`) and `--top-p` (default `1.0`) control
+next-token selection. `--temperature 0.0` is greedy argmax - deterministic, no
+RNG involved. Any positive temperature enables nucleus (top-p) sampling,
+seeded by `--seed` (default `42`) for reproducible runs:
+
+```
+cargo run --release -- cli \
   --model ../SmolLM2-360M.Q8_0.gguf \
   --tokenizer tokenizer.json \
   --prompt "The capital of France is" \
@@ -106,17 +163,18 @@ cargo test --features cuda          # kernel/model unit tests; each skips
 Builds and runs unchanged on machines without a GPU - the feature is opt-in,
 and the default (CPU/Candle) path is untouched by it.
 
-Both binaries take `--device cuda` to run through the custom-written CUDA
-inference path (`cuda::model::CudaModel` + `cuda::engine::run`) instead of
-the CPU/Candle one, instead of `cargo build`'s `--features cuda` alone -
+Every command (`cli`, `serve`, `bench`) takes `--device cuda` to run through the
+custom-written CUDA inference path (`cuda::model::CudaModel` +
+`cuda::engine::CudaBackend`) instead of the CPU/Candle one, instead of `cargo build`'s `--features cuda` alone -
 that just makes the CUDA code available in the binary, `--device cuda` is
 what actually switches to it at runtime. Omitting it (or building without
 the feature at all) always uses the CPU path.
 
-Interactive CLI, same flags as the CPU examples above, run through CUDA:
+CLI, same flags as the CPU examples above, run through CUDA (`serve` works
+the same way):
 
 ```
-cargo run --release --features cuda -- \
+cargo run --release --features cuda -- cli \
   --model ../SmolLM2-360M.Q8_0.gguf \
   --tokenizer tokenizer.json \
   --prompt "The capital of France is" \
