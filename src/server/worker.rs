@@ -43,7 +43,7 @@ pub struct WorkerStatus {
 
 struct Live {
     events: UnboundedSender<WorkerEvent>,
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 // Runs until every `Job` sender is dropped and all in-flight work is done.
@@ -67,7 +67,7 @@ pub fn run_worker<B: Backend>(
                     id,
                     Live {
                         events: job.events,
-                        _permit: job.permit,
+                        permit: job.permit,
                     },
                 );
             }
@@ -104,17 +104,29 @@ pub fn run_worker<B: Backend>(
         match engine.step() {
             Ok(events) => {
                 for ev in events {
+                    if ev.finish.is_some() {
+                        // Release the queue slot *before* the final event goes
+                        // out: once the client has its response, an immediate
+                        // follow-up request must not see the slot still taken.
+                        let Some(Live { events, permit }) = live.remove(&ev.id) else {
+                            continue;
+                        };
+                        drop(permit);
+                        let _ = events.send(WorkerEvent::Token {
+                            token: ev.token,
+                            finish: ev.finish,
+                        });
+                        continue;
+                    }
                     let Some(l) = live.get(&ev.id) else { continue };
                     let delivered = l
                         .events
                         .send(WorkerEvent::Token {
                             token: ev.token,
-                            finish: ev.finish,
+                            finish: None,
                         })
                         .is_ok();
-                    if ev.finish.is_some() {
-                        live.remove(&ev.id);
-                    } else if !delivered {
+                    if !delivered {
                         engine.abort(ev.id);
                         live.remove(&ev.id);
                     }
