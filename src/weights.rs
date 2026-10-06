@@ -117,9 +117,8 @@ mod tests {
         let hf = Tensor::from_vec(data, (8, 3), &Device::Cpu)?;
         let gguf = llama_cpp_permute(&hf, 2)?;
         // Per head, GGUF order is [0, 2, 1, 3] of the HF rows.
-        let row_ids = |t: &Tensor| -> Result<Vec<f32>> {
-            Ok(t.narrow(1, 0, 1)?.flatten_all()?.to_vec1()?)
-        };
+        let row_ids =
+            |t: &Tensor| -> Result<Vec<f32>> { Ok(t.narrow(1, 0, 1)?.flatten_all()?.to_vec1()?) };
         assert_eq!(row_ids(&gguf)?, vec![0., 2., 1., 3., 4., 6., 5., 7.]);
         assert_eq!(row_ids(&unpermute_rope_rows(&gguf, 2)?)?, row_ids(&hf)?);
         Ok(())

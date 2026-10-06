@@ -8,4 +8,5 @@ pub mod runtime;
 pub mod sampler;
 pub mod server;
 pub mod tokenizer;
+pub mod tui;
 pub mod weights;
