@@ -16,3 +16,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --locked
+      - name: Library-only build
+        run: cargo build --locked --no-default-features

@@ -3,6 +3,24 @@
 Two modes, one engine: `rvllm cli` for asking questions in the terminal and
 `rvllm serve` for an OpenAI-compatible HTTP server.
 
+## Use as a library
+
+```toml
+rvllm = { version = "0.1", default-features = false }            # engine only
+rvllm = { version = "0.1", default-features = false, features = ["server"] }  # + HTTP server module
+```
+
+```rust
+use rvllm::generator::{GenerateOptions, Generator};
+
+let generator = Generator::load("SmolLM2-360M.Q8_0.gguf", "tokenizer.json", "cpu")?;
+let text = generator.complete("The capital of France is", &GenerateOptions::default())?;
+```
+
+Features: `server` (axum API), `tui` (ratatui UI), `cli` (default; both plus the
+`rvllm`/`bench` binaries), `cuda`. Lower-level pieces (`Runtime`, `Engine`,
+`Backend`) are public too.
+
 ## Supported models
 
 Only the SmolLM2-360M family is supported right now, in Q8_0 GGUF form with its
