@@ -1,5 +1,4 @@
 use std::io::{BufRead, Write};
-use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use rvllm::chat::{self, ChatMessage};
@@ -7,8 +6,7 @@ use rvllm::engine::{self, BoxError, Engine, EngineConfig, Request, RequestSpec};
 use rvllm::model::{Config, Model};
 use rvllm::runtime::Runtime;
 use rvllm::sampler::{Sampler, SamplingParams};
-use rvllm::server::worker::{WorkerStatus, run_worker};
-use rvllm::server::{self, AppState, ServerConfig};
+use rvllm::server;
 use rvllm::tokenizer::{SmollLM230MTokenizer, StreamDecoder};
 
 #[derive(Parser)]
@@ -381,88 +379,22 @@ fn interactive(
 // ---- serve ----------------------------------------------------------------
 
 fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
-    if args.max_running == 0 {
-        return Err("--max-running must be at least 1".into());
-    }
-    let model_file = model_path(&args.model)?;
-    let model = Model::load(model_file)?;
-    let tokenizer = load_tokenizer(&args.model.tokenizer, &model.config)?;
-    let context_length = model.config.context_length as usize;
-    let block_size = args.model.block_size;
-    let num_blocks = args.model.num_blocks.unwrap_or_else(|| {
-        args.max_running * blocks_for(context_length.min(args.tokens_per_seq), block_size)
-    });
-    let engine_cfg = EngineConfig {
-        block_size,
-        num_blocks,
-        max_running: args.max_running,
-    };
-    let model_name = args.model_name.clone().unwrap_or_else(|| {
-        std::path::Path::new(model_file)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "rvllm".into())
-    });
-
-    let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
-    let status = Arc::new(WorkerStatus::default());
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<usize, String>>();
-
-    std::thread::scope(|scope| -> Result<(), BoxError> {
-        // The engine thread builds its own runtime (CUDA context included) so
-        // device state never crosses threads.
-        let worker_status = status.clone();
-        let device = args.model.device.clone();
-        let model = &model;
-        scope.spawn(move || {
-            let runtime = match Runtime::new(model, &device) {
-                Ok(r) => r,
-                Err(e) => return drop(ready_tx.send(Err(e.to_string()))),
-            };
-            let backend = match runtime.backend(block_size, num_blocks) {
-                Ok(b) => b,
-                Err(e) => return drop(ready_tx.send(Err(e.to_string()))),
-            };
-            let engine = Engine::new(backend, engine_cfg);
-            let _ = ready_tx.send(Ok(engine.max_sequence_tokens()));
-            run_worker(engine, job_rx, worker_status);
-        });
-        let max_sequence_tokens = ready_rx
-            .recv()
-            .map_err(|_| "engine thread died during startup")??;
-
-        let state = AppState::new(
-            ServerConfig {
-                model_name: model_name.clone(),
-                max_running: args.max_running,
-                max_queue: args.max_queue,
-                default_max_tokens: args.default_max_tokens,
-                default_temperature: args.default_temperature,
-                default_top_p: args.default_top_p,
-                context_length,
-                max_sequence_tokens,
-            },
-            tokenizer,
-            job_tx,
-            status,
-        );
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        let addr = format!("{}:{}", args.host, args.port);
-        let result = rt.block_on(async {
-            let listener = tokio::net::TcpListener::bind(&addr).await?;
-            eprintln!(
-                "serving {model_name:?} on http://{addr} ({} on {}; {} running slots, queue of {}; KV pool {} blocks x {} tokens)",
-                model_file, args.model.device, args.max_running, args.max_queue, num_blocks, block_size,
-            );
-            server::serve(listener, state).await
-        });
-        // Drops any request tasks still holding the job channel, so the
-        // engine thread sees it close and exits.
-        rt.shutdown_background();
-        result?;
-        Ok(())
-    })
+    let model_file = model_path(&args.model)?.to_string();
+    server::run(
+        &model_file,
+        &args.model.tokenizer,
+        server::ServeOptions {
+            device: args.model.device,
+            addr: format!("{}:{}", args.host, args.port),
+            model_name: args.model_name,
+            block_size: args.model.block_size,
+            num_blocks: args.model.num_blocks,
+            tokens_per_seq: args.tokens_per_seq,
+            max_running: args.max_running,
+            max_queue: args.max_queue,
+            default_max_tokens: args.default_max_tokens,
+            default_temperature: args.default_temperature,
+            default_top_p: args.default_top_p,
+        },
+    )
 }

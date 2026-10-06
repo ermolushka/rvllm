@@ -9,8 +9,11 @@
 // requests get HTTP 429 instead of piling up unboundedly.
 
 mod api;
+mod launch;
 mod stop;
 pub mod worker;
+
+pub use launch::{ServeOptions, run};
 
 use std::convert::Infallible;
 use std::sync::Arc;
