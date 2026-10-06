@@ -30,8 +30,9 @@ enum Command {
 
 #[derive(Args)]
 struct ModelArgs {
+    // Required, except with `cli --tui` where the model can be picked in the UI.
     #[arg(long)]
-    model: String,
+    model: Option<String>,
     #[arg(long, default_value = "tokenizer.json")]
     tokenizer: String,
     // "cpu" (default) or "cuda" - requires building with --features cuda.
@@ -79,6 +80,15 @@ struct CliArgs {
     // then prefix cache and throughput stats.
     #[arg(long)]
     debug: bool,
+    // Full-screen terminal UI (ratatui): pick a model from `--models-dir` and
+    // chat with streamed output. `--model` preloads one instead of opening the
+    // picker.
+    #[arg(long, conflicts_with_all = ["prompt", "debug", "arrival_step"])]
+    tui: bool,
+    // Where the TUI model picker looks for .gguf files (plus one level of
+    // subdirectories).
+    #[arg(long, default_value = ".")]
+    models_dir: String,
 }
 
 #[derive(Args)]
@@ -121,6 +131,12 @@ fn main() -> Result<(), BoxError> {
     }
 }
 
+fn model_path(args: &ModelArgs) -> Result<&str, BoxError> {
+    args.model
+        .as_deref()
+        .ok_or_else(|| "--model is required".into())
+}
+
 fn blocks_for(tokens: usize, block_size: usize) -> usize {
     tokens.div_ceil(block_size).max(1)
 }
@@ -140,14 +156,27 @@ fn stop_tokens(tokenizer: &SmollLM230MTokenizer) -> Vec<u32> {
 // ---- cli ------------------------------------------------------------------
 
 fn run_cli(args: CliArgs) -> Result<(), BoxError> {
-    let model = Model::load(&args.model.model)?;
-    let tokenizer = load_tokenizer(&args.model.tokenizer, &model.config)?;
-    let runtime = Runtime::new(&model, &args.model.device)?;
     let sampling = SamplingParams {
         temperature: args.temperature,
         top_p: args.top_p,
         seed: args.seed,
     };
+    if args.tui {
+        return rvllm::tui::run(rvllm::tui::TuiOptions {
+            device: args.model.device,
+            block_size: args.model.block_size,
+            num_blocks: args.model.num_blocks,
+            max_tokens: args.max_tokens.unwrap_or(256),
+            chat: args.chat,
+            sampling,
+            fallback_tokenizer: args.model.tokenizer.into(),
+            models_dir: args.models_dir.into(),
+            initial_model: args.model.model.map(Into::into),
+        });
+    }
+    let model = Model::load(model_path(&args.model)?)?;
+    let tokenizer = load_tokenizer(&args.model.tokenizer, &model.config)?;
+    let runtime = Runtime::new(&model, &args.model.device)?;
     if args.prompt.is_empty() {
         interactive(&args, &runtime, &tokenizer, sampling)
     } else {
@@ -355,7 +384,8 @@ fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
     if args.max_running == 0 {
         return Err("--max-running must be at least 1".into());
     }
-    let model = Model::load(&args.model.model)?;
+    let model_file = model_path(&args.model)?;
+    let model = Model::load(model_file)?;
     let tokenizer = load_tokenizer(&args.model.tokenizer, &model.config)?;
     let context_length = model.config.context_length as usize;
     let block_size = args.model.block_size;
@@ -368,7 +398,7 @@ fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
         max_running: args.max_running,
     };
     let model_name = args.model_name.clone().unwrap_or_else(|| {
-        std::path::Path::new(&args.model.model)
+        std::path::Path::new(model_file)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "rvllm".into())
@@ -425,7 +455,7 @@ fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             eprintln!(
                 "serving {model_name:?} on http://{addr} ({} on {}; {} running slots, queue of {}; KV pool {} blocks x {} tokens)",
-                args.model.model, args.model.device, args.max_running, args.max_queue, num_blocks, block_size,
+                model_file, args.model.device, args.max_running, args.max_queue, num_blocks, block_size,
             );
             server::serve(listener, state).await
         });

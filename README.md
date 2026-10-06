@@ -64,6 +64,23 @@ order). Pass `--debug` to also print each prompt with a labelled completion,
 plus the prefix cache hit rate, total block allocations, and step count /
 throughput (tok/s) for the run.
 
+### TUI
+
+`cli --tui` opens a full-screen terminal UI (ratatui) with a model picker and a
+chat view that streams the answer as it is generated:
+
+```bash
+cargo run --release -- cli --tui --models-dir .. --chat
+```
+
+The picker lists the `.gguf` files under `--models-dir` (default `.`, plus one
+level of subdirectories); each model uses a `tokenizer.json` next to it, else
+`--tokenizer`. `--model` skips the picker and preloads that file. Keys: Enter
+send, Esc stop generating, Ctrl-O switch model, Ctrl-N new conversation,
+PgUp/PgDn scroll, Ctrl-C quit. The sampling, `--chat`, `--max-tokens`,
+`--device` and KV flags apply as in the plain interactive loop;
+`--prompt`/`--debug`/`--arrival-step` can't be combined with `--tui`.
+
 ## Server mode
 
 ```
