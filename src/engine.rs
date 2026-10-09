@@ -578,6 +578,7 @@ pub fn run<B: Backend>(
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
+    use crate::model::Arch;
 
     // Deterministic stand-in for a model: the next token is always the last
     // input token + 1 (mod vocab). No KV involved, so scheduling behaviour -
@@ -591,10 +592,12 @@ pub(crate) mod testing {
         pub fn new(context_length: u32) -> Self {
             CountingBackend {
                 config: Config {
+                    arch: Arch::Llama,
                     n_layers: 1,
                     n_heads: 1,
                     n_kv_heads: 1,
                     hidden_dim: 1,
+                    head_dim: 1,
                     ffn_dim: 1,
                     rope_theta: 10000.0,
                     rms_eps: 1e-5,

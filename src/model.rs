@@ -4,13 +4,23 @@ use kv_cache_scheduler::block_pool::BlockID;
 
 use crate::kv_storage::{GatherPlan, KvStorage};
 
-// Model hyperparameters, read from the GGUF metadata by `Model::load`.
+// Model family, from the GGUF's `general.architecture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arch {
+    Llama,
+}
+
+// Model hyperparameters, read from the GGUF metadata by `Model::load`. The
+// crate-private fields mean only rvllm can build a `Config`, so fields can be
+// added without breaking downstream code.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub(crate) arch: Arch,
     pub n_layers: u32,
     pub n_heads: u32,
     pub n_kv_heads: u32,
     pub hidden_dim: u32,
+    pub(crate) head_dim: u32,
     pub ffn_dim: u32,
     pub rope_theta: f32,
     pub rms_eps: f32,
@@ -22,7 +32,7 @@ pub struct Config {
 
 impl Config {
     pub fn head_dim(&self) -> usize {
-        (self.hidden_dim / self.n_heads) as usize
+        self.head_dim as usize
     }
 }
 
@@ -706,10 +716,12 @@ mod tests {
         };
         Model {
             config: Config {
+                arch: Arch::Llama,
                 n_layers: 1,
                 n_heads: n_heads as u32,
                 n_kv_heads: n_kv_heads as u32,
                 hidden_dim: hidden_dim as u32,
+                head_dim: head_dim as u32,
                 ffn_dim: ffn_dim as u32,
                 rope_theta: 10000.0,
                 rms_eps: 1e-5,
