@@ -62,14 +62,14 @@ impl CudaWeights {
             .map(|l| -> Result<CudaLayer, Box<dyn std::error::Error>> {
                 Ok(CudaLayer {
                     attn_norm: upload(cuda_runtime, &l.attn_norm)?,
-                    attn_q: upload_f16(cuda_runtime, &l.attn_q)?,
-                    attn_k: upload_f16(cuda_runtime, &l.attn_k)?,
-                    attn_v: upload_f16(cuda_runtime, &l.attn_v)?,
-                    attn_output: upload_f16(cuda_runtime, &l.attn_output)?,
+                    attn_q: upload_f16(cuda_runtime, &l.attn.q)?,
+                    attn_k: upload_f16(cuda_runtime, &l.attn.k)?,
+                    attn_v: upload_f16(cuda_runtime, &l.attn.v)?,
+                    attn_output: upload_f16(cuda_runtime, &l.attn.o)?,
                     ffn_norm: upload(cuda_runtime, &l.ffn_norm)?,
-                    ffn_gate: upload_f16(cuda_runtime, &l.ffn_gate)?,
-                    ffn_up: upload_f16(cuda_runtime, &l.ffn_up)?,
-                    ffn_down: upload_f16(cuda_runtime, &l.ffn_down)?,
+                    ffn_gate: upload_f16(cuda_runtime, &l.ffn.gate)?,
+                    ffn_up: upload_f16(cuda_runtime, &l.ffn.up)?,
+                    ffn_down: upload_f16(cuda_runtime, &l.ffn.down)?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -87,7 +87,7 @@ impl CudaWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Config, Layer};
+    use crate::model::{Attention, Config, Ffn, Layer};
     use candle_core::{DType, Device};
 
     fn runtime() -> Option<CudaRuntime> {
@@ -107,16 +107,20 @@ mod tests {
 
         let token_embd = rand((vocab_size, hidden_dim));
         let layer = Layer {
-            index: 0,
             attn_norm: ones(),
-            attn_q: rand((n_heads * head_dim, hidden_dim)),
-            attn_k: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_v: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_output: rand((hidden_dim, n_heads * head_dim)),
+            attn: Attention {
+                kv_index: 0,
+                q: rand((n_heads * head_dim, hidden_dim)),
+                k: rand((n_kv_heads * head_dim, hidden_dim)),
+                v: rand((n_kv_heads * head_dim, hidden_dim)),
+                o: rand((hidden_dim, n_heads * head_dim)),
+            },
             ffn_norm: ones(),
-            ffn_gate: rand((ffn_dim, hidden_dim)),
-            ffn_up: rand((ffn_dim, hidden_dim)),
-            ffn_down: rand((hidden_dim, ffn_dim)),
+            ffn: Ffn {
+                gate: rand((ffn_dim, hidden_dim)),
+                up: rand((ffn_dim, hidden_dim)),
+                down: rand((hidden_dim, ffn_dim)),
+            },
         };
         Model {
             config: Config {
@@ -147,7 +151,8 @@ mod tests {
         assert_eq!(got, want);
 
         let want_q: Vec<f32> = model.layers[0]
-            .attn_q
+            .attn
+            .q
             .flatten_all()
             .unwrap()
             .to_vec1()

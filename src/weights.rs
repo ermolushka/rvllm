@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::{Device, Result, Tensor};
 
-use crate::model::{Arch, Config, Layer, Model};
+use crate::model::{Arch, Attention, Config, Ffn, Layer, Model};
 
 // Reads `key` with `get` (e.g. `Value::to_u32`) if present, naming the key if
 // it holds another type.
@@ -153,41 +153,57 @@ impl Model {
         let config =
             Config::from_gguf_metadata(&content.metadata, token_embd_info.shape.dim(0)? as u32)?;
         let device = Device::Cpu;
-        let mut load = |name: &str| -> Result<Tensor> {
-            content
-                .tensor(&mut file, name, &device)?
-                .dequantize(&device)
+        // Checking each weight's shape against the config makes a file whose
+        // tensors and metadata disagree fail here, not on the first request.
+        let mut load = |name: &str, dims: &[usize]| -> Result<Tensor> {
+            let tensor = content.tensor(&mut file, name, &device)?;
+            if tensor.shape().dims() != dims {
+                candle_core::bail!(
+                    "GGUF tensor {name:?} has shape {:?}, expected {dims:?}",
+                    tensor.shape().dims()
+                )
+            }
+            tensor.dequantize(&device)
         };
+        let hidden_dim = config.hidden_dim as usize;
+        let vocab_size = config.vocab_size as usize;
+        let ffn_dim = config.ffn_dim as usize;
+        let q_dim = config.n_heads as usize * config.head_dim();
+        let kv_dim = config.n_kv_heads as usize * config.head_dim();
 
-        let token_embd = load("token_embd.weight")?;
-        let output_norm = load("output_norm.weight")?;
+        let token_embd = load("token_embd.weight", &[vocab_size, hidden_dim])?;
+        let output_norm = load("output_norm.weight", &[hidden_dim])?;
         // Models that tie their input and output embeddings ship no separate
         // output matrix; sharing the tensor avoids a second full copy.
         let output = if content.tensor_infos.contains_key("output.weight") {
-            load("output.weight")?
+            load("output.weight", &[vocab_size, hidden_dim])?
         } else {
             token_embd.clone()
         };
 
         let layers = (0..config.n_layers as usize)
             .map(|i| {
-                let mut attn_q = load(&format!("blk.{i}.attn_q.weight"))?;
-                let mut attn_k = load(&format!("blk.{i}.attn_k.weight"))?;
+                let mut q = load(&format!("blk.{i}.attn_q.weight"), &[q_dim, hidden_dim])?;
+                let mut k = load(&format!("blk.{i}.attn_k.weight"), &[kv_dim, hidden_dim])?;
                 if config.arch.qk_permuted() {
-                    attn_q = unpermute_rope_rows(&attn_q, config.n_heads as usize)?;
-                    attn_k = unpermute_rope_rows(&attn_k, config.n_kv_heads as usize)?;
+                    q = unpermute_rope_rows(&q, config.n_heads as usize)?;
+                    k = unpermute_rope_rows(&k, config.n_kv_heads as usize)?;
                 }
                 Ok(Layer {
-                    index: i,
-                    attn_norm: load(&format!("blk.{i}.attn_norm.weight"))?,
-                    attn_q,
-                    attn_k,
-                    attn_v: load(&format!("blk.{i}.attn_v.weight"))?,
-                    attn_output: load(&format!("blk.{i}.attn_output.weight"))?,
-                    ffn_norm: load(&format!("blk.{i}.ffn_norm.weight"))?,
-                    ffn_gate: load(&format!("blk.{i}.ffn_gate.weight"))?,
-                    ffn_up: load(&format!("blk.{i}.ffn_up.weight"))?,
-                    ffn_down: load(&format!("blk.{i}.ffn_down.weight"))?,
+                    attn_norm: load(&format!("blk.{i}.attn_norm.weight"), &[hidden_dim])?,
+                    attn: Attention {
+                        kv_index: i,
+                        q,
+                        k,
+                        v: load(&format!("blk.{i}.attn_v.weight"), &[kv_dim, hidden_dim])?,
+                        o: load(&format!("blk.{i}.attn_output.weight"), &[hidden_dim, q_dim])?,
+                    },
+                    ffn_norm: load(&format!("blk.{i}.ffn_norm.weight"), &[hidden_dim])?,
+                    ffn: Ffn {
+                        gate: load(&format!("blk.{i}.ffn_gate.weight"), &[ffn_dim, hidden_dim])?,
+                        up: load(&format!("blk.{i}.ffn_up.weight"), &[ffn_dim, hidden_dim])?,
+                        down: load(&format!("blk.{i}.ffn_down.weight"), &[hidden_dim, ffn_dim])?,
+                    },
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -432,28 +448,54 @@ mod tests {
         model
     }
 
-    #[test]
-    fn load_undoes_llama_qk_permutation() -> Result<()> {
-        let (q, k) = (rows(8, 8)?, rows(4, 8)?);
+    // Every weight `tiny_llama_metadata` needs, with `q` and `k` (HF order)
+    // stored the way llama.cpp permutes them.
+    fn tiny_llama_tensors(q: &Tensor, k: &Tensor) -> Result<Vec<(&'static str, Tensor)>> {
         let norm = Tensor::ones(8, DType::F32, &Device::Cpu)?;
-        let tensors = [
+        Ok(vec![
             ("token_embd.weight", rows(5, 8)?),
             ("output_norm.weight", norm.clone()),
             ("blk.0.attn_norm.weight", norm.clone()),
-            ("blk.0.attn_q.weight", llama_cpp_permute(&q, 2)?),
-            ("blk.0.attn_k.weight", llama_cpp_permute(&k, 1)?),
+            ("blk.0.attn_q.weight", llama_cpp_permute(q, 2)?),
+            ("blk.0.attn_k.weight", llama_cpp_permute(k, 1)?),
             ("blk.0.attn_v.weight", rows(4, 8)?),
             ("blk.0.attn_output.weight", rows(8, 8)?),
             ("blk.0.ffn_norm.weight", norm),
             ("blk.0.ffn_gate.weight", rows(8, 8)?),
             ("blk.0.ffn_up.weight", rows(8, 8)?),
             ("blk.0.ffn_down.weight", rows(8, 8)?),
-        ];
-        let model = load_gguf("llama", &tiny_llama_metadata(), &tensors)?;
+        ])
+    }
+
+    #[test]
+    fn load_undoes_llama_qk_permutation() -> Result<()> {
+        let (q, k) = (rows(8, 8)?, rows(4, 8)?);
+        let model = load_gguf(
+            "llama",
+            &tiny_llama_metadata(),
+            &tiny_llama_tensors(&q, &k)?,
+        )?;
         assert_eq!((model.config.vocab_size, model.config.head_dim), (5, 4));
         let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
-        assert_eq!(values(&model.layers[0].attn_q)?, values(&q)?);
-        assert_eq!(values(&model.layers[0].attn_k)?, values(&k)?);
+        assert_eq!(values(&model.layers[0].attn.q)?, values(&q)?);
+        assert_eq!(values(&model.layers[0].attn.k)?, values(&k)?);
+        Ok(())
+    }
+
+    #[test]
+    fn load_rejects_a_tensor_of_the_wrong_shape() -> Result<()> {
+        let mut tensors = tiny_llama_tensors(&rows(8, 8)?, &rows(4, 8)?)?;
+        // One KV head of size 4 needs a [4, 8] V projection.
+        for (name, tensor) in &mut tensors {
+            if *name == "blk.0.attn_v.weight" {
+                *tensor = rows(3, 8)?;
+            }
+        }
+        let Err(err) = load_gguf("bad-shape", &tiny_llama_metadata(), &tensors) else {
+            panic!("loaded a tensor of the wrong shape");
+        };
+        let want = "\"blk.0.attn_v.weight\" has shape [3, 8], expected [4, 8]";
+        assert!(err.to_string().contains(want), "{err}");
         Ok(())
     }
 

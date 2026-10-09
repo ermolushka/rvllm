@@ -72,30 +72,39 @@ impl Config {
 
 // One transformer block's weights, all F32 in candle Linear convention
 // ([out_features, in_features]) except the two norm vectors.
-pub struct Layer {
+pub(crate) struct Layer {
+    pub(crate) attn_norm: Tensor,
+    pub(crate) attn: Attention,
+    pub(crate) ffn_norm: Tensor,
+    pub(crate) ffn: Ffn,
+}
+
+pub(crate) struct Attention {
     // Index of this layer's slot in `KvStorage`.
-    pub index: usize,
-    pub attn_norm: Tensor,
-    pub attn_q: Tensor,
-    pub attn_k: Tensor,
-    pub attn_v: Tensor,
-    pub attn_output: Tensor,
-    pub ffn_norm: Tensor,
-    pub ffn_gate: Tensor,
-    pub ffn_up: Tensor,
-    pub ffn_down: Tensor,
+    pub(crate) kv_index: usize,
+    pub(crate) q: Tensor,
+    pub(crate) k: Tensor,
+    pub(crate) v: Tensor,
+    pub(crate) o: Tensor,
+}
+
+// The SwiGLU FFN's projections (see `swiglu_ffn`).
+pub(crate) struct Ffn {
+    pub(crate) gate: Tensor,
+    pub(crate) up: Tensor,
+    pub(crate) down: Tensor,
 }
 
 // The whole model. `Model::load` (in weights.rs) builds one from a GGUF file.
 pub struct Model {
     pub config: Config,
     // [vocab_size, hidden_dim]
-    pub token_embd: Tensor,
-    pub layers: Vec<Layer>,
-    pub output_norm: Tensor,
+    pub(crate) token_embd: Tensor,
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) output_norm: Tensor,
     // [vocab_size, hidden_dim]. Shares storage with `token_embd` when the
     // model ties its input and output embeddings.
-    pub output: Tensor,
+    pub(crate) output: Tensor,
 }
 
 // RMSNorm: rescale each row by its root-mean-square, then apply a learned
@@ -402,13 +411,13 @@ impl Layer {
         // heads. Then split the projected dim into per-head chunks and move
         // the head axis in front of the sequence axis:
         // [batch, q_len, heads * head_dim] -> [batch, heads, q_len, head_dim].
-        let q = linear(&normed, &self.attn_q)?
+        let q = linear(&normed, &self.attn.q)?
             .reshape((batch, q_len, n_heads, head_dim))?
             .transpose(1, 2)?;
-        let k = linear(&normed, &self.attn_k)?
+        let k = linear(&normed, &self.attn.k)?
             .reshape((batch, q_len, n_kv_heads, head_dim))?
             .transpose(1, 2)?;
-        let v = linear(&normed, &self.attn_v)?
+        let v = linear(&normed, &self.attn.v)?
             .reshape((batch, q_len, n_kv_heads, head_dim))?
             .transpose(1, 2)?;
 
@@ -421,7 +430,7 @@ impl Layer {
         // Write this call's tokens into their block slots. The cache wants
         // token-major rows: [batch * q_len, n_kv_heads, head_dim].
         kv_storage.write_tokens(
-            self.index,
+            self.attn.kv_index,
             &ctx.writes,
             &k.transpose(1, 2)?
                 .reshape((batch * q_len, n_kv_heads, head_dim))?,
@@ -430,7 +439,7 @@ impl Layer {
         )?;
         // Read back every sequence's full cached K/V (padded to the batch's
         // longest context) and attend against it.
-        let (k_full, v_full) = kv_storage.gather(self.index, &ctx.gather)?;
+        let (k_full, v_full) = kv_storage.gather(self.attn.kv_index, &ctx.gather)?;
         let attn_out = gqa_attention(&q, &k_full, &v_full, &ctx.mask)?;
 
         // Merge the heads back into one dimension - inverse of the earlier
@@ -439,7 +448,7 @@ impl Layer {
         let attn_out = attn_out
             .transpose(1, 2)?
             .reshape((batch, q_len, n_heads * head_dim))?;
-        let attn_out = linear(&attn_out, &self.attn_output)?;
+        let attn_out = linear(&attn_out, &self.attn.o)?;
 
         // Residual connection: the block adds *to* x rather than replacing it,
         // so gradients (and, at inference time, information) can flow straight
@@ -448,7 +457,7 @@ impl Layer {
 
         // Same pre-norm pattern before the FFN half of the block.
         let normed2 = rms_norm(&h, &self.ffn_norm, config.rms_eps)?;
-        let ffn_out = swiglu_ffn(&normed2, &self.ffn_gate, &self.ffn_up, &self.ffn_down)?;
+        let ffn_out = swiglu_ffn(&normed2, &self.ffn.gate, &self.ffn.up, &self.ffn.down)?;
 
         // Second residual connection - this is the block's output.
         h.add(&ffn_out)
@@ -737,16 +746,20 @@ mod tests {
 
         let token_embd = rand((vocab_size, hidden_dim));
         let layer = Layer {
-            index: 0,
             attn_norm: ones(),
-            attn_q: rand((n_heads * head_dim, hidden_dim)),
-            attn_k: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_v: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_output: rand((hidden_dim, n_heads * head_dim)),
+            attn: Attention {
+                kv_index: 0,
+                q: rand((n_heads * head_dim, hidden_dim)),
+                k: rand((n_kv_heads * head_dim, hidden_dim)),
+                v: rand((n_kv_heads * head_dim, hidden_dim)),
+                o: rand((hidden_dim, n_heads * head_dim)),
+            },
             ffn_norm: ones(),
-            ffn_gate: rand((ffn_dim, hidden_dim)),
-            ffn_up: rand((ffn_dim, hidden_dim)),
-            ffn_down: rand((hidden_dim, ffn_dim)),
+            ffn: Ffn {
+                gate: rand((ffn_dim, hidden_dim)),
+                up: rand((ffn_dim, hidden_dim)),
+                down: rand((hidden_dim, ffn_dim)),
+            },
         };
         Model {
             config: Config {

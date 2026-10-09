@@ -631,7 +631,7 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     use crate::kv_storage::KvStorage;
-    use crate::model::Layer;
+    use crate::model::{Attention, Ffn, Layer};
 
     fn runtime() -> Option<CudaRuntime> {
         CudaRuntime::new(0).ok()
@@ -650,16 +650,20 @@ mod tests {
 
         let token_embd = rand((vocab_size, hidden_dim));
         let layer = Layer {
-            index: 0,
             attn_norm: ones(),
-            attn_q: rand((n_heads * head_dim, hidden_dim)),
-            attn_k: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_v: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_output: rand((hidden_dim, n_heads * head_dim)),
+            attn: Attention {
+                kv_index: 0,
+                q: rand((n_heads * head_dim, hidden_dim)),
+                k: rand((n_kv_heads * head_dim, hidden_dim)),
+                v: rand((n_kv_heads * head_dim, hidden_dim)),
+                o: rand((hidden_dim, n_heads * head_dim)),
+            },
             ffn_norm: ones(),
-            ffn_gate: rand((ffn_dim, hidden_dim)),
-            ffn_up: rand((ffn_dim, hidden_dim)),
-            ffn_down: rand((hidden_dim, ffn_dim)),
+            ffn: Ffn {
+                gate: rand((ffn_dim, hidden_dim)),
+                up: rand((ffn_dim, hidden_dim)),
+                down: rand((hidden_dim, ffn_dim)),
+            },
         };
         Model {
             config: Config {
