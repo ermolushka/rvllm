@@ -5,15 +5,29 @@ use candle_core::{Device, Result, Tensor};
 
 use crate::model::{Arch, Config, Layer, Model};
 
-// Reads `key` with `get` (e.g. `Value::to_u32`), naming the key if it's
-// missing or holds another type.
+// Reads `key` with `get` (e.g. `Value::to_u32`) if present, naming the key if
+// it holds another type.
+fn optional_metadata<'a, T>(
+    md: &'a HashMap<String, Value>,
+    key: &str,
+    get: impl FnOnce(&'a Value) -> Result<T>,
+) -> Result<Option<T>> {
+    match md.get(key) {
+        Some(value) => get(value)
+            .map(Some)
+            .map_err(|e| e.context(format!("GGUF metadata key {key:?}"))),
+        None => Ok(None),
+    }
+}
+
+// Like `optional_metadata`, for keys the model can't do without.
 fn metadata<'a, T>(
     md: &'a HashMap<String, Value>,
     key: &str,
     get: impl FnOnce(&'a Value) -> Result<T>,
 ) -> Result<T> {
-    match md.get(key) {
-        Some(value) => get(value).map_err(|e| e.context(format!("GGUF metadata key {key:?}"))),
+    match optional_metadata(md, key, get)? {
+        Some(value) => Ok(value),
         None => candle_core::bail!("missing GGUF metadata key {key:?}"),
     }
 }
@@ -68,19 +82,39 @@ impl Config {
         let hidden_dim = metadata(md, &key("embedding_length"), Value::to_u32)?;
         // Optional in GGUF; llama.cpp also falls back to hidden_dim / n_heads.
         let key_length = key("attention.key_length");
-        let head_dim = if md.contains_key(&key_length) {
-            metadata(md, &key_length, Value::to_u32)?
-        } else if hidden_dim % n_heads == 0 {
-            hidden_dim / n_heads
-        } else {
-            candle_core::bail!(
+        let head_dim = match optional_metadata(md, &key_length, Value::to_u32)? {
+            Some(head_dim) => head_dim,
+            None if hidden_dim % n_heads == 0 => hidden_dim / n_heads,
+            None => candle_core::bail!(
                 "no {key_length:?} and {hidden_dim} isn't divisible by {n_heads} heads"
-            )
+            ),
         };
         // RoPE rotates pairs of dimensions.
         if head_dim == 0 || head_dim % 2 != 0 {
             candle_core::bail!("invalid attention head size {head_dim}: must be even and non-zero")
         }
+
+        let tokenizer_model = optional_metadata(md, "tokenizer.ggml.model", Value::to_string)?;
+        let tokenizer_pre = optional_metadata(md, "tokenizer.ggml.pre", Value::to_string)?.cloned();
+        // When the GGUF doesn't say, follow llama.cpp's defaults: SentencePiece
+        // vocabularies and Llama 3's BPE tokenizer start prompts with BOS.
+        let add_bos = optional_metadata(md, "tokenizer.ggml.add_bos_token", Value::to_bool)?
+            .unwrap_or(
+                tokenizer_model.is_some_and(|model| model == "llama")
+                    || matches!(
+                        tokenizer_pre.as_deref(),
+                        Some("llama-bpe" | "llama3" | "llama-v3")
+                    ),
+            );
+        let eos_token_id = metadata(md, "tokenizer.ggml.eos_token_id", Value::to_u32)?;
+        let bos_token_id = metadata(md, "tokenizer.ggml.bos_token_id", Value::to_u32)?;
+        let tokens = optional_metadata(md, "tokenizer.ggml.tokens", Value::to_vec)?;
+        let token = |id: u32| {
+            tokens
+                .and_then(|tokens| tokens.get(id as usize))
+                .and_then(|token| token.to_string().ok())
+                .cloned()
+        };
 
         Ok(Config {
             arch,
@@ -94,8 +128,12 @@ impl Config {
             rms_eps: metadata(md, &key("attention.layer_norm_rms_epsilon"), Value::to_f32)?,
             vocab_size,
             context_length: metadata(md, &key("context_length"), Value::to_u32)?,
-            eos_token_id: metadata(md, "tokenizer.ggml.eos_token_id", Value::to_u32)?,
-            bos_token_id: metadata(md, "tokenizer.ggml.bos_token_id", Value::to_u32)?,
+            eos_token_id,
+            bos_token_id,
+            add_bos,
+            tokenizer_pre,
+            bos_token: token(bos_token_id),
+            eos_token: token(eos_token_id),
         })
     }
 }
@@ -207,6 +245,17 @@ mod tests {
             ("llama.context_length", Value::U32(8192)),
             ("tokenizer.ggml.eos_token_id", Value::U32(2)),
             ("tokenizer.ggml.bos_token_id", Value::U32(1)),
+            ("tokenizer.ggml.model", Value::String("gpt2".into())),
+            ("tokenizer.ggml.pre", Value::String("smollm".into())),
+            ("tokenizer.ggml.add_bos_token", Value::Bool(false)),
+            (
+                "tokenizer.ggml.tokens",
+                Value::Array(
+                    ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+                        .map(|t| Value::String(t.into()))
+                        .to_vec(),
+                ),
+            ),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
@@ -229,6 +278,35 @@ mod tests {
         assert_eq!((config.rope_theta, config.rms_eps), (100000.0, 1e-5));
         assert_eq!((config.vocab_size, config.context_length), (49152, 8192));
         assert_eq!((config.eos_token_id, config.bos_token_id), (2, 1));
+        assert_eq!(config.eos_token.as_deref(), Some("<|im_end|>"));
+        assert_eq!(config.bos_token.as_deref(), Some("<|im_start|>"));
+        assert_eq!(config.tokenizer_pre.as_deref(), Some("smollm"));
+        assert!(!config.add_bos);
+        Ok(())
+    }
+
+    #[test]
+    fn add_bos_follows_the_gguf_then_llama_cpp_defaults() -> Result<()> {
+        // (add_bos_token, tokenizer.ggml.model, tokenizer.ggml.pre, expected)
+        let cases = [
+            (Some(true), "gpt2", "smollm", true),
+            (Some(false), "gpt2", "llama-bpe", false),
+            (Some(false), "llama", "default", false),
+            (None, "gpt2", "llama-bpe", true),
+            (None, "llama", "default", true),
+            (None, "gpt2", "smollm", false),
+        ];
+        for (flag, model, pre, expected) in cases {
+            let mut md = smollm2_metadata();
+            md.insert("tokenizer.ggml.model".into(), Value::String(model.into()));
+            md.insert("tokenizer.ggml.pre".into(), Value::String(pre.into()));
+            match flag {
+                Some(flag) => md.insert("tokenizer.ggml.add_bos_token".into(), Value::Bool(flag)),
+                None => md.remove("tokenizer.ggml.add_bos_token"),
+            };
+            let add_bos = Config::from_gguf_metadata(&md, 49152)?.add_bos;
+            assert_eq!(add_bos, expected, "{flag:?} {model} {pre}");
+        }
         Ok(())
     }
 
@@ -292,6 +370,11 @@ mod tests {
                 "llama.attention.key_length",
                 Some(Value::U32(63)),
                 "head size",
+            ),
+            (
+                "tokenizer.ggml.add_bos_token",
+                Some(Value::U32(1)),
+                "tokenizer.ggml.add_bos_token",
             ),
         ];
         for (key, value, expected) in cases {

@@ -510,16 +510,17 @@ pub struct RunResult {
     pub stats: RunStats,
 }
 
-// Runs a fixed set of requests to completion. Each request samples with its
-// own `Sampler` built from `sampling`.
+// Runs a fixed set of requests to completion, each ending early on any of
+// `stop_tokens`. Each request samples with its own `Sampler` built from
+// `sampling`.
 pub fn run<B: Backend>(
     backend: B,
     requests: &[RequestSpec],
     sampling: SamplingParams,
     cfg: EngineConfig,
+    stop_tokens: &[u32],
 ) -> Result<RunResult, BoxError> {
     let mut engine = Engine::new(backend, cfg);
-    let eos_token_id = engine.config().eos_token_id;
 
     let mut order: Vec<usize> = (0..requests.len()).collect();
     order.sort_by_key(|&i| requests[i].arrival_step);
@@ -538,7 +539,7 @@ pub fn run<B: Backend>(
             let id = engine.add_request(Request {
                 tokens: requests[i].tokens.clone(),
                 max_tokens: requests[i].max_tokens,
-                stop_tokens: vec![eos_token_id],
+                stop_tokens: stop_tokens.to_vec(),
                 sampler: Sampler::from_params(sampling),
             })?;
             req_of.insert(id, i);
@@ -578,7 +579,6 @@ pub fn run<B: Backend>(
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use crate::model::Arch;
 
     // Deterministic stand-in for a model: the next token is always the last
     // input token + 1 (mod vocab). No KV involved, so scheduling behaviour -
@@ -592,19 +592,16 @@ pub(crate) mod testing {
         pub fn new(context_length: u32) -> Self {
             CountingBackend {
                 config: Config {
-                    arch: Arch::Llama,
                     n_layers: 1,
                     n_heads: 1,
                     n_kv_heads: 1,
                     hidden_dim: 1,
                     head_dim: 1,
                     ffn_dim: 1,
-                    rope_theta: 10000.0,
-                    rms_eps: 1e-5,
                     vocab_size: 1000,
                     context_length,
                     eos_token_id: 999,
-                    bos_token_id: 0,
+                    ..Config::for_tests()
                 },
                 max_batch_seen: 0,
             }
@@ -827,9 +824,37 @@ mod tests {
             &requests,
             SamplingParams::GREEDY,
             cfg(16, 8),
+            &[999],
         )
         .unwrap();
         assert_eq!(result.generated, vec![vec![2, 3, 4], vec![51, 52, 53]]);
         assert_eq!(result.stats.output_tokens, 6);
+    }
+
+    #[test]
+    fn run_wrapper_stops_on_any_stop_token() {
+        // Counting from 1, the first request reaches stop token 3; the second
+        // never does and runs to max_tokens.
+        let requests = vec![
+            RequestSpec {
+                tokens: vec![1],
+                max_tokens: 5,
+                arrival_step: 0,
+            },
+            RequestSpec {
+                tokens: vec![50],
+                max_tokens: 3,
+                arrival_step: 0,
+            },
+        ];
+        let result = run(
+            CountingBackend::new(64),
+            &requests,
+            SamplingParams::GREEDY,
+            cfg(16, 8),
+            &[999, 3],
+        )
+        .unwrap();
+        assert_eq!(result.generated, vec![vec![2, 3], vec![51, 52, 53]]);
     }
 }

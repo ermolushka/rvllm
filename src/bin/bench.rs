@@ -206,6 +206,8 @@ fn run_and_report(
         ..SamplingParams::GREEDY
     };
 
+    let stops = [runtime.model().config.eos_token_id];
+
     // Warmup run (discarded) so the measured run isn't paying for first-touch
     // allocation of the KV storage tensors, per the plan's "steady-state
     // throughput once warmup is excluded".
@@ -214,6 +216,7 @@ fn run_and_report(
         requests,
         sampling,
         cfg,
+        &stops,
     )?;
 
     let result = engine::run(
@@ -221,6 +224,7 @@ fn run_and_report(
         requests,
         sampling,
         cfg,
+        &stops,
     )?;
     report(label, &result, batch_size, num_blocks)
 }

@@ -34,9 +34,13 @@ Only the SmolLM2-360M family is supported right now, in Q8_0 GGUF form with its
 These are the only models this has been developed and tested against. The loader
 reads Llama-style GGUF metadata (`llama.*` keys) and dequantizes everything to F32
 on load (F16 on the GPU), so other Llama-architecture models might load, but
-nothing else is tested, and the tokenizer wrapper and the hardcoded ChatML chat
-template are specific to SmolLM2. Base models aren't chat-tuned, so don't expect
-sensible answers from `--chat` with the base file.
+nothing else is tested. `--chat` uses the model's chat format where rvllm knows
+it (ChatML for SmolLM2) and refuses otherwise. Base models aren't chat-tuned, so
+don't expect sensible answers from `--chat` with the base file.
+
+`--tokenizer` defaults to the `tokenizer.json` next to the model file, then
+`./tokenizer.json`. A tokenizer that gives the model's BOS or EOS token a
+different id belongs to another model and is rejected.
 
 GGUF files store Q/K weights in llama.cpp's interleaved RoPE layout; the loader
 reorders them to the rotate-half layout the kernels use (`weights.rs`).
@@ -52,7 +56,7 @@ cargo run --release -- cli \
   --tokenizer tokenizer.json
 ```
 
-Pass `--chat` to wrap input in the ChatML template (use this with `-Instruct`
+Pass `--chat` to wrap input in the model's chat format (use this with instruct
 models); the conversation history is then kept between questions.
 
 With `--prompt` the CLI runs the given prompts once and exits. Multiple
@@ -145,8 +149,8 @@ KV capacity is `--num-blocks` blocks of `--block-size` tokens; by default
 `--max-running` x `--tokens-per-seq` (2048) tokens. A single request can use
 at most the whole pool (and never more than the model's context length).
 `--default-max-tokens`, `--default-temperature` and `--default-top-p` apply
-to requests that omit them. SmolLM2 base models aren't chat-tuned: for real
-chat use a `-Instruct` GGUF (the chat template is ChatML).
+to requests that omit them. Base models aren't chat-tuned: for real chat use an
+instruct GGUF. `/v1/chat/completions` uses the model's chat format, like `--chat`.
 
 ## Sampling
 

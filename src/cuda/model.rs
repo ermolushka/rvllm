@@ -631,7 +631,7 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     use crate::kv_storage::KvStorage;
-    use crate::model::{Arch, Layer};
+    use crate::model::Layer;
 
     fn runtime() -> Option<CudaRuntime> {
         CudaRuntime::new(0).ok()
@@ -663,19 +663,14 @@ mod tests {
         };
         Model {
             config: Config {
-                arch: Arch::Llama,
                 n_layers: 1,
                 n_heads: n_heads as u32,
                 n_kv_heads: n_kv_heads as u32,
                 hidden_dim: hidden_dim as u32,
                 head_dim: head_dim as u32,
                 ffn_dim: ffn_dim as u32,
-                rope_theta: 10000.0,
-                rms_eps: 1e-5,
                 vocab_size: vocab_size as u32,
-                context_length: 8,
-                eos_token_id: 99,
-                bos_token_id: 0,
+                ..Config::for_tests()
             },
             token_embd,
             layers: vec![layer],

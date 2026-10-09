@@ -4,10 +4,11 @@
 
 use std::sync::Arc;
 
+use crate::chat::ChatFormat;
 use crate::engine::{BoxError, Engine, EngineConfig};
 use crate::model::Model;
 use crate::runtime::Runtime;
-use crate::tokenizer::SmollLM230MTokenizer;
+use crate::tokenizer::Tokenizer;
 
 use super::worker::{WorkerStatus, run_worker};
 use super::{AppState, ServerConfig, serve};
@@ -56,11 +57,7 @@ pub fn run(model_path: &str, tokenizer_path: &str, opts: ServeOptions) -> Result
         return Err("max_running must be at least 1".into());
     }
     let model = Model::load(model_path)?;
-    let tokenizer = SmollLM230MTokenizer::from_file(
-        tokenizer_path,
-        model.config.eos_token_id,
-        model.config.bos_token_id,
-    )?;
+    let tokenizer = Tokenizer::for_model(tokenizer_path, &model.config)?;
     let context_length = model.config.context_length as usize;
     let block_size = opts.block_size;
     let num_blocks = opts.num_blocks.unwrap_or_else(|| {
@@ -121,6 +118,7 @@ pub fn run(model_path: &str, tokenizer_path: &str, opts: ServeOptions) -> Result
                 max_sequence_tokens,
             },
             tokenizer,
+            ChatFormat::for_model(&model.config),
             job_tx,
             status,
         );

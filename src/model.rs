@@ -28,11 +28,45 @@ pub struct Config {
     pub context_length: u32,
     pub eos_token_id: u32,
     pub bos_token_id: u32,
+    // Whether prompts start with BOS, as the model was trained.
+    pub(crate) add_bos: bool,
+    // `tokenizer.ggml.pre`: which tokenizer family the GGUF was converted with.
+    pub(crate) tokenizer_pre: Option<String>,
+    // The BOS and EOS token strings, for checking a tokenizer.json against the model.
+    pub(crate) bos_token: Option<String>,
+    pub(crate) eos_token: Option<String>,
 }
 
 impl Config {
     pub fn head_dim(&self) -> usize {
         self.head_dim as usize
+    }
+}
+
+#[cfg(test)]
+impl Config {
+    // The 1-layer shape the tests' tiny models use; override fields with
+    // struct-update syntax.
+    pub(crate) fn for_tests() -> Config {
+        Config {
+            arch: Arch::Llama,
+            n_layers: 1,
+            n_heads: 2,
+            n_kv_heads: 1,
+            hidden_dim: 4,
+            head_dim: 2,
+            ffn_dim: 4,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            vocab_size: 5,
+            context_length: 8,
+            eos_token_id: 99,
+            bos_token_id: 0,
+            add_bos: false,
+            tokenizer_pre: None,
+            bos_token: None,
+            eos_token: None,
+        }
     }
 }
 
@@ -716,19 +750,14 @@ mod tests {
         };
         Model {
             config: Config {
-                arch: Arch::Llama,
                 n_layers: 1,
                 n_heads: n_heads as u32,
                 n_kv_heads: n_kv_heads as u32,
                 hidden_dim: hidden_dim as u32,
                 head_dim: head_dim as u32,
                 ffn_dim: ffn_dim as u32,
-                rope_theta: 10000.0,
-                rms_eps: 1e-5,
                 vocab_size: vocab_size as u32,
-                context_length: 8,
-                eos_token_id: 99,
-                bos_token_id: 0,
+                ..Config::for_tests()
             },
             token_embd,
             layers: vec![layer],
