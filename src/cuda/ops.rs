@@ -847,7 +847,7 @@ mod tests {
         // Pre-expand cos/sin per row, same as the host is responsible for doing
         // before calling rope_wrapper.
         let (cos_t, sin_t) =
-            crate::model::rope_cos_sin(rope_theta, head_dim, &positions, &cpu).unwrap();
+            crate::model::rope_cos_sin(rope_theta, None, head_dim, &positions, &cpu).unwrap();
         let cos: Vec<f32> = cos_t.flatten_all().unwrap().to_vec1().unwrap();
         let sin: Vec<f32> = sin_t.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(cos.len(), positions.len() * half);

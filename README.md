@@ -23,20 +23,24 @@ Features: `server` (axum API), `tui` (ratatui UI), `cli` (default; both plus the
 
 ## Supported models
 
-Only the SmolLM2-360M family is supported right now, in Q8_0 GGUF form with its
+These models are tested end to end, as Q8_0 GGUF files with their
 `tokenizer.json`:
 
-- `SmolLM2-360M.Q8_0.gguf` (base): plain completions.
-- `SmolLM2-360M-Instruct` Q8_0 GGUF (use the Instruct repo's `tokenizer.json`):
-  chat, via `--chat` and `/v1/chat/completions`. Tested end to end, including
-  multi-turn history and stopping on `<|im_end|>`.
+| Model | GGUF architecture | Chat format | Devices |
+|---|---|---|---|
+| SmolLM2-360M, SmolLM2-360M-Instruct | `llama` | ChatML | CPU, CUDA |
+| Llama-3.2-1B-Instruct | `llama` | Llama 3 | CPU |
 
-These are the only models this has been developed and tested against. The loader
-reads Llama-style GGUF metadata (`llama.*` keys) and dequantizes everything to F32
-on load (F16 on the GPU), so other Llama-architecture models might load, but
-nothing else is tested. `--chat` uses the model's chat format where rvllm knows
-it (ChatML for SmolLM2) and refuses otherwise. Base models aren't chat-tuned, so
-don't expect sensible answers from `--chat` with the base file.
+Base models do plain completions; instruct models also chat, via `--chat` and
+`/v1/chat/completions`, with multi-turn history and stopping at the end of their
+turn. `--chat` uses the model's chat format where rvllm knows it and refuses
+otherwise; plain completion works either way. Other models of these architectures
+may load, but aren't tested.
+
+Everything is dequantized to F32 on load (F16 on the GPU), so a model needs
+about 4 bytes of RAM per parameter: roughly 1.5 GB for SmolLM2-360M and 5 GB for
+Llama-3.2-1B. The CUDA backend implements SmolLM2's architecture only;
+`--device cuda` refuses models that need more (such as Llama 3's RoPE scaling).
 
 `--tokenizer` defaults to the `tokenizer.json` next to the model file, then
 `./tokenizer.json`. A tokenizer that gives the model's BOS or EOS token a

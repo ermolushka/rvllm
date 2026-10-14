@@ -507,6 +507,14 @@ pub struct CudaModel {
     pub weights: CudaWeights,
 }
 
+// What `model` needs that these kernels don't implement yet, if anything.
+pub(crate) fn unsupported(model: &Model) -> Option<&'static str> {
+    if model.config.rope_factors.is_some() {
+        return Some("Llama 3 RoPE scaling");
+    }
+    None
+}
+
 impl CudaModel {
     pub fn upload(
         cuda_runtime: &CudaRuntime,
@@ -635,6 +643,14 @@ mod tests {
 
     fn runtime() -> Option<CudaRuntime> {
         CudaRuntime::new(0).ok()
+    }
+
+    #[test]
+    fn rope_scaling_is_unsupported() {
+        let mut model = tiny_model();
+        assert_eq!(unsupported(&model), None);
+        model.config.rope_factors = Some(vec![1.0]);
+        assert_eq!(unsupported(&model), Some("Llama 3 RoPE scaling"));
     }
 
     // Same tiny fake model as model.rs's own `tiny_model` test helper: 1

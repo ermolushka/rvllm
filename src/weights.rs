@@ -125,6 +125,7 @@ impl Config {
             head_dim,
             ffn_dim: metadata(md, &key("feed_forward_length"), Value::to_u32)?,
             rope_theta: metadata(md, &key("rope.freq_base"), Value::to_f32)?,
+            rope_factors: None,
             rms_eps: metadata(md, &key("attention.layer_norm_rms_epsilon"), Value::to_f32)?,
             vocab_size,
             context_length: metadata(md, &key("context_length"), Value::to_u32)?,
@@ -150,7 +151,7 @@ impl Model {
         let Some(token_embd_info) = content.tensor_infos.get("token_embd.weight") else {
             candle_core::bail!("missing GGUF tensor \"token_embd.weight\"")
         };
-        let config =
+        let mut config =
             Config::from_gguf_metadata(&content.metadata, token_embd_info.shape.dim(0)? as u32)?;
         let device = Device::Cpu;
         // Checking each weight's shape against the config makes a file whose
@@ -180,6 +181,11 @@ impl Model {
         } else {
             token_embd.clone()
         };
+        // Llama 3 ships its RoPE scaling as a tensor rather than metadata.
+        if content.tensor_infos.contains_key("rope_freqs.weight") {
+            let factors = load("rope_freqs.weight", &[config.head_dim() / 2])?;
+            config.rope_factors = Some(factors.to_vec1()?);
+        }
 
         let layers = (0..config.n_layers as usize)
             .map(|i| {
@@ -479,6 +485,20 @@ mod tests {
         let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
         assert_eq!(values(&model.layers[0].attn.q)?, values(&q)?);
         assert_eq!(values(&model.layers[0].attn.k)?, values(&k)?);
+        Ok(())
+    }
+
+    #[test]
+    fn load_reads_rope_factors() -> Result<()> {
+        let mut tensors = tiny_llama_tensors(&rows(8, 8)?, &rows(4, 8)?)?;
+        let model = load_gguf("no-rope-freqs", &tiny_llama_metadata(), &tensors)?;
+        assert_eq!(model.config.rope_factors, None);
+
+        // head_dim 4: one factor per dimension pair.
+        let factors = Tensor::new(&[1f32, 8.], &Device::Cpu)?;
+        tensors.push(("rope_freqs.weight", factors));
+        let model = load_gguf("rope-freqs", &tiny_llama_metadata(), &tensors)?;
+        assert_eq!(model.config.rope_factors, Some(vec![1., 8.]));
         Ok(())
     }
 

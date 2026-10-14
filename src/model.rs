@@ -23,6 +23,9 @@ pub struct Config {
     pub(crate) head_dim: u32,
     pub ffn_dim: u32,
     pub rope_theta: f32,
+    // Llama 3's RoPE scaling: one factor per dimension pair, dividing that
+    // pair's frequency (the GGUF's `rope_freqs.weight`).
+    pub(crate) rope_factors: Option<Vec<f32>>,
     pub rms_eps: f32,
     pub vocab_size: u32,
     pub context_length: u32,
@@ -57,6 +60,7 @@ impl Config {
             head_dim: 2,
             ffn_dim: 4,
             rope_theta: 10000.0,
+            rope_factors: None,
             rms_eps: 1e-5,
             vocab_size: 5,
             context_length: 8,
@@ -131,15 +135,22 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
 // slower - so different pairs encode position at different resolutions, like
 // clock hands moving at different speeds. Depends only on positions, so it is
 // built once per forward call and shared by every layer and head.
+// `factors` (Llama 3) divides each pair's frequency by its own factor, which
+// slows the low-frequency pairs down for contexts longer than the model was
+// first trained on.
 pub fn rope_cos_sin(
     rope_theta: f32,
+    factors: Option<&[f32]>,
     head_dim: usize,
     positions: &[usize],
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let theta: Vec<f32> = (0..half)
-        .map(|j| rope_theta.powf(-2.0 * j as f32 / head_dim as f32))
+        .map(|j| {
+            let theta = rope_theta.powf(-2.0 * j as f32 / head_dim as f32);
+            factors.map_or(theta, |factors| theta / factors[j])
+        })
         .collect();
     let theta = Tensor::from_vec(theta, (1, half), device)?;
 
@@ -172,7 +183,7 @@ pub fn rope_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 // `positions` (same order as `x`'s rows).
 pub fn rope(x: &Tensor, rope_theta: f32, device: &Device, positions: &[usize]) -> Result<Tensor> {
     let (_, head_dim) = x.dims2()?;
-    let (cos, sin) = rope_cos_sin(rope_theta, head_dim, positions, device)?;
+    let (cos, sin) = rope_cos_sin(rope_theta, None, head_dim, positions, device)?;
     rope_apply(x, &cos, &sin)
 }
 
@@ -349,7 +360,13 @@ impl StepCtx {
             .iter()
             .flat_map(|item| item.position_offset..item.position_offset + q_len)
             .collect();
-        let (cos, sin) = rope_cos_sin(config.rope_theta, head_dim, &positions, device)?;
+        let (cos, sin) = rope_cos_sin(
+            config.rope_theta,
+            config.rope_factors.as_deref(),
+            head_dim,
+            &positions,
+            device,
+        )?;
         let rope_shape = (items.len(), 1, q_len, head_dim / 2);
         let cos = cos.reshape(rope_shape)?;
         let sin = sin.reshape(rope_shape)?;
@@ -577,6 +594,21 @@ mod tests {
         let expected_row1 = [1f32.cos(), 0.01f32.cos(), 1f32.sin(), 0.01f32.sin()];
         for (got, want) in out[4..8].iter().zip(expected_row1.iter()) {
             assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn rope_factors_divide_each_pairs_frequency() {
+        // head_dim=4, rope_theta=10000 -> theta = [1, 0.01]; factors [2, 4]
+        // make it [0.5, 0.0025], so position 1 rotates by those angles.
+        let (cos, sin) = rope_cos_sin(10000.0, Some(&[2., 4.]), 4, &[1], &Device::Cpu).unwrap();
+        let want_cos = [0.5f32.cos(), 0.0025f32.cos()];
+        let want_sin = [0.5f32.sin(), 0.0025f32.sin()];
+        for (got, want) in flat(&cos).iter().zip(&want_cos) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+        for (got, want) in flat(&sin).iter().zip(&want_sin) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
         }
     }
 
