@@ -22,9 +22,12 @@ pub const END_OF_TURN: &str = "<|im_end|>";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatFormat {
     // `<|im_start|>role\n...<|im_end|>\n` turns. `default_system` is used when
-    // the conversation doesn't start with a system message.
+    // the conversation doesn't start with a system message. `skip_thinking`
+    // opens the reply with an empty thinking block, which is how Qwen3's
+    // template turns thinking off.
     ChatMl {
         default_system: Option<&'static str>,
+        skip_thinking: bool,
     },
     // Llama 3's `<|start_header_id|>role<|end_header_id|>` turns.
     Llama3,
@@ -33,9 +36,15 @@ pub enum ChatFormat {
 impl ChatFormat {
     pub const SMOLLM2: ChatFormat = ChatFormat::ChatMl {
         default_system: Some(SMOLLM2_SYSTEM),
+        skip_thinking: false,
     };
     pub const QWEN2_5: ChatFormat = ChatFormat::ChatMl {
         default_system: Some(QWEN2_5_SYSTEM),
+        skip_thinking: false,
+    };
+    pub const QWEN3: ChatFormat = ChatFormat::ChatMl {
+        default_system: None,
+        skip_thinking: true,
     };
 
     // The chat format of `config`'s model, if rvllm knows its family. Within
@@ -45,6 +54,7 @@ impl ChatFormat {
             (Arch::Llama, Some("smollm")) => Some(ChatFormat::SMOLLM2),
             (Arch::Llama, Some("llama-bpe")) => Some(ChatFormat::Llama3),
             (Arch::Qwen2, Some("qwen2")) => Some(ChatFormat::QWEN2_5),
+            (Arch::Qwen3, Some("qwen2")) => Some(ChatFormat::QWEN3),
             _ => None,
         }
     }
@@ -54,7 +64,10 @@ impl ChatFormat {
     pub fn render(&self, messages: &[ChatMessage]) -> String {
         let mut out = String::new();
         match *self {
-            ChatFormat::ChatMl { default_system } => {
+            ChatFormat::ChatMl {
+                default_system,
+                skip_thinking,
+            } => {
                 if let Some(system) = default_system
                     && messages.first().is_none_or(|m| m.role != "system")
                 {
@@ -67,6 +80,9 @@ impl ChatFormat {
                     ));
                 }
                 out.push_str("<|im_start|>assistant\n");
+                if skip_thinking {
+                    out.push_str("<think>\n\n</think>\n\n");
+                }
             }
             ChatFormat::Llama3 => {
                 let (system, turns) = match messages.split_first() {
@@ -190,6 +206,27 @@ mod tests {
         );
     }
 
+    // Qwen3-0.6B's own template with `enable_thinking=False`, rendered as HF
+    // does.
+    #[test]
+    fn qwen3_matches_its_template_without_thinking() {
+        assert_eq!(
+            ChatFormat::QWEN3.render(&[
+                msg("system", "be terse"),
+                msg("user", "a"),
+                msg("assistant", "b"),
+                msg("user", "c"),
+            ]),
+            "<|im_start|>system\nbe terse<|im_end|>\n<|im_start|>user\na<|im_end|>\n\
+             <|im_start|>assistant\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        assert_eq!(
+            ChatFormat::QWEN3.render(&[msg("user", "hi")]),
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
     #[test]
     fn format_follows_the_tokenizer_family() {
         let format = |arch: Arch, pre: Option<&str>| {
@@ -211,6 +248,7 @@ mod tests {
             format(Arch::Qwen2, Some("qwen2")),
             Some(ChatFormat::QWEN2_5)
         );
+        assert_eq!(format(Arch::Qwen3, Some("qwen2")), Some(ChatFormat::QWEN3));
         assert_eq!(format(Arch::Llama, Some("qwen2")), None);
         assert_eq!(format(Arch::Llama, Some("default")), None);
         assert_eq!(format(Arch::Llama, None), None);

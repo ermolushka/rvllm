@@ -9,6 +9,7 @@ use crate::kv_storage::{GatherPlan, KvStorage};
 pub(crate) enum Arch {
     Llama,
     Qwen2,
+    Qwen3,
 }
 
 // Model hyperparameters, read from the GGUF metadata by `Model::load`. The
@@ -95,6 +96,10 @@ pub(crate) struct Attention {
     pub(crate) q_bias: Option<Tensor>,
     pub(crate) k_bias: Option<Tensor>,
     pub(crate) v_bias: Option<Tensor>,
+    // RMSNorm weights ([head_dim]) applied to each Q and K head before RoPE,
+    // for families that normalize them (Qwen3).
+    pub(crate) q_norm: Option<Tensor>,
+    pub(crate) k_norm: Option<Tensor>,
 }
 
 // The SwiGLU FFN's projections (see `swiglu_ffn`).
@@ -216,6 +221,14 @@ pub fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     x.reshape((rows, in_features))?
         .matmul(&weight.t()?)?
         .reshape(out_dims)
+}
+
+// `rms_norm` with `weight`, or `x` unchanged when there is no weight.
+fn optional_rms_norm(x: Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Tensor> {
+    match weight {
+        Some(weight) => rms_norm(&x, weight, eps),
+        None => Ok(x),
+    }
 }
 
 // `linear`, plus `bias` ([out_features]) when the projection has one.
@@ -443,11 +456,11 @@ impl Layer {
         // the head axis in front of the sequence axis:
         // [batch, q_len, heads * head_dim] -> [batch, heads, q_len, head_dim].
         let q = linear_bias(&normed, &self.attn.q, self.attn.q_bias.as_ref())?
-            .reshape((batch, q_len, n_heads, head_dim))?
-            .transpose(1, 2)?;
+            .reshape((batch, q_len, n_heads, head_dim))?;
+        let q = optional_rms_norm(q, self.attn.q_norm.as_ref(), config.rms_eps)?.transpose(1, 2)?;
         let k = linear_bias(&normed, &self.attn.k, self.attn.k_bias.as_ref())?
-            .reshape((batch, q_len, n_kv_heads, head_dim))?
-            .transpose(1, 2)?;
+            .reshape((batch, q_len, n_kv_heads, head_dim))?;
+        let k = optional_rms_norm(k, self.attn.k_norm.as_ref(), config.rms_eps)?.transpose(1, 2)?;
         let v = linear_bias(&normed, &self.attn.v, self.attn.v_bias.as_ref())?
             .reshape((batch, q_len, n_kv_heads, head_dim))?
             .transpose(1, 2)?;
@@ -802,6 +815,8 @@ mod tests {
                 q_bias: None,
                 k_bias: None,
                 v_bias: None,
+                q_norm: None,
+                k_norm: None,
             },
             ffn_norm: ones(),
             ffn: Ffn {
@@ -898,6 +913,39 @@ mod tests {
         let want = [1.5f32, 0., 3.5, 2., 5.5, 4., 7.5, 6.];
         for (got, want) in flat(&out).iter().zip(&want) {
             assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn qk_norm_cancels_the_scale_of_the_qk_projections() {
+        let device = Device::Cpu;
+        let run = |model: &Model| {
+            let mut kv = KvStorage::new(1, 1, 4, 1, 2, &device).unwrap();
+            let blocks = [BlockID(0)];
+            let mut writes = Vec::new();
+            let items = [item(&[0, 2, 1], 0, &blocks, 4, &mut writes)];
+            flat(&model.forward(&items, &mut kv).unwrap())
+        };
+        let scale_qk = |model: &mut Model| {
+            let attn = &mut model.layers[0].attn;
+            attn.q = attn.q.affine(7.0, 0.0).unwrap();
+            attn.k = attn.k.affine(7.0, 0.0).unwrap();
+        };
+
+        // Without the norms, scaling Q and K sharpens attention.
+        let mut model = tiny_model();
+        let before = run(&model);
+        scale_qk(&mut model);
+        assert_ne!(run(&model), before);
+
+        // With them, each head is normalized before RoPE, so it can't.
+        let norm = Tensor::new(&[0.5f32, 2.], &device).unwrap();
+        model.layers[0].attn.q_norm = Some(norm.clone());
+        model.layers[0].attn.k_norm = Some(norm);
+        let before = run(&model);
+        scale_qk(&mut model);
+        for (got, want) in run(&model).iter().zip(&before) {
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
         }
     }
 

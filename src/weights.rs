@@ -53,8 +53,9 @@ impl Arch {
         match name {
             "llama" => Ok(Arch::Llama),
             "qwen2" => Ok(Arch::Qwen2),
+            "qwen3" => Ok(Arch::Qwen3),
             _ => candle_core::bail!(
-                "unsupported model architecture {name:?} (supported: llama, qwen2)"
+                "unsupported model architecture {name:?} (supported: llama, qwen2, qwen3)"
             ),
         }
     }
@@ -65,13 +66,18 @@ impl Arch {
     fn qk_permuted(self) -> bool {
         match self {
             Arch::Llama => true,
-            Arch::Qwen2 => false,
+            Arch::Qwen2 | Arch::Qwen3 => false,
         }
     }
 
     // Whether the Q/K/V projections have biases.
     fn qkv_bias(self) -> bool {
         matches!(self, Arch::Qwen2)
+    }
+
+    // Whether each Q and K head is RMS-normalized before RoPE.
+    fn qk_norm(self) -> bool {
+        matches!(self, Arch::Qwen3)
     }
 }
 
@@ -205,6 +211,8 @@ impl Model {
                     k = unpermute_rope_rows(&k, config.n_kv_heads as usize)?;
                 }
                 let bias = config.arch.qkv_bias();
+                let qk_norm = config.arch.qk_norm();
+                let head_dim = config.head_dim();
                 Ok(Layer {
                     attn_norm: load(&format!("blk.{i}.attn_norm.weight"), &[hidden_dim])?,
                     attn: Attention {
@@ -221,6 +229,12 @@ impl Model {
                             .transpose()?,
                         v_bias: bias
                             .then(|| load(&format!("blk.{i}.attn_v.bias"), &[kv_dim]))
+                            .transpose()?,
+                        q_norm: qk_norm
+                            .then(|| load(&format!("blk.{i}.attn_q_norm.weight"), &[head_dim]))
+                            .transpose()?,
+                        k_norm: qk_norm
+                            .then(|| load(&format!("blk.{i}.attn_k_norm.weight"), &[head_dim]))
                             .transpose()?,
                     },
                     ffn_norm: load(&format!("blk.{i}.ffn_norm.weight"), &[hidden_dim])?,
@@ -486,16 +500,16 @@ mod tests {
         model
     }
 
-    // Every weight `tiny_llama_metadata` needs, with `q` and `k` (HF order)
-    // stored the way llama.cpp permutes them.
-    fn tiny_llama_tensors(q: &Tensor, k: &Tensor) -> Result<Vec<(&'static str, Tensor)>> {
+    // Every weight `tiny_llama_metadata` needs, with `q` and `k` stored as
+    // given.
+    fn tiny_tensors(q: Tensor, k: Tensor) -> Result<Vec<(&'static str, Tensor)>> {
         let norm = Tensor::ones(8, DType::F32, &Device::Cpu)?;
         Ok(vec![
             ("token_embd.weight", rows(5, 8)?),
             ("output_norm.weight", norm.clone()),
             ("blk.0.attn_norm.weight", norm.clone()),
-            ("blk.0.attn_q.weight", llama_cpp_permute(q, 2)?),
-            ("blk.0.attn_k.weight", llama_cpp_permute(k, 1)?),
+            ("blk.0.attn_q.weight", q),
+            ("blk.0.attn_k.weight", k),
             ("blk.0.attn_v.weight", rows(4, 8)?),
             ("blk.0.attn_output.weight", rows(8, 8)?),
             ("blk.0.ffn_norm.weight", norm),
@@ -503,6 +517,12 @@ mod tests {
             ("blk.0.ffn_up.weight", rows(8, 8)?),
             ("blk.0.ffn_down.weight", rows(8, 8)?),
         ])
+    }
+
+    // `tiny_tensors` with `q` and `k` (HF order) stored the way llama.cpp
+    // permutes them for Llama.
+    fn tiny_llama_tensors(q: &Tensor, k: &Tensor) -> Result<Vec<(&'static str, Tensor)>> {
+        tiny_tensors(llama_cpp_permute(q, 2)?, llama_cpp_permute(k, 1)?)
     }
 
     #[test]
@@ -525,14 +545,7 @@ mod tests {
     fn load_qwen2_keeps_qk_rows_and_reads_biases() -> Result<()> {
         let (q, k) = (rows(8, 8)?, rows(4, 8)?);
         // llama.cpp stores Qwen2's Q/K rows in HF order, unpermuted.
-        let mut tensors = tiny_llama_tensors(&q, &k)?;
-        for (name, tensor) in &mut tensors {
-            match *name {
-                "blk.0.attn_q.weight" => *tensor = q.clone(),
-                "blk.0.attn_k.weight" => *tensor = k.clone(),
-                _ => {}
-            }
-        }
+        let mut tensors = tiny_tensors(q.clone(), k.clone())?;
         let md = tiny_metadata("qwen2");
         let Err(err) = load_gguf("qwen2-no-bias", &md, &tensors) else {
             panic!("loaded a qwen2 file without its biases");
@@ -574,6 +587,37 @@ mod tests {
         tensors.push(("rope_freqs.weight", factors));
         let model = load_gguf("rope-freqs", &tiny_llama_metadata(), &tensors)?;
         assert_eq!(model.config.rope_factors, Some(vec![1., 8.]));
+        Ok(())
+    }
+
+    #[test]
+    fn load_qwen3_reads_qk_norms() -> Result<()> {
+        let (q, k) = (rows(8, 8)?, rows(4, 8)?);
+        let mut tensors = tiny_tensors(q.clone(), k.clone())?;
+        let md = tiny_metadata("qwen3");
+        let Err(err) = load_gguf("qwen3-no-norm", &md, &tensors) else {
+            panic!("loaded a qwen3 file without its Q/K norms");
+        };
+        assert!(
+            err.to_string().contains("blk.0.attn_q_norm.weight"),
+            "{err}"
+        );
+
+        // One weight per element of a head (head_dim 4).
+        let q_norm = Tensor::arange(0f32, 4., &Device::Cpu)?;
+        let k_norm = Tensor::arange(4f32, 8., &Device::Cpu)?;
+        tensors.extend([
+            ("blk.0.attn_q_norm.weight", q_norm.clone()),
+            ("blk.0.attn_k_norm.weight", k_norm.clone()),
+        ]);
+        let model = load_gguf("qwen3", &md, &tensors)?;
+        assert_eq!(model.config.arch, Arch::Qwen3);
+        let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
+        let attn = &model.layers[0].attn;
+        assert_eq!(values(&attn.q)?, values(&q)?);
+        assert_eq!(values(attn.q_norm.as_ref().unwrap())?, values(&q_norm)?);
+        assert_eq!(values(attn.k_norm.as_ref().unwrap())?, values(&k_norm)?);
+        assert!(attn.q_bias.is_none());
         Ok(())
     }
 

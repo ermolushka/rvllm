@@ -117,6 +117,8 @@ mod tests {
                 q_bias: None,
                 k_bias: None,
                 v_bias: None,
+                q_norm: None,
+                k_norm: None,
             },
             ffn_norm: ones(),
             ffn: Ffn {

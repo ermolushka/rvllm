@@ -515,6 +515,9 @@ pub(crate) fn unsupported(model: &Model) -> Option<&'static str> {
     if model.layers.iter().any(|l| l.attn.q_bias.is_some()) {
         return Some("attention biases");
     }
+    if model.layers.iter().any(|l| l.attn.q_norm.is_some()) {
+        return Some("Q/K normalization");
+    }
     None
 }
 
@@ -657,6 +660,13 @@ mod tests {
     }
 
     #[test]
+    fn qk_norm_is_unsupported() {
+        let mut model = tiny_model();
+        model.layers[0].attn.q_norm = Some(Tensor::ones(2, DType::F32, &Device::Cpu).unwrap());
+        assert_eq!(unsupported(&model), Some("Q/K normalization"));
+    }
+
+    #[test]
     fn attention_biases_are_unsupported() {
         let mut model = tiny_model();
         model.layers[0].attn.q_bias = Some(Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap());
@@ -686,6 +696,8 @@ mod tests {
                 q_bias: None,
                 k_bias: None,
                 v_bias: None,
+                q_norm: None,
+                k_norm: None,
             },
             ffn_norm: ones(),
             ffn: Ffn {
