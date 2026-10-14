@@ -9,7 +9,7 @@ use cudarc::driver::CudaSlice;
 use half::f16;
 use kv_cache_scheduler::block_pool::BlockID;
 
-use crate::model::{BatchItem, Config, Model};
+use crate::model::{Activation, BatchItem, Config, Model};
 
 use super::context::CudaRuntime;
 use super::cublas_ops;
@@ -518,6 +518,18 @@ pub(crate) fn unsupported(model: &Model) -> Option<&'static str> {
     if model.layers.iter().any(|l| l.attn.q_norm.is_some()) {
         return Some("Q/K normalization");
     }
+    if model.config.local_attention.is_some() {
+        return Some("sliding-window attention");
+    }
+    if model.layers.iter().any(|l| l.post_attn_norm.is_some()) {
+        return Some("post-attention and post-FFN norms");
+    }
+    if model.config.activation != Activation::Silu {
+        return Some("GELU feed-forward layers");
+    }
+    if model.config.embedding_scale.is_some() {
+        return Some("scaled embeddings");
+    }
     None
 }
 
@@ -667,6 +679,27 @@ mod tests {
     }
 
     #[test]
+    fn gemma3_features_are_unsupported() {
+        let ones = || Tensor::ones(4, DType::F32, &Device::Cpu).unwrap();
+        let mut model = tiny_model();
+        model.config.embedding_scale = Some(2.0);
+        assert_eq!(unsupported(&model), Some("scaled embeddings"));
+        model.config.activation = Activation::GeluTanh;
+        assert_eq!(unsupported(&model), Some("GELU feed-forward layers"));
+        model.layers[0].post_attn_norm = Some(ones());
+        model.layers[0].post_ffn_norm = Some(ones());
+        assert_eq!(
+            unsupported(&model),
+            Some("post-attention and post-FFN norms")
+        );
+        model.config.local_attention = Some(crate::model::LocalAttention {
+            window: 512,
+            rope_theta: 10000.0,
+        });
+        assert_eq!(unsupported(&model), Some("sliding-window attention"));
+    }
+
+    #[test]
     fn attention_biases_are_unsupported() {
         let mut model = tiny_model();
         model.layers[0].attn.q_bias = Some(Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap());
@@ -689,6 +722,7 @@ mod tests {
             attn_norm: ones(),
             attn: Attention {
                 kv_index: 0,
+                local: false,
                 q: rand((n_heads * head_dim, hidden_dim)),
                 k: rand((n_kv_heads * head_dim, hidden_dim)),
                 v: rand((n_kv_heads * head_dim, hidden_dim)),
@@ -699,12 +733,14 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
             },
+            post_attn_norm: None,
             ffn_norm: ones(),
             ffn: Ffn {
                 gate: rand((ffn_dim, hidden_dim)),
                 up: rand((ffn_dim, hidden_dim)),
                 down: rand((hidden_dim, ffn_dim)),
             },
+            post_ffn_norm: None,
         };
         Model {
             config: Config {

@@ -110,6 +110,7 @@ mod tests {
             attn_norm: ones(),
             attn: Attention {
                 kv_index: 0,
+                local: false,
                 q: rand((n_heads * head_dim, hidden_dim)),
                 k: rand((n_kv_heads * head_dim, hidden_dim)),
                 v: rand((n_kv_heads * head_dim, hidden_dim)),
@@ -120,12 +121,14 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
             },
+            post_attn_norm: None,
             ffn_norm: ones(),
             ffn: Ffn {
                 gate: rand((ffn_dim, hidden_dim)),
                 up: rand((ffn_dim, hidden_dim)),
                 down: rand((hidden_dim, ffn_dim)),
             },
+            post_ffn_norm: None,
         };
         Model {
             config: Config {

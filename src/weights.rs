@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::{Device, Result, Tensor};
 
-use crate::model::{Arch, Attention, Config, Ffn, Layer, Model};
+use crate::model::{Activation, Arch, Attention, Config, Ffn, Layer, LocalAttention, Model};
 
 // Reads `key` with `get` (e.g. `Value::to_u32`) if present, naming the key if
 // it holds another type.
@@ -54,8 +54,9 @@ impl Arch {
             "llama" => Ok(Arch::Llama),
             "qwen2" => Ok(Arch::Qwen2),
             "qwen3" => Ok(Arch::Qwen3),
+            "gemma3" => Ok(Arch::Gemma3),
             _ => candle_core::bail!(
-                "unsupported model architecture {name:?} (supported: llama, qwen2, qwen3)"
+                "unsupported model architecture {name:?} (supported: llama, qwen2, qwen3, gemma3)"
             ),
         }
     }
@@ -66,7 +67,7 @@ impl Arch {
     fn qk_permuted(self) -> bool {
         match self {
             Arch::Llama => true,
-            Arch::Qwen2 | Arch::Qwen3 => false,
+            Arch::Qwen2 | Arch::Qwen3 | Arch::Gemma3 => false,
         }
     }
 
@@ -77,7 +78,26 @@ impl Arch {
 
     // Whether each Q and K head is RMS-normalized before RoPE.
     fn qk_norm(self) -> bool {
-        matches!(self, Arch::Qwen3)
+        matches!(self, Arch::Qwen3 | Arch::Gemma3)
+    }
+
+    // Whether the attention and FFN outputs are RMS-normalized before the
+    // residual adds.
+    fn post_norms(self) -> bool {
+        matches!(self, Arch::Gemma3)
+    }
+
+    // Whether layer `i` is a local layer: Gemma 3 follows every five of them
+    // with one global layer.
+    fn local_layer(self, i: usize) -> bool {
+        matches!(self, Arch::Gemma3) && i % 6 < 5
+    }
+
+    fn activation(self) -> Activation {
+        match self {
+            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 => Activation::Silu,
+            Arch::Gemma3 => Activation::GeluTanh,
+        }
     }
 }
 
@@ -121,6 +141,22 @@ impl Config {
                         Some("llama-bpe" | "llama3" | "llama-v3")
                     ),
             );
+        // Gemma 3's local layers; llama.cpp defaults their RoPE base to 10000.
+        let local_attention = match arch {
+            Arch::Gemma3 => {
+                let window = metadata(md, &key("attention.sliding_window"), Value::to_u32)?;
+                if window == 0 {
+                    candle_core::bail!("invalid sliding window of 0 positions")
+                }
+                Some(LocalAttention {
+                    window: window as usize,
+                    rope_theta: optional_metadata(md, &key("rope.freq_base_swa"), Value::to_f32)?
+                        .unwrap_or(10000.0),
+                })
+            }
+            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 => None,
+        };
+
         let eos_token_id = metadata(md, "tokenizer.ggml.eos_token_id", Value::to_u32)?;
         let bos_token_id = metadata(md, "tokenizer.ggml.bos_token_id", Value::to_u32)?;
         let tokens = optional_metadata(md, "tokenizer.ggml.tokens", Value::to_vec)?;
@@ -141,6 +177,7 @@ impl Config {
             ffn_dim: metadata(md, &key("feed_forward_length"), Value::to_u32)?,
             rope_theta: metadata(md, &key("rope.freq_base"), Value::to_f32)?,
             rope_factors: None,
+            local_attention,
             rms_eps: metadata(md, &key("attention.layer_norm_rms_epsilon"), Value::to_f32)?,
             vocab_size,
             context_length: metadata(md, &key("context_length"), Value::to_u32)?,
@@ -150,6 +187,8 @@ impl Config {
             tokenizer_pre,
             bos_token: token(bos_token_id),
             eos_token: token(eos_token_id),
+            embedding_scale: (arch == Arch::Gemma3).then(|| (hidden_dim as f32).sqrt()),
+            activation: arch.activation(),
         })
     }
 }
@@ -213,10 +252,12 @@ impl Model {
                 let bias = config.arch.qkv_bias();
                 let qk_norm = config.arch.qk_norm();
                 let head_dim = config.head_dim();
+                let post_norms = config.arch.post_norms();
                 Ok(Layer {
                     attn_norm: load(&format!("blk.{i}.attn_norm.weight"), &[hidden_dim])?,
                     attn: Attention {
                         kv_index: i,
+                        local: config.arch.local_layer(i),
                         q,
                         k,
                         v: load(&format!("blk.{i}.attn_v.weight"), &[kv_dim, hidden_dim])?,
@@ -237,12 +278,23 @@ impl Model {
                             .then(|| load(&format!("blk.{i}.attn_k_norm.weight"), &[head_dim]))
                             .transpose()?,
                     },
+                    post_attn_norm: post_norms
+                        .then(|| {
+                            load(
+                                &format!("blk.{i}.post_attention_norm.weight"),
+                                &[hidden_dim],
+                            )
+                        })
+                        .transpose()?,
                     ffn_norm: load(&format!("blk.{i}.ffn_norm.weight"), &[hidden_dim])?,
                     ffn: Ffn {
                         gate: load(&format!("blk.{i}.ffn_gate.weight"), &[ffn_dim, hidden_dim])?,
                         up: load(&format!("blk.{i}.ffn_up.weight"), &[ffn_dim, hidden_dim])?,
                         down: load(&format!("blk.{i}.ffn_down.weight"), &[hidden_dim, ffn_dim])?,
                     },
+                    post_ffn_norm: post_norms
+                        .then(|| load(&format!("blk.{i}.post_ffw_norm.weight"), &[hidden_dim]))
+                        .transpose()?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -386,7 +438,7 @@ mod tests {
             ),
             (
                 "general.architecture",
-                Some(Value::String("gemma3".into())),
+                Some(Value::String("mamba".into())),
                 "unsupported model architecture",
             ),
             ("llama.context_length", None, "llama.context_length"),
@@ -621,6 +673,96 @@ mod tests {
         Ok(())
     }
 
+    // `tiny_metadata("gemma3")` plus the sliding window Gemma 3 requires.
+    fn tiny_gemma3_metadata() -> HashMap<String, Value> {
+        let mut md = tiny_metadata("gemma3");
+        md.insert("gemma3.attention.sliding_window".into(), Value::U32(512));
+        md
+    }
+
+    #[test]
+    fn config_from_gemma3_metadata() -> Result<()> {
+        let mut md = tiny_gemma3_metadata();
+        let config = Config::from_gguf_metadata(&md, 5)?;
+        assert_eq!(config.arch, Arch::Gemma3);
+        // No `rope.freq_base_swa`, so llama.cpp's default base.
+        let local = LocalAttention {
+            window: 512,
+            rope_theta: 10000.0,
+        };
+        assert_eq!(config.local_attention, Some(local));
+        assert_eq!(config.embedding_scale, Some(8f32.sqrt()));
+        assert_eq!(config.activation, Activation::GeluTanh);
+
+        md.insert("gemma3.rope.freq_base_swa".into(), Value::F32(5000.0));
+        let config = Config::from_gguf_metadata(&md, 5)?;
+        assert_eq!(config.local_attention.unwrap().rope_theta, 5000.0);
+
+        md.insert("gemma3.attention.sliding_window".into(), Value::U32(0));
+        let err = Config::from_gguf_metadata(&md, 5).unwrap_err();
+        assert!(err.to_string().contains("sliding window"), "{err}");
+        md.remove("gemma3.attention.sliding_window");
+        let err = Config::from_gguf_metadata(&md, 5).unwrap_err();
+        assert!(
+            err.to_string().contains("gemma3.attention.sliding_window"),
+            "{err}"
+        );
+
+        let llama = Config::from_gguf_metadata(&tiny_llama_metadata(), 5)?;
+        assert_eq!(llama.local_attention, None);
+        assert_eq!(llama.embedding_scale, None);
+        assert_eq!(llama.activation, Activation::Silu);
+        Ok(())
+    }
+
+    #[test]
+    fn gemma3_follows_five_local_layers_with_a_global_one() {
+        let local: Vec<bool> = (0..12).map(|i| Arch::Gemma3.local_layer(i)).collect();
+        let pattern = [true, true, true, true, true, false];
+        assert_eq!(local, pattern.repeat(2));
+        assert!(!(0..12).any(|i| Arch::Llama.local_layer(i)));
+    }
+
+    #[test]
+    fn load_gemma3_reads_post_norms() -> Result<()> {
+        let (q, k) = (rows(8, 8)?, rows(4, 8)?);
+        let mut tensors = tiny_tensors(q, k)?;
+        let head_norm = Tensor::ones(4, DType::F32, &Device::Cpu)?;
+        tensors.extend([
+            ("blk.0.attn_q_norm.weight", head_norm.clone()),
+            ("blk.0.attn_k_norm.weight", head_norm),
+        ]);
+        let md = tiny_gemma3_metadata();
+        let Err(err) = load_gguf("gemma3-no-post-norm", &md, &tensors) else {
+            panic!("loaded a gemma3 file without its post norms");
+        };
+        assert!(
+            err.to_string().contains("blk.0.post_attention_norm.weight"),
+            "{err}"
+        );
+
+        let post_attn = Tensor::arange(0f32, 8., &Device::Cpu)?;
+        let post_ffn = Tensor::arange(8f32, 16., &Device::Cpu)?;
+        tensors.extend([
+            ("blk.0.post_attention_norm.weight", post_attn.clone()),
+            ("blk.0.post_ffw_norm.weight", post_ffn.clone()),
+        ]);
+        let model = load_gguf("gemma3", &md, &tensors)?;
+        let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
+        let layer = &model.layers[0];
+        assert!(layer.attn.local);
+        assert!(layer.attn.q_norm.is_some());
+        assert_eq!(
+            values(layer.post_attn_norm.as_ref().unwrap())?,
+            values(&post_attn)?
+        );
+        assert_eq!(
+            values(layer.post_ffn_norm.as_ref().unwrap())?,
+            values(&post_ffn)?
+        );
+        Ok(())
+    }
+
     #[test]
     fn load_rejects_a_tensor_of_the_wrong_shape() -> Result<()> {
         let mut tensors = tiny_llama_tensors(&rows(8, 8)?, &rows(4, 8)?)?;
@@ -641,15 +783,12 @@ mod tests {
     #[test]
     fn load_checks_architecture_before_reading_weights() -> Result<()> {
         let mut md = tiny_llama_metadata();
-        md.insert(
-            "general.architecture".into(),
-            Value::String("gemma3".into()),
-        );
+        md.insert("general.architecture".into(), Value::String("mamba".into()));
         // Every other tensor is missing, so reading any weight would fail differently.
-        let Err(err) = load_gguf("gemma3", &md, &[("token_embd.weight", rows(5, 8)?)]) else {
-            panic!("loaded a gemma3 file");
+        let Err(err) = load_gguf("mamba", &md, &[("token_embd.weight", rows(5, 8)?)]) else {
+            panic!("loaded a mamba file");
         };
-        assert!(err.to_string().contains("\"gemma3\""), "{err}");
+        assert!(err.to_string().contains("\"mamba\""), "{err}");
         Ok(())
     }
 

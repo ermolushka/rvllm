@@ -31,6 +31,9 @@ pub enum ChatFormat {
     },
     // Llama 3's `<|start_header_id|>role<|end_header_id|>` turns.
     Llama3,
+    // Gemma's `<start_of_turn>role\n...<end_of_turn>\n` turns, with the
+    // assistant as `model`.
+    Gemma,
 }
 
 impl ChatFormat {
@@ -55,6 +58,7 @@ impl ChatFormat {
             (Arch::Llama, Some("llama-bpe")) => Some(ChatFormat::Llama3),
             (Arch::Qwen2, Some("qwen2")) => Some(ChatFormat::QWEN2_5),
             (Arch::Qwen3, Some("qwen2")) => Some(ChatFormat::QWEN3),
+            (Arch::Gemma3, _) => Some(ChatFormat::Gemma),
             _ => None,
         }
     }
@@ -105,6 +109,31 @@ impl ChatFormat {
                 }
                 out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
             }
+            ChatFormat::Gemma => {
+                // Gemma has no system role: its template puts a leading system
+                // message, untrimmed, in front of the first turn. Turns that
+                // don't alternate between user and assistant are rendered as
+                // given (the template rejects them, llama.cpp doesn't).
+                let (system, turns) = match messages.split_first() {
+                    Some((first, rest)) if first.role == "system" => (Some(&first.content), rest),
+                    _ => (None, messages),
+                };
+                for (i, m) in turns.iter().enumerate() {
+                    let role = if m.role == "assistant" {
+                        "model"
+                    } else {
+                        &m.role
+                    };
+                    out.push_str(&format!("<start_of_turn>{role}\n"));
+                    if i == 0
+                        && let Some(system) = system
+                    {
+                        out.push_str(&format!("{system}\n\n"));
+                    }
+                    out.push_str(&format!("{}<end_of_turn>\n", m.content.trim()));
+                }
+                out.push_str("<start_of_turn>model\n");
+            }
         }
         out
     }
@@ -114,6 +143,7 @@ impl ChatFormat {
         match self {
             ChatFormat::ChatMl { .. } => &[END_OF_TURN],
             ChatFormat::Llama3 => &["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"],
+            ChatFormat::Gemma => &["<end_of_turn>"],
         }
     }
 }
@@ -227,6 +257,26 @@ mod tests {
         );
     }
 
+    // gemma-3-270m-it's own template, rendered as HF does, minus the leading
+    // BOS.
+    #[test]
+    fn gemma_matches_its_template() {
+        assert_eq!(
+            ChatFormat::Gemma.render(&[
+                msg("system", " be terse "),
+                msg("user", "a"),
+                msg("assistant", " b\n"),
+                msg("user", "c"),
+            ]),
+            "<start_of_turn>user\n be terse \n\na<end_of_turn>\n<start_of_turn>model\nb<end_of_turn>\n\
+             <start_of_turn>user\nc<end_of_turn>\n<start_of_turn>model\n"
+        );
+        assert_eq!(
+            ChatFormat::Gemma.render(&[msg("user", "  padded \n")]),
+            "<start_of_turn>user\npadded<end_of_turn>\n<start_of_turn>model\n"
+        );
+    }
+
     #[test]
     fn format_follows_the_tokenizer_family() {
         let format = |arch: Arch, pre: Option<&str>| {
@@ -249,6 +299,10 @@ mod tests {
             Some(ChatFormat::QWEN2_5)
         );
         assert_eq!(format(Arch::Qwen3, Some("qwen2")), Some(ChatFormat::QWEN3));
+        assert_eq!(
+            format(Arch::Gemma3, Some("default")),
+            Some(ChatFormat::Gemma)
+        );
         assert_eq!(format(Arch::Llama, Some("qwen2")), None);
         assert_eq!(format(Arch::Llama, Some("default")), None);
         assert_eq!(format(Arch::Llama, None), None);

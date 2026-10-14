@@ -10,6 +10,7 @@ pub(crate) enum Arch {
     Llama,
     Qwen2,
     Qwen3,
+    Gemma3,
 }
 
 // Model hyperparameters, read from the GGUF metadata by `Model::load`. The
@@ -28,6 +29,8 @@ pub struct Config {
     // Llama 3's RoPE scaling: one factor per dimension pair, dividing that
     // pair's frequency (the GGUF's `rope_freqs.weight`).
     pub(crate) rope_factors: Option<Vec<f32>>,
+    // Set when some layers attend locally (Gemma 3).
+    pub(crate) local_attention: Option<LocalAttention>,
     pub rms_eps: f32,
     pub vocab_size: u32,
     pub context_length: u32,
@@ -40,6 +43,26 @@ pub struct Config {
     // The BOS and EOS token strings, for checking a tokenizer.json against the model.
     pub(crate) bos_token: Option<String>,
     pub(crate) eos_token: Option<String>,
+    // Multiplies the token embeddings (Gemma: sqrt(hidden_dim)).
+    pub(crate) embedding_scale: Option<f32>,
+    pub(crate) activation: Activation,
+}
+
+// Gemma 3's local layers attend only to the last `window` positions, and
+// rotate with their own RoPE base.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LocalAttention {
+    pub(crate) window: usize,
+    pub(crate) rope_theta: f32,
+}
+
+// The nonlinearity on the FFN's gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Activation {
+    // SwiGLU (Llama, Qwen).
+    Silu,
+    // GELU with the tanh approximation, i.e. GeGLU (Gemma).
+    GeluTanh,
 }
 
 impl Config {
@@ -63,6 +86,7 @@ impl Config {
             ffn_dim: 4,
             rope_theta: 10000.0,
             rope_factors: None,
+            local_attention: None,
             rms_eps: 1e-5,
             vocab_size: 5,
             context_length: 8,
@@ -72,22 +96,30 @@ impl Config {
             tokenizer_pre: None,
             bos_token: None,
             eos_token: None,
+            embedding_scale: None,
+            activation: Activation::Silu,
         }
     }
 }
 
 // One transformer block's weights, all F32 in candle Linear convention
-// ([out_features, in_features]) except the two norm vectors.
+// ([out_features, in_features]) except the norm vectors.
 pub(crate) struct Layer {
     pub(crate) attn_norm: Tensor,
     pub(crate) attn: Attention,
+    // Normalizes the attention output before the residual add (Gemma).
+    pub(crate) post_attn_norm: Option<Tensor>,
     pub(crate) ffn_norm: Tensor,
     pub(crate) ffn: Ffn,
+    // Likewise for the FFN output.
+    pub(crate) post_ffn_norm: Option<Tensor>,
 }
 
 pub(crate) struct Attention {
     // Index of this layer's slot in `KvStorage`.
     pub(crate) kv_index: usize,
+    // Whether this is a local layer (see `LocalAttention`).
+    pub(crate) local: bool,
     pub(crate) q: Tensor,
     pub(crate) k: Tensor,
     pub(crate) v: Tensor,
@@ -102,7 +134,8 @@ pub(crate) struct Attention {
     pub(crate) k_norm: Option<Tensor>,
 }
 
-// The SwiGLU FFN's projections (see `swiglu_ffn`).
+// The gated FFN's projections: down(act(gate(x)) * up(x)), with SiLU (see
+// `swiglu_ffn`) or GELU as `act`.
 pub(crate) struct Ffn {
     pub(crate) gate: Tensor,
     pub(crate) up: Tensor,
@@ -268,11 +301,14 @@ pub fn swiglu_ffn(
 // batch-padding tail every other sequence's longer context leaves behind for
 // this one. Masked positions get -inf so softmax assigns them exactly 0.
 // position_offset[b]: position of item b's first query row in its sequence.
+// `window` additionally hides keys that many positions or more behind the
+// query, for sliding-window attention.
 pub fn batch_mask(
     position_offset: &[usize],
     read_num_tokens: &[usize],
     q_len: usize,
     ctx_len: usize,
+    window: Option<usize>,
     device: &Device,
 ) -> Result<Tensor> {
     let batch = position_offset.len();
@@ -282,7 +318,8 @@ pub fn batch_mask(
         let valid_len = read_num_tokens[b];
         for i in 0..q_len {
             for j in 0..ctx_len {
-                if j >= valid_len || j > offset + i {
+                let outside_window = window.is_some_and(|w| j + w <= offset + i);
+                if j >= valid_len || j > offset + i || outside_window {
                     mask_data[(b * q_len + i) * ctx_len + j] = f32::NEG_INFINITY;
                 }
             }
@@ -356,16 +393,23 @@ pub struct BatchItem<'a> {
     pub position_offset: usize,
 }
 
-// Everything that depends only on this call's items, not on the layer: RoPE
-// cos/sin, the attention mask, the cache read plan and the flattened cache
-// write positions. Built once per call and shared by every layer instead of
-// being rebuilt per layer.
-pub struct StepCtx {
+// RoPE cos/sin and the attention mask for one kind of attention layer.
+struct AttnCtx {
     // [batch, 1, q_len, head_dim / 2]
     cos: Tensor,
     sin: Tensor,
     // [batch, 1, q_len, ctx_len]
     mask: Tensor,
+}
+
+// Everything that depends only on this call's items, not on the layer: RoPE
+// cos/sin, the attention mask, the cache read plan and the flattened cache
+// write positions. Built once per call and shared by every layer instead of
+// being rebuilt per layer.
+pub struct StepCtx {
+    global: AttnCtx,
+    // The local layers' own tables, when the model has local layers.
+    local: Option<AttnCtx>,
     gather: GatherPlan,
     // Every item's write positions, concatenated in (batch, q_len) row-major
     // order to match the flattened K/V rows.
@@ -387,16 +431,6 @@ impl StepCtx {
             .iter()
             .flat_map(|item| item.position_offset..item.position_offset + q_len)
             .collect();
-        let (cos, sin) = rope_cos_sin(
-            config.rope_theta,
-            config.rope_factors.as_deref(),
-            head_dim,
-            &positions,
-            device,
-        )?;
-        let rope_shape = (items.len(), 1, q_len, head_dim / 2);
-        let cos = cos.reshape(rope_shape)?;
-        let sin = sin.reshape(rope_shape)?;
 
         let gather_items: Vec<(&[BlockID], usize)> = items
             .iter()
@@ -406,32 +440,60 @@ impl StepCtx {
 
         let position_offsets: Vec<usize> = items.iter().map(|i| i.position_offset).collect();
         let read_num_tokens: Vec<usize> = items.iter().map(|i| i.read_num_tokens).collect();
-        let mask = batch_mask(
-            &position_offsets,
-            &read_num_tokens,
-            q_len,
-            gather.ctx_len(),
-            device,
-        )?;
+        let attn_ctx = |rope_theta: f32, factors: Option<&[f32]>, window: Option<usize>| {
+            let (cos, sin) = rope_cos_sin(rope_theta, factors, head_dim, &positions, device)?;
+            let rope_shape = (items.len(), 1, q_len, head_dim / 2);
+            Ok::<_, candle_core::Error>(AttnCtx {
+                cos: cos.reshape(rope_shape)?,
+                sin: sin.reshape(rope_shape)?,
+                mask: batch_mask(
+                    &position_offsets,
+                    &read_num_tokens,
+                    q_len,
+                    gather.ctx_len(),
+                    window,
+                    device,
+                )?,
+            })
+        };
+        let global = attn_ctx(config.rope_theta, config.rope_factors.as_deref(), None)?;
+        let local = config
+            .local_attention
+            .map(|local| attn_ctx(local.rope_theta, None, Some(local.window)))
+            .transpose()?;
 
         let writes = items
             .iter()
             .flat_map(|item| item.write_positions.iter().copied())
             .collect();
         Ok(StepCtx {
-            cos,
-            sin,
-            mask,
+            global,
+            local,
             gather,
             writes,
         })
     }
 }
 
+impl Ffn {
+    fn forward(&self, x: &Tensor, activation: Activation) -> Result<Tensor> {
+        match activation {
+            Activation::Silu => swiglu_ffn(x, &self.gate, &self.up, &self.down),
+            // The same gating, through GELU instead of SiLU.
+            Activation::GeluTanh => {
+                let gate = linear(x, &self.gate)?.gelu()?;
+                linear(&gate.mul(&linear(x, &self.up)?)?, &self.down)
+            }
+        }
+    }
+}
+
 impl Layer {
-    // One Llama transformer block:
+    // One transformer block:
     //   h   = x + attention(rms_norm(x, attn_norm)) // aka residual
-    //   out = h + swiglu_ffn(rms_norm(h, ffn_norm))
+    //   out = h + ffn(rms_norm(h, ffn_norm))
+    // Gemma also RMS-normalizes the attention and FFN outputs before adding
+    // them (`post_attn_norm`, `post_ffn_norm`).
     // x: [batch, q_len, hidden_dim]; returns the same shape.
     pub fn forward(
         &self,
@@ -465,11 +527,18 @@ impl Layer {
             .reshape((batch, q_len, n_kv_heads, head_dim))?
             .transpose(1, 2)?;
 
+        // Local layers rotate with their own RoPE base and see only their
+        // window of the context.
+        let attn_ctx = match &ctx.local {
+            Some(local) if self.attn.local => local,
+            _ => &ctx.global,
+        };
+
         // RoPE rotates every head identically given the position, so one call
         // per tensor covers all heads. Only Q and K get rotated - V carries
         // content, not position.
-        let q = rope_apply(&q, &ctx.cos, &ctx.sin)?;
-        let k = rope_apply(&k, &ctx.cos, &ctx.sin)?;
+        let q = rope_apply(&q, &attn_ctx.cos, &attn_ctx.sin)?;
+        let k = rope_apply(&k, &attn_ctx.cos, &attn_ctx.sin)?;
 
         // Write this call's tokens into their block slots. The cache wants
         // token-major rows: [batch * q_len, n_kv_heads, head_dim].
@@ -484,7 +553,7 @@ impl Layer {
         // Read back every sequence's full cached K/V (padded to the batch's
         // longest context) and attend against it.
         let (k_full, v_full) = kv_storage.gather(self.attn.kv_index, &ctx.gather)?;
-        let attn_out = gqa_attention(&q, &k_full, &v_full, &ctx.mask)?;
+        let attn_out = gqa_attention(&q, &k_full, &v_full, &attn_ctx.mask)?;
 
         // Merge the heads back into one dimension - inverse of the earlier
         // split - and project down to hidden_dim so it can be added to the
@@ -493,6 +562,7 @@ impl Layer {
             .transpose(1, 2)?
             .reshape((batch, q_len, n_heads * head_dim))?;
         let attn_out = linear(&attn_out, &self.attn.o)?;
+        let attn_out = optional_rms_norm(attn_out, self.post_attn_norm.as_ref(), config.rms_eps)?;
 
         // Residual connection: the block adds *to* x rather than replacing it,
         // so gradients (and, at inference time, information) can flow straight
@@ -501,7 +571,8 @@ impl Layer {
 
         // Same pre-norm pattern before the FFN half of the block.
         let normed2 = rms_norm(&h, &self.ffn_norm, config.rms_eps)?;
-        let ffn_out = swiglu_ffn(&normed2, &self.ffn.gate, &self.ffn.up, &self.ffn.down)?;
+        let ffn_out = self.ffn.forward(&normed2, config.activation)?;
+        let ffn_out = optional_rms_norm(ffn_out, self.post_ffn_norm.as_ref(), config.rms_eps)?;
 
         // Second residual connection - this is the block's output.
         h.add(&ffn_out)
@@ -529,6 +600,9 @@ impl Model {
             q_len,
             self.config.hidden_dim as usize,
         ))?;
+        if let Some(scale) = self.config.embedding_scale {
+            x = x.affine(scale as f64, 0.0)?;
+        }
 
         let ctx = StepCtx::new(&self.config, items, device)?;
         // Run through every layer in sequence, each one refining x a bit more.
@@ -717,7 +791,7 @@ mod tests {
         )
         .unwrap();
 
-        let mask = batch_mask(&[0], &[2], 2, 2, &device).unwrap();
+        let mask = batch_mask(&[0], &[2], 2, 2, None, &device).unwrap();
         let out = flat(&gqa_attention(&q, &k, &v, &mask).unwrap());
 
         // Causal mask means position0 can only attend to position0, so its
@@ -774,7 +848,7 @@ mod tests {
         let q = Tensor::randn(0f32, 1., (batch, n_heads, q_len, head_dim), &device).unwrap();
         let k = Tensor::randn(0f32, 1., (batch, n_kv_heads, ctx_len, head_dim), &device).unwrap();
         let v = Tensor::randn(0f32, 1., (batch, n_kv_heads, ctx_len, head_dim), &device).unwrap();
-        let mask = batch_mask(&[3, 1], &[5, 3], q_len, ctx_len, &device).unwrap();
+        let mask = batch_mask(&[3, 1], &[5, 3], q_len, ctx_len, None, &device).unwrap();
 
         let out = gqa_attention(&q, &k, &v, &mask).unwrap();
         assert_eq!(out.dims(), &[batch, n_heads, q_len, head_dim]);
@@ -808,6 +882,7 @@ mod tests {
             attn_norm: ones(),
             attn: Attention {
                 kv_index: 0,
+                local: false,
                 q: rand((n_heads * head_dim, hidden_dim)),
                 k: rand((n_kv_heads * head_dim, hidden_dim)),
                 v: rand((n_kv_heads * head_dim, hidden_dim)),
@@ -818,12 +893,14 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
             },
+            post_attn_norm: None,
             ffn_norm: ones(),
             ffn: Ffn {
                 gate: rand((ffn_dim, hidden_dim)),
                 up: rand((ffn_dim, hidden_dim)),
                 down: rand((hidden_dim, ffn_dim)),
             },
+            post_ffn_norm: None,
         };
         Model {
             config: Config {
@@ -946,6 +1023,101 @@ mod tests {
         scale_qk(&mut model);
         for (got, want) in run(&model).iter().zip(&before) {
             assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn gelu_ffn_identity_weights() {
+        let device = Device::Cpu;
+        // As `swiglu_ffn_identity_weights`, through GELU's tanh approximation
+        // (torch's gelu(approximate="tanh")): gelu([1, 2]) * up([1, 2]).
+        let identity = Tensor::new(&[[1f32, 0.], [0., 1.]], &device).unwrap();
+        let ffn = Ffn {
+            gate: identity.clone(),
+            up: identity.clone(),
+            down: identity,
+        };
+        let x = Tensor::new(&[[1f32, 2.]], &device).unwrap();
+        let out = flat(&ffn.forward(&x, Activation::GeluTanh).unwrap());
+        let expected = [0.841192f32, 3.909195];
+        for (got, want) in out.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn batch_mask_limits_attention_to_the_window() {
+        // Four queries from position 0 over four keys, window 2: each query
+        // sees itself and the position before it.
+        let mask = flat(&batch_mask(&[0], &[4], 4, 4, Some(2), &Device::Cpu).unwrap());
+        let x = f32::NEG_INFINITY;
+        let rows = [
+            [0., x, x, x],
+            [0., 0., x, x],
+            [x, 0., 0., x],
+            [x, x, 0., 0.],
+        ];
+        assert_eq!(mask, rows.concat());
+    }
+
+    // Logits after `tokens`, run from position 0 on a fresh cache.
+    fn last_logits(model: &Model, tokens: &[u32]) -> Vec<f32> {
+        let mut kv = KvStorage::new(1, 1, 4, 1, 2, &Device::Cpu).unwrap();
+        let blocks = [BlockID(0)];
+        let mut writes = Vec::new();
+        let items = [item(tokens, 0, &blocks, 4, &mut writes)];
+        flat(&model.forward_last(&items, &mut kv).unwrap())
+    }
+
+    #[test]
+    fn local_layer_sees_only_its_window() {
+        let mut model = tiny_model();
+        model.config.local_attention = Some(LocalAttention {
+            window: 1,
+            rope_theta: 10000.0,
+        });
+        // A global layer mixes in the earlier token...
+        let alone = last_logits(&model, &[2]);
+        assert_ne!(last_logits(&model, &[0, 2]), alone);
+        // ...but with a one-position window, a token attends to itself only,
+        // so its output can't depend on what came before.
+        model.layers[0].attn.local = true;
+        for (got, want) in last_logits(&model, &[0, 2]).iter().zip(&alone) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn post_norms_cancel_the_scale_of_attention_and_ffn_outputs() {
+        let scale_outputs = |model: &mut Model| {
+            let layer = &mut model.layers[0];
+            layer.attn.o = layer.attn.o.affine(7.0, 0.0).unwrap();
+            layer.ffn.down = layer.ffn.down.affine(7.0, 0.0).unwrap();
+        };
+        let mut model = tiny_model();
+        let before = last_logits(&model, &[0, 2, 1]);
+        scale_outputs(&mut model);
+        assert_ne!(last_logits(&model, &[0, 2, 1]), before);
+
+        let norm = Tensor::new(&[0.5f32, 2., 1., 3.], &Device::Cpu).unwrap();
+        model.layers[0].post_attn_norm = Some(norm.clone());
+        model.layers[0].post_ffn_norm = Some(norm);
+        let before = last_logits(&model, &[0, 2, 1]);
+        scale_outputs(&mut model);
+        for (got, want) in last_logits(&model, &[0, 2, 1]).iter().zip(&before) {
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn embedding_scale_multiplies_the_embeddings() {
+        let mut model = tiny_model();
+        model.config.embedding_scale = Some(3.0);
+        let scaled = last_logits(&model, &[0, 2]);
+        model.config.embedding_scale = None;
+        model.token_embd = model.token_embd.affine(3.0, 0.0).unwrap();
+        for (got, want) in last_logits(&model, &[0, 2]).iter().zip(&scaled) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
         }
     }
 
