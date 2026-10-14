@@ -57,7 +57,8 @@ cargo run --release -- cli \
 ```
 
 Pass `--chat` to wrap input in the model's chat format (use this with instruct
-models); the conversation history is then kept between questions.
+models); the conversation history is then kept between questions. `--system
+"..."` sets the system prompt, replacing the model's default one.
 
 With `--prompt` the CLI runs the given prompts once and exits. Multiple
 `--prompt`s run concurrently through continuous batching, all sharing one KV
@@ -99,8 +100,8 @@ The picker lists the `.gguf` files under `--models-dir` (default `.`, plus one
 level of subdirectories); each model uses a `tokenizer.json` next to it, else
 `--tokenizer`. `--model` skips the picker and preloads that file. Keys: Enter
 send, Esc stop generating, Ctrl-O switch model, Ctrl-N new conversation,
-PgUp/PgDn scroll, Ctrl-C quit. The sampling, `--chat`, `--max-tokens`,
-`--device` and KV flags apply as in the plain interactive loop;
+PgUp/PgDn scroll, Ctrl-C quit. The sampling, `--chat`, `--system`,
+`--max-tokens`, `--device` and KV flags apply as in the plain interactive loop;
 `--prompt`/`--debug`/`--arrival-step` can't be combined with `--tui`.
 
 ## Server mode

@@ -9,6 +9,8 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+// SmolLM2-Instruct's chat template adds this system message to a conversation
+// that doesn't start with one.
 const SMOLLM2_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
 
 // Terminates each ChatML turn.

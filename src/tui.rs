@@ -33,6 +33,8 @@ pub struct TuiOptions {
     pub num_blocks: Option<usize>,
     pub max_tokens: usize,
     pub chat: bool,
+    // System prompt for chat mode, in place of the model's default one.
+    pub system: Option<String>,
     pub sampling: SamplingParams,
     // Used for models with no `tokenizer.json` next to them.
     pub fallback_tokenizer: PathBuf,
@@ -191,10 +193,21 @@ fn session(
     );
     let _ = ctx.tx.send(Event::Ready { name, context });
 
-    let mut history: Vec<ChatMessage> = Vec::new();
+    // Every chat, including one started with Ctrl-N, opens with the system
+    // prompt, if one was given.
+    let opening = || -> Vec<ChatMessage> {
+        opts.system
+            .iter()
+            .map(|system| ChatMessage {
+                role: "system".into(),
+                content: system.clone(),
+            })
+            .collect()
+    };
+    let mut history = opening();
     loop {
         match rx.recv() {
-            Ok(Cmd::NewChat) => history.clear(),
+            Ok(Cmd::NewChat) => history = opening(),
             Ok(load @ Cmd::Load { .. }) => return Ok(Some(load)),
             Ok(Cmd::Send(line, settings)) => {
                 if let Err(e) = generate(

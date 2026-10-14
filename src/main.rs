@@ -63,6 +63,9 @@ struct CliArgs {
     // interactive loop the conversation history is kept between questions.
     #[arg(long)]
     chat: bool,
+    // System prompt for `--chat`, in place of the model's default one.
+    #[arg(long, requires = "chat")]
+    system: Option<String>,
     // One entry per `--prompt`, in the same order: the decode step at which
     // that request "arrives" (becomes eligible to be admitted). Requests
     // without a matching entry arrive at step 0. Simulates staggered arrival
@@ -142,6 +145,17 @@ fn blocks_for(tokens: usize, block_size: usize) -> usize {
     tokens.div_ceil(block_size).max(1)
 }
 
+// The messages a chat starts with: the `--system` prompt, if given.
+fn opening_messages(args: &CliArgs) -> Vec<ChatMessage> {
+    args.system
+        .iter()
+        .map(|system| ChatMessage {
+            role: "system".into(),
+            content: system.clone(),
+        })
+        .collect()
+}
+
 fn tokenizer_path(args: &ModelArgs, model: &str) -> String {
     match &args.tokenizer {
         Some(path) => path.clone(),
@@ -166,6 +180,7 @@ fn run_cli(args: CliArgs) -> Result<(), BoxError> {
             num_blocks: args.model.num_blocks,
             max_tokens: args.max_tokens.unwrap_or(256),
             chat: args.chat,
+            system: args.system,
             sampling,
             fallback_tokenizer: args
                 .model
@@ -213,10 +228,14 @@ fn one_shot(
         .enumerate()
         .map(|(i, prompt)| {
             let text = match chat {
-                Some(format) => format.render(&[ChatMessage {
-                    role: "user".into(),
-                    content: prompt.clone(),
-                }]),
+                Some(format) => {
+                    let mut messages = opening_messages(args);
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: prompt.clone(),
+                    });
+                    format.render(&messages)
+                }
                 None => prompt.clone(),
             };
             Ok(RequestSpec {
@@ -316,7 +335,7 @@ fn interactive(
         },
     );
     eprintln!("Type a question and press Enter. Ctrl-D or `exit` to quit.");
-    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut history = opening_messages(args);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     loop {
