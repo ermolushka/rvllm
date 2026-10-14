@@ -9,7 +9,7 @@ use cudarc::driver::CudaSlice;
 use half::f16;
 use kv_cache_scheduler::block_pool::BlockID;
 
-use crate::model::{Activation, BatchItem, Config, Model};
+use crate::model::{Activation, BatchItem, Config, Mixer, Model};
 
 use super::context::CudaRuntime;
 use super::cublas_ops;
@@ -509,13 +509,22 @@ pub struct CudaModel {
 
 // What `model` needs that these kernels don't implement yet, if anything.
 pub(crate) fn unsupported(model: &Model) -> Option<&'static str> {
+    if model.config.conv.is_some() {
+        return Some("short-convolution layers");
+    }
     if model.config.rope_factors.is_some() {
         return Some("Llama 3 RoPE scaling");
     }
-    if model.layers.iter().any(|l| l.attn.q_bias.is_some()) {
+    let attention = || {
+        model.layers.iter().filter_map(|l| match &l.mixer {
+            Mixer::Attention(attn) => Some(attn),
+            Mixer::ShortConv(_) => None,
+        })
+    };
+    if attention().any(|attn| attn.q_bias.is_some()) {
         return Some("attention biases");
     }
-    if model.layers.iter().any(|l| l.attn.q_norm.is_some()) {
+    if attention().any(|attn| attn.q_norm.is_some()) {
         return Some("Q/K normalization");
     }
     if model.config.local_attention.is_some() {
@@ -655,6 +664,7 @@ impl CudaModel {
 mod tests {
     use super::*;
     use candle_core::{DType, Device, Tensor};
+    use kv_cache_scheduler::sequence::SequenceId;
 
     use crate::kv_storage::KvStorage;
     use crate::model::{Attention, Ffn, Layer};
@@ -671,11 +681,29 @@ mod tests {
         assert_eq!(unsupported(&model), Some("Llama 3 RoPE scaling"));
     }
 
+    // The tiny model's only layer's attention.
+    fn attention(model: &mut Model) -> &mut Attention {
+        match &mut model.layers[0].mixer {
+            Mixer::Attention(attn) => attn,
+            Mixer::ShortConv(_) => unreachable!("the tiny model's layer is attention"),
+        }
+    }
+
     #[test]
     fn qk_norm_is_unsupported() {
         let mut model = tiny_model();
-        model.layers[0].attn.q_norm = Some(Tensor::ones(2, DType::F32, &Device::Cpu).unwrap());
+        attention(&mut model).q_norm = Some(Tensor::ones(2, DType::F32, &Device::Cpu).unwrap());
         assert_eq!(unsupported(&model), Some("Q/K normalization"));
+    }
+
+    #[test]
+    fn short_conv_is_unsupported() {
+        let mut model = tiny_model();
+        model.config.conv = Some(crate::model::ConvLayers {
+            layers: vec![0],
+            kernel: 3,
+        });
+        assert_eq!(unsupported(&model), Some("short-convolution layers"));
     }
 
     #[test]
@@ -702,7 +730,7 @@ mod tests {
     #[test]
     fn attention_biases_are_unsupported() {
         let mut model = tiny_model();
-        model.layers[0].attn.q_bias = Some(Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap());
+        attention(&mut model).q_bias = Some(Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap());
         assert_eq!(unsupported(&model), Some("attention biases"));
     }
 
@@ -720,7 +748,7 @@ mod tests {
         let token_embd = rand((vocab_size, hidden_dim));
         let layer = Layer {
             attn_norm: ones(),
-            attn: Attention {
+            mixer: Mixer::Attention(Attention {
                 kv_index: 0,
                 local: false,
                 q: rand((n_heads * head_dim, hidden_dim)),
@@ -732,7 +760,7 @@ mod tests {
                 v_bias: None,
                 q_norm: None,
                 k_norm: None,
-            },
+            }),
             post_attn_norm: None,
             ffn_norm: ones(),
             ffn: Ffn {
@@ -771,6 +799,7 @@ mod tests {
             .map(|p| (blocks[p / block_size], p % block_size))
             .collect();
         BatchItem {
+            seq_id: SequenceId(0),
             tokens,
             write_positions: writes,
             read_blocks: blocks,

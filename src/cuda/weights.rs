@@ -10,7 +10,7 @@ use candle_core::Tensor;
 use cudarc::driver::CudaSlice;
 use half::f16;
 
-use crate::model::Model;
+use crate::model::{Mixer, Model};
 
 use super::context::CudaRuntime;
 
@@ -60,12 +60,15 @@ impl CudaWeights {
             .layers
             .iter()
             .map(|l| -> Result<CudaLayer, Box<dyn std::error::Error>> {
+                let Mixer::Attention(attn) = &l.mixer else {
+                    return Err("short-convolution layers aren't supported on CUDA".into());
+                };
                 Ok(CudaLayer {
                     attn_norm: upload(cuda_runtime, &l.attn_norm)?,
-                    attn_q: upload_f16(cuda_runtime, &l.attn.q)?,
-                    attn_k: upload_f16(cuda_runtime, &l.attn.k)?,
-                    attn_v: upload_f16(cuda_runtime, &l.attn.v)?,
-                    attn_output: upload_f16(cuda_runtime, &l.attn.o)?,
+                    attn_q: upload_f16(cuda_runtime, &attn.q)?,
+                    attn_k: upload_f16(cuda_runtime, &attn.k)?,
+                    attn_v: upload_f16(cuda_runtime, &attn.v)?,
+                    attn_output: upload_f16(cuda_runtime, &attn.o)?,
                     ffn_norm: upload(cuda_runtime, &l.ffn_norm)?,
                     ffn_gate: upload_f16(cuda_runtime, &l.ffn.gate)?,
                     ffn_up: upload_f16(cuda_runtime, &l.ffn.up)?,
@@ -108,7 +111,7 @@ mod tests {
         let token_embd = rand((vocab_size, hidden_dim));
         let layer = Layer {
             attn_norm: ones(),
-            attn: Attention {
+            mixer: Mixer::Attention(Attention {
                 kv_index: 0,
                 local: false,
                 q: rand((n_heads * head_dim, hidden_dim)),
@@ -120,7 +123,7 @@ mod tests {
                 v_bias: None,
                 q_norm: None,
                 k_norm: None,
-            },
+            }),
             post_attn_norm: None,
             ffn_norm: ones(),
             ffn: Ffn {
@@ -158,13 +161,10 @@ mod tests {
         let got = rt.stream.clone_dtoh(&weights.token_embd).unwrap();
         assert_eq!(got, want);
 
-        let want_q: Vec<f32> = model.layers[0]
-            .attn
-            .q
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
+        let Mixer::Attention(attn) = &model.layers[0].mixer else {
+            unreachable!("the tiny model's layer is attention");
+        };
+        let want_q: Vec<f32> = attn.q.flatten_all().unwrap().to_vec1().unwrap();
         let got_q = rt.stream.clone_dtoh(&weights.layers[0].attn_q).unwrap();
         for (g, w) in got_q.iter().zip(want_q.iter()) {
             assert!(

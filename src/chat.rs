@@ -49,6 +49,11 @@ impl ChatFormat {
         default_system: None,
         skip_thinking: true,
     };
+    // Unlike LFM2's template, this keeps an empty system message.
+    pub const LFM2: ChatFormat = ChatFormat::ChatMl {
+        default_system: None,
+        skip_thinking: false,
+    };
 
     // The chat format of `config`'s model, if rvllm knows its family. Within
     // an architecture, the GGUF's tokenizer family tells models apart.
@@ -59,6 +64,7 @@ impl ChatFormat {
             (Arch::Qwen2, Some("qwen2")) => Some(ChatFormat::QWEN2_5),
             (Arch::Qwen3, Some("qwen2")) => Some(ChatFormat::QWEN3),
             (Arch::Gemma3, _) => Some(ChatFormat::Gemma),
+            (Arch::Lfm2, Some("lfm2")) => Some(ChatFormat::LFM2),
             _ => None,
         }
     }
@@ -277,6 +283,27 @@ mod tests {
         );
     }
 
+    // LFM2.5-1.2B-Instruct's own template, rendered as HF does, minus the
+    // leading BOS.
+    #[test]
+    fn lfm2_matches_its_template() {
+        assert_eq!(
+            ChatFormat::LFM2.render(&[
+                msg("system", "be terse"),
+                msg("user", "a"),
+                msg("assistant", "b"),
+                msg("user", "c"),
+            ]),
+            "<|im_start|>system\nbe terse<|im_end|>\n<|im_start|>user\na<|im_end|>\n\
+             <|im_start|>assistant\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        assert_eq!(
+            ChatFormat::LFM2.render(&[msg("user", "hi")]),
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
     #[test]
     fn format_follows_the_tokenizer_family() {
         let format = |arch: Arch, pre: Option<&str>| {
@@ -303,6 +330,7 @@ mod tests {
             format(Arch::Gemma3, Some("default")),
             Some(ChatFormat::Gemma)
         );
+        assert_eq!(format(Arch::Lfm2, Some("lfm2")), Some(ChatFormat::LFM2));
         assert_eq!(format(Arch::Llama, Some("qwen2")), None);
         assert_eq!(format(Arch::Llama, Some("default")), None);
         assert_eq!(format(Arch::Llama, None), None);

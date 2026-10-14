@@ -39,6 +39,10 @@ pub trait Backend {
         last_only: bool,
         samplers: &mut [&mut Sampler],
     ) -> Result<Vec<u32>, BoxError>;
+
+    // Drops whatever the backend keeps for `seq_id` alone (LFM2's short-conv
+    // state), once the sequence finished, was aborted or was preempted.
+    fn release(&mut self, _seq_id: SequenceId) {}
 }
 
 impl<B: Backend + ?Sized> Backend for Box<B> {
@@ -54,6 +58,10 @@ impl<B: Backend + ?Sized> Backend for Box<B> {
     ) -> Result<Vec<u32>, BoxError> {
         (**self).forward_sample(items, last_only, samplers)
     }
+
+    fn release(&mut self, seq_id: SequenceId) {
+        (**self).release(seq_id)
+    }
 }
 
 pub struct CpuBackend<'a> {
@@ -65,7 +73,7 @@ impl<'a> CpuBackend<'a> {
     pub fn new(model: &'a Model, block_size: usize, num_blocks: usize) -> Result<Self, BoxError> {
         let config = &model.config;
         let kv_storage = KvStorage::new(
-            config.n_layers as usize,
+            config.n_attention_layers(),
             num_blocks,
             block_size,
             config.n_kv_heads as usize,
@@ -97,6 +105,10 @@ impl Backend for CpuBackend<'_> {
             next.push(sampler.sample(&logits.get(i)?.get(0)?)?);
         }
         Ok(next)
+    }
+
+    fn release(&mut self, seq_id: SequenceId) {
+        self.kv_storage.release(seq_id);
     }
 }
 
@@ -296,6 +308,7 @@ impl<B: Backend> Engine<B> {
             self.scheduler.finish_sequence(id);
         }
         self.scheduler.sequences.remove(&id);
+        self.backend.release(id);
     }
 
     // One engine iteration: admit + prefill what fits, then one batched
@@ -338,6 +351,7 @@ impl<B: Backend> Engine<B> {
             // Only the tokens past the cached prefix run through the model,
             // but attention reads the sequence's whole block table.
             let item = BatchItem {
+                seq_id,
                 tokens: &tokens[skip_tokens..],
                 write_positions: &write_positions,
                 read_blocks: seq.block_table.blocks(),
@@ -381,6 +395,7 @@ impl<B: Backend> Engine<B> {
         // token was never written back into the list, so fix up the tail.
         for &seq_id in &running {
             if !self.scheduler.running.contains(&seq_id) {
+                self.backend.release(seq_id);
                 let state = &self.seqs[&seq_id];
                 let real_len = state.prompt_len + state.num_generated;
                 let token_ids = &mut self.scheduler.sequences.get_mut(&seq_id).unwrap().token_ids;
@@ -417,6 +432,7 @@ impl<B: Backend> Engine<B> {
                 .map(|row| {
                     let table = &self.scheduler.sequences[&row.seq_id].block_table;
                     BatchItem {
+                        seq_id: row.seq_id,
                         tokens: &row.token,
                         write_positions: &row.write,
                         read_blocks: table.blocks(),
@@ -469,6 +485,7 @@ impl<B: Backend> Engine<B> {
             // long-running server.
             self.scheduler.sequences.remove(&seq_id);
             self.seqs.remove(&seq_id);
+            self.backend.release(seq_id);
         }
         events.push(TokenEvent {
             id: seq_id,
@@ -586,6 +603,8 @@ pub(crate) mod testing {
     pub struct CountingBackend {
         pub config: Config,
         pub max_batch_seen: usize,
+        // Every `release` call, in order.
+        pub released: Vec<SequenceId>,
     }
 
     impl CountingBackend {
@@ -604,6 +623,7 @@ pub(crate) mod testing {
                     ..Config::for_tests()
                 },
                 max_batch_seen: 0,
+                released: Vec::new(),
             }
         }
     }
@@ -625,6 +645,10 @@ pub(crate) mod testing {
                 .iter()
                 .map(|item| (item.tokens.last().unwrap() + 1) % 1000)
                 .collect())
+        }
+
+        fn release(&mut self, seq_id: SequenceId) {
+            self.released.push(seq_id);
         }
     }
 }
@@ -689,6 +713,7 @@ mod tests {
         let events = drain(&mut engine);
         assert_eq!(tokens_of(&events, id), vec![11, 12, 13]);
         assert_eq!(events.last().unwrap().finish, Some(FinishReason::Stop));
+        assert_eq!(engine.backend.released, [id]);
     }
 
     #[test]
@@ -763,6 +788,11 @@ mod tests {
             );
         }
         assert_eq!(engine.scheduler().pool.available(), 6);
+        // Each finished sequence was released, and so was every preempted
+        // one, each time it was preempted.
+        let released = &engine.backend.released;
+        assert!(ids.iter().all(|id| released.contains(id)));
+        assert!(released.len() > ids.len());
     }
 
     #[test]
@@ -774,6 +804,7 @@ mod tests {
         assert_eq!((engine.num_running(), engine.num_waiting()), (1, 1));
         engine.abort(a);
         engine.abort(b);
+        assert_eq!(engine.backend.released, [a, b]);
         assert!(!engine.has_work());
         assert_eq!(engine.scheduler().pool.available(), 16);
         assert!(engine.scheduler().sequences.is_empty());

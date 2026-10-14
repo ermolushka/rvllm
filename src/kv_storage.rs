@@ -1,10 +1,15 @@
 use candle_core::{DType, Device, Result, Tensor};
 use kv_cache_scheduler::block_pool::BlockID;
+use kv_cache_scheduler::sequence::SequenceId;
 
-// [num_blocks, block_size, n_kv_heads, head_dim] per layer.
+use crate::conv_cache::ConvCache;
+
+// [num_blocks, block_size, n_kv_heads, head_dim] per attention layer, plus
+// the state of any short-conv layers.
 pub struct KvStorage {
     kv_k: Vec<Tensor>,
     kv_v: Vec<Tensor>,
+    pub(crate) conv: ConvCache,
 }
 
 // `write_tokens` mutates the cache tensors in place, and `Tensor::clone` only
@@ -20,6 +25,9 @@ impl Clone for KvStorage {
         KvStorage {
             kv_k: deep(&self.kv_k),
             kv_v: deep(&self.kv_v),
+            // Conv rows are replaced, never written in place, so the copies
+            // can share them.
+            conv: self.conv.clone(),
         }
     }
 }
@@ -88,7 +96,16 @@ impl KvStorage {
         let kv_v = (0..n_layers)
             .map(|_| Tensor::zeros(shape, DType::F32, device))
             .collect::<Result<Vec<_>>>()?;
-        Ok(KvStorage { kv_k, kv_v })
+        Ok(KvStorage {
+            kv_k,
+            kv_v,
+            conv: ConvCache::new(block_size),
+        })
+    }
+
+    // Drops what is kept for `seq_id` alone, once the engine is done with it.
+    pub fn release(&mut self, seq_id: SequenceId) {
+        self.conv.release(seq_id);
     }
 
     // Writes `positions.len()` tokens' K/V into `layer`'s cache in place.

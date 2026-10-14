@@ -33,6 +33,7 @@ These models are tested end to end, as Q8_0 GGUF files with their
 | Qwen2.5-0.5B-Instruct | `qwen2` | ChatML | CPU |
 | Qwen3-0.6B | `qwen3` | ChatML, thinking off | CPU |
 | gemma-3-270m-it | `gemma3` | Gemma | CPU |
+| LFM2.5-1.2B-Instruct | `lfm2` | ChatML | CPU |
 
 Base models do plain completions; instruct models also chat, via `--chat` and
 `/v1/chat/completions`, with multi-turn history and stopping at the end of their
@@ -44,8 +45,8 @@ Everything is dequantized to F32 on load (F16 on the GPU), so a model needs
 about 4 bytes of RAM per parameter: roughly 1.5 GB for SmolLM2-360M and 5 GB for
 Llama-3.2-1B. The CUDA backend implements SmolLM2's architecture only;
 `--device cuda` refuses models that need more (such as Llama 3's RoPE scaling,
-Qwen2's attention biases, Qwen3's Q/K normalization or Gemma 3's sliding-window
-attention).
+Qwen2's attention biases, Qwen3's Q/K normalization, Gemma 3's sliding-window
+attention or LFM2's short convolutions).
 
 `--tokenizer` defaults to the `tokenizer.json` next to the model file, then
 `./tokenizer.json`. A tokenizer that gives the model's BOS or EOS token a

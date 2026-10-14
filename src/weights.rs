@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use candle_core::quantized::gguf_file::{self, Value};
 use candle_core::{Device, Result, Tensor};
 
-use crate::model::{Activation, Arch, Attention, Config, Ffn, Layer, LocalAttention, Model};
+use crate::model::{
+    Activation, Arch, Attention, Config, ConvLayers, Ffn, Layer, LocalAttention, Mixer, Model,
+    ShortConv,
+};
 
 // Reads `key` with `get` (e.g. `Value::to_u32`) if present, naming the key if
 // it holds another type.
@@ -32,6 +35,17 @@ fn metadata<'a, T>(
     }
 }
 
+// A count from a GGUF integer array: llama.cpp writes per-layer values as
+// I32, single ones as U32.
+fn count(value: &Value) -> Result<u32> {
+    match value {
+        Value::I32(n) => {
+            u32::try_from(*n).map_err(|_| candle_core::Error::Msg(format!("negative count {n}")))
+        }
+        _ => value.to_u32(),
+    }
+}
+
 // llama.cpp's converter reorders each head's Q/K output rows so that RoPE
 // rotates *adjacent* pairs (row 2j with row 2j+1). This engine's RoPE uses the
 // rotate-half convention (row j with row j + head_dim/2), which is how
@@ -55,8 +69,9 @@ impl Arch {
             "qwen2" => Ok(Arch::Qwen2),
             "qwen3" => Ok(Arch::Qwen3),
             "gemma3" => Ok(Arch::Gemma3),
+            "lfm2" => Ok(Arch::Lfm2),
             _ => candle_core::bail!(
-                "unsupported model architecture {name:?} (supported: llama, qwen2, qwen3, gemma3)"
+                "unsupported model architecture {name:?} (supported: llama, qwen2, qwen3, gemma3, lfm2)"
             ),
         }
     }
@@ -67,7 +82,7 @@ impl Arch {
     fn qk_permuted(self) -> bool {
         match self {
             Arch::Llama => true,
-            Arch::Qwen2 | Arch::Qwen3 | Arch::Gemma3 => false,
+            Arch::Qwen2 | Arch::Qwen3 | Arch::Gemma3 | Arch::Lfm2 => false,
         }
     }
 
@@ -78,7 +93,7 @@ impl Arch {
 
     // Whether each Q and K head is RMS-normalized before RoPE.
     fn qk_norm(self) -> bool {
-        matches!(self, Arch::Qwen3 | Arch::Gemma3)
+        matches!(self, Arch::Qwen3 | Arch::Gemma3 | Arch::Lfm2)
     }
 
     // Whether the attention and FFN outputs are RMS-normalized before the
@@ -95,8 +110,17 @@ impl Arch {
 
     fn activation(self) -> Activation {
         match self {
-            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 => Activation::Silu,
+            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 | Arch::Lfm2 => Activation::Silu,
             Arch::Gemma3 => Activation::GeluTanh,
+        }
+    }
+
+    // The final norm's tensor. LFM2's is named after the embeddings (HF's
+    // `embedding_norm`), though it comes after the last layer.
+    fn output_norm(self) -> &'static str {
+        match self {
+            Arch::Lfm2 => "token_embd_norm.weight",
+            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 | Arch::Gemma3 => "output_norm.weight",
         }
     }
 }
@@ -107,8 +131,37 @@ impl Config {
         let arch = Arch::from_gguf(arch_name)?;
         let key = |name: &str| format!("{arch_name}.{name}");
 
+        let n_layers = metadata(md, &key("block_count"), Value::to_u32)?;
         let n_heads = metadata(md, &key("attention.head_count"), Value::to_u32)?;
-        let n_kv_heads = metadata(md, &key("attention.head_count_kv"), Value::to_u32)?;
+        // LFM2 gives the KV head count per layer, 0 for its short-conv layers.
+        let kv_key = key("attention.head_count_kv");
+        let kv_heads = match md.get(&kv_key) {
+            Some(Value::Array(per_layer)) => per_layer
+                .iter()
+                .map(count)
+                .collect::<Result<Vec<_>>>()
+                .map_err(|e| e.context(format!("GGUF metadata key {kv_key:?}")))?,
+            _ => vec![metadata(md, &kv_key, Value::to_u32)?; n_layers as usize],
+        };
+        if kv_heads.len() != n_layers as usize {
+            candle_core::bail!(
+                "{kv_key:?} has {} entries for {n_layers} layers",
+                kv_heads.len()
+            )
+        }
+        let conv_layers: Vec<usize> = match arch {
+            Arch::Lfm2 => (0..kv_heads.len()).filter(|&i| kv_heads[i] == 0).collect(),
+            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 | Arch::Gemma3 => Vec::new(),
+        };
+        let mut attention_kv_heads = (0..kv_heads.len())
+            .filter(|i| !conv_layers.contains(i))
+            .map(|i| kv_heads[i]);
+        let Some(n_kv_heads) = attention_kv_heads.next() else {
+            candle_core::bail!("no attention layers")
+        };
+        if attention_kv_heads.any(|n| n != n_kv_heads) {
+            candle_core::bail!("attention layers with different KV head counts aren't supported")
+        }
         // Grouped-query attention shares each KV head with a whole group of
         // query heads.
         if n_heads == 0 || n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
@@ -141,6 +194,19 @@ impl Config {
                         Some("llama-bpe" | "llama3" | "llama-v3")
                     ),
             );
+        let conv = if conv_layers.is_empty() {
+            None
+        } else {
+            let kernel = metadata(md, &key("shortconv.l_cache"), Value::to_u32)?;
+            if kernel == 0 {
+                candle_core::bail!("invalid short-conv kernel size 0")
+            }
+            Some(ConvLayers {
+                layers: conv_layers,
+                kernel: kernel as usize,
+            })
+        };
+
         // Gemma 3's local layers; llama.cpp defaults their RoPE base to 10000.
         let local_attention = match arch {
             Arch::Gemma3 => {
@@ -154,7 +220,7 @@ impl Config {
                         .unwrap_or(10000.0),
                 })
             }
-            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 => None,
+            Arch::Llama | Arch::Qwen2 | Arch::Qwen3 | Arch::Lfm2 => None,
         };
 
         let eos_token_id = metadata(md, "tokenizer.ggml.eos_token_id", Value::to_u32)?;
@@ -169,7 +235,7 @@ impl Config {
 
         Ok(Config {
             arch,
-            n_layers: metadata(md, &key("block_count"), Value::to_u32)?,
+            n_layers,
             n_heads,
             n_kv_heads,
             hidden_dim,
@@ -178,6 +244,7 @@ impl Config {
             rope_theta: metadata(md, &key("rope.freq_base"), Value::to_f32)?,
             rope_factors: None,
             local_attention,
+            conv,
             rms_eps: metadata(md, &key("attention.layer_norm_rms_epsilon"), Value::to_f32)?,
             vocab_size,
             context_length: metadata(md, &key("context_length"), Value::to_u32)?,
@@ -227,7 +294,7 @@ impl Model {
         let kv_dim = config.n_kv_heads as usize * config.head_dim();
 
         let token_embd = load("token_embd.weight", &[vocab_size, hidden_dim])?;
-        let output_norm = load("output_norm.weight", &[hidden_dim])?;
+        let output_norm = load(config.arch.output_norm(), &[hidden_dim])?;
         // Models that tie their input and output embeddings ship no separate
         // output matrix; sharing the tensor avoids a second full copy.
         let output = if content.tensor_infos.contains_key("output.weight") {
@@ -241,43 +308,69 @@ impl Model {
             config.rope_factors = Some(factors.to_vec1()?);
         }
 
+        let conv_layers = config
+            .conv
+            .as_ref()
+            .map_or(&[][..], |conv| &conv.layers[..]);
+        let kernel = config.conv.as_ref().map_or(0, |conv| conv.kernel);
         let layers = (0..config.n_layers as usize)
             .map(|i| {
-                let mut q = load(&format!("blk.{i}.attn_q.weight"), &[q_dim, hidden_dim])?;
-                let mut k = load(&format!("blk.{i}.attn_k.weight"), &[kv_dim, hidden_dim])?;
-                if config.arch.qk_permuted() {
-                    q = unpermute_rope_rows(&q, config.n_heads as usize)?;
-                    k = unpermute_rope_rows(&k, config.n_kv_heads as usize)?;
-                }
-                let bias = config.arch.qkv_bias();
-                let qk_norm = config.arch.qk_norm();
-                let head_dim = config.head_dim();
+                let mixer = match conv_layers.iter().position(|&layer| layer == i) {
+                    Some(conv_index) => Mixer::ShortConv(ShortConv {
+                        conv_index,
+                        in_proj: load(
+                            &format!("blk.{i}.shortconv.in_proj.weight"),
+                            &[3 * hidden_dim, hidden_dim],
+                        )?,
+                        conv: load(
+                            &format!("blk.{i}.shortconv.conv.weight"),
+                            &[hidden_dim, kernel],
+                        )?,
+                        out_proj: load(
+                            &format!("blk.{i}.shortconv.out_proj.weight"),
+                            &[hidden_dim, hidden_dim],
+                        )?,
+                    }),
+                    None => {
+                        let mut q = load(&format!("blk.{i}.attn_q.weight"), &[q_dim, hidden_dim])?;
+                        let mut k = load(&format!("blk.{i}.attn_k.weight"), &[kv_dim, hidden_dim])?;
+                        if config.arch.qk_permuted() {
+                            q = unpermute_rope_rows(&q, config.n_heads as usize)?;
+                            k = unpermute_rope_rows(&k, config.n_kv_heads as usize)?;
+                        }
+                        let bias = config.arch.qkv_bias();
+                        let qk_norm = config.arch.qk_norm();
+                        let head_dim = config.head_dim();
+                        Mixer::Attention(Attention {
+                            // Only attention layers have KV slots.
+                            kv_index: i - conv_layers.iter().filter(|&&layer| layer < i).count(),
+                            local: config.arch.local_layer(i),
+                            q,
+                            k,
+                            v: load(&format!("blk.{i}.attn_v.weight"), &[kv_dim, hidden_dim])?,
+                            o: load(&format!("blk.{i}.attn_output.weight"), &[hidden_dim, q_dim])?,
+                            q_bias: bias
+                                .then(|| load(&format!("blk.{i}.attn_q.bias"), &[q_dim]))
+                                .transpose()?,
+                            k_bias: bias
+                                .then(|| load(&format!("blk.{i}.attn_k.bias"), &[kv_dim]))
+                                .transpose()?,
+                            v_bias: bias
+                                .then(|| load(&format!("blk.{i}.attn_v.bias"), &[kv_dim]))
+                                .transpose()?,
+                            q_norm: qk_norm
+                                .then(|| load(&format!("blk.{i}.attn_q_norm.weight"), &[head_dim]))
+                                .transpose()?,
+                            k_norm: qk_norm
+                                .then(|| load(&format!("blk.{i}.attn_k_norm.weight"), &[head_dim]))
+                                .transpose()?,
+                        })
+                    }
+                };
                 let post_norms = config.arch.post_norms();
                 Ok(Layer {
                     attn_norm: load(&format!("blk.{i}.attn_norm.weight"), &[hidden_dim])?,
-                    attn: Attention {
-                        kv_index: i,
-                        local: config.arch.local_layer(i),
-                        q,
-                        k,
-                        v: load(&format!("blk.{i}.attn_v.weight"), &[kv_dim, hidden_dim])?,
-                        o: load(&format!("blk.{i}.attn_output.weight"), &[hidden_dim, q_dim])?,
-                        q_bias: bias
-                            .then(|| load(&format!("blk.{i}.attn_q.bias"), &[q_dim]))
-                            .transpose()?,
-                        k_bias: bias
-                            .then(|| load(&format!("blk.{i}.attn_k.bias"), &[kv_dim]))
-                            .transpose()?,
-                        v_bias: bias
-                            .then(|| load(&format!("blk.{i}.attn_v.bias"), &[kv_dim]))
-                            .transpose()?,
-                        q_norm: qk_norm
-                            .then(|| load(&format!("blk.{i}.attn_q_norm.weight"), &[head_dim]))
-                            .transpose()?,
-                        k_norm: qk_norm
-                            .then(|| load(&format!("blk.{i}.attn_k_norm.weight"), &[head_dim]))
-                            .transpose()?,
-                    },
+                    mixer,
                     post_attn_norm: post_norms
                         .then(|| {
                             load(
@@ -532,6 +625,14 @@ mod tests {
             .collect()
     }
 
+    // Layer `i`'s attention.
+    fn attention(model: &Model, i: usize) -> &Attention {
+        match &model.layers[i].mixer {
+            Mixer::Attention(attn) => attn,
+            Mixer::ShortConv(_) => panic!("layer {i} is a short-conv layer"),
+        }
+    }
+
     // Writes `md` and `tensors` (stored as F32) to a temporary GGUF file and
     // runs `Model::load` on it.
     fn load_gguf(
@@ -587,9 +688,10 @@ mod tests {
         )?;
         assert_eq!((model.config.vocab_size, model.config.head_dim), (5, 4));
         let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
-        assert_eq!(values(&model.layers[0].attn.q)?, values(&q)?);
-        assert_eq!(values(&model.layers[0].attn.k)?, values(&k)?);
-        assert!(model.layers[0].attn.q_bias.is_none());
+        let attn = attention(&model, 0);
+        assert_eq!(values(&attn.q)?, values(&q)?);
+        assert_eq!(values(&attn.k)?, values(&k)?);
+        assert!(attn.q_bias.is_none());
         Ok(())
     }
 
@@ -615,7 +717,7 @@ mod tests {
         let model = load_gguf("qwen2", &md, &tensors)?;
         assert_eq!(model.config.arch, Arch::Qwen2);
         let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
-        let attn = &model.layers[0].attn;
+        let attn = attention(&model, 0);
         assert_eq!(values(&attn.q)?, values(&q)?);
         assert_eq!(values(&attn.k)?, values(&k)?);
         for (got, want) in [
@@ -665,7 +767,7 @@ mod tests {
         let model = load_gguf("qwen3", &md, &tensors)?;
         assert_eq!(model.config.arch, Arch::Qwen3);
         let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
-        let attn = &model.layers[0].attn;
+        let attn = attention(&model, 0);
         assert_eq!(values(&attn.q)?, values(&q)?);
         assert_eq!(values(attn.q_norm.as_ref().unwrap())?, values(&q_norm)?);
         assert_eq!(values(attn.k_norm.as_ref().unwrap())?, values(&k_norm)?);
@@ -750,8 +852,8 @@ mod tests {
         let model = load_gguf("gemma3", &md, &tensors)?;
         let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
         let layer = &model.layers[0];
-        assert!(layer.attn.local);
-        assert!(layer.attn.q_norm.is_some());
+        assert!(attention(&model, 0).local);
+        assert!(attention(&model, 0).q_norm.is_some());
         assert_eq!(
             values(layer.post_attn_norm.as_ref().unwrap())?,
             values(&post_attn)?
@@ -760,6 +862,108 @@ mod tests {
             values(layer.post_ffn_norm.as_ref().unwrap())?,
             values(&post_ffn)?
         );
+        Ok(())
+    }
+
+    // Two LFM2 layers: a short convolution, then attention with one KV head.
+    fn tiny_lfm2_metadata() -> HashMap<String, Value> {
+        let mut md = tiny_metadata("lfm2");
+        md.insert("lfm2.block_count".into(), Value::U32(2));
+        md.insert(
+            "lfm2.attention.head_count_kv".into(),
+            Value::Array(vec![Value::I32(0), Value::I32(1)]),
+        );
+        md.insert("lfm2.shortconv.l_cache".into(), Value::U32(3));
+        md
+    }
+
+    #[test]
+    fn config_from_lfm2_metadata() -> Result<()> {
+        let config = Config::from_gguf_metadata(&tiny_lfm2_metadata(), 5)?;
+        assert_eq!(config.arch, Arch::Lfm2);
+        assert_eq!(config.n_kv_heads, 1);
+        let conv = ConvLayers {
+            layers: vec![0],
+            kernel: 3,
+        };
+        assert_eq!(config.conv, Some(conv));
+        assert_eq!(config.n_attention_layers(), 1);
+
+        // (per-layer KV head counts, text the error must contain)
+        let cases = [
+            (vec![0, 0], "no attention layers"),
+            (vec![2, 1], "different KV head counts"),
+            (vec![0], "has 1 entries for 2 layers"),
+            (vec![0, -1], "negative count"),
+        ];
+        for (per_layer, expected) in cases {
+            let mut md = tiny_lfm2_metadata();
+            let per_layer = per_layer.into_iter().map(Value::I32).collect();
+            md.insert(
+                "lfm2.attention.head_count_kv".into(),
+                Value::Array(per_layer),
+            );
+            let err = Config::from_gguf_metadata(&md, 5).unwrap_err().to_string();
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        let mut md = tiny_lfm2_metadata();
+        md.remove("lfm2.shortconv.l_cache");
+        let err = Config::from_gguf_metadata(&md, 5).unwrap_err().to_string();
+        assert!(err.contains("lfm2.shortconv.l_cache"), "{err}");
+
+        // Only LFM2 has short-conv layers; elsewhere 0 KV heads is invalid.
+        let mut md = tiny_llama_metadata();
+        md.insert(
+            "llama.attention.head_count_kv".into(),
+            Value::Array(vec![Value::I32(0)]),
+        );
+        let err = Config::from_gguf_metadata(&md, 5).unwrap_err().to_string();
+        assert!(err.contains("head counts"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn load_lfm2_layers() -> Result<()> {
+        let norm = Tensor::ones(8, DType::F32, &Device::Cpu)?;
+        let head_norm = Tensor::ones(4, DType::F32, &Device::Cpu)?;
+        let final_norm = Tensor::arange(0f32, 8., &Device::Cpu)?;
+        let conv = Tensor::arange(0f32, 24., &Device::Cpu)?.reshape((8, 3))?;
+        let q = rows(8, 8)?;
+        let tensors = [
+            ("token_embd.weight", rows(5, 8)?),
+            ("token_embd_norm.weight", final_norm.clone()),
+            ("blk.0.attn_norm.weight", norm.clone()),
+            ("blk.0.shortconv.in_proj.weight", rows(24, 8)?),
+            ("blk.0.shortconv.conv.weight", conv.clone()),
+            ("blk.0.shortconv.out_proj.weight", rows(8, 8)?),
+            ("blk.0.ffn_norm.weight", norm.clone()),
+            ("blk.0.ffn_gate.weight", rows(8, 8)?),
+            ("blk.0.ffn_up.weight", rows(8, 8)?),
+            ("blk.0.ffn_down.weight", rows(8, 8)?),
+            ("blk.1.attn_norm.weight", norm.clone()),
+            ("blk.1.attn_q.weight", q.clone()),
+            ("blk.1.attn_k.weight", rows(4, 8)?),
+            ("blk.1.attn_v.weight", rows(4, 8)?),
+            ("blk.1.attn_output.weight", rows(8, 8)?),
+            ("blk.1.attn_q_norm.weight", head_norm.clone()),
+            ("blk.1.attn_k_norm.weight", head_norm),
+            ("blk.1.ffn_norm.weight", norm),
+            ("blk.1.ffn_gate.weight", rows(8, 8)?),
+            ("blk.1.ffn_up.weight", rows(8, 8)?),
+            ("blk.1.ffn_down.weight", rows(8, 8)?),
+        ];
+        let model = load_gguf("lfm2", &tiny_lfm2_metadata(), &tensors)?;
+        let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
+        assert_eq!(values(&model.output_norm)?, values(&final_norm)?);
+        let Mixer::ShortConv(short_conv) = &model.layers[0].mixer else {
+            panic!("layer 0 isn't a short-conv layer");
+        };
+        assert_eq!(short_conv.conv_index, 0);
+        assert_eq!(values(&short_conv.conv)?, values(&conv)?);
+        // The first attention layer takes the first KV slot.
+        let attn = attention(&model, 1);
+        assert_eq!(attn.kv_index, 0);
+        assert_eq!(values(&attn.q)?, values(&q)?);
         Ok(())
     }
 
