@@ -114,6 +114,9 @@ mod tests {
                 k: rand((n_kv_heads * head_dim, hidden_dim)),
                 v: rand((n_kv_heads * head_dim, hidden_dim)),
                 o: rand((hidden_dim, n_heads * head_dim)),
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
             },
             ffn_norm: ones(),
             ffn: Ffn {

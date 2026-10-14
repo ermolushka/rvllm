@@ -52,7 +52,10 @@ impl Arch {
     fn from_gguf(name: &str) -> Result<Arch> {
         match name {
             "llama" => Ok(Arch::Llama),
-            _ => candle_core::bail!("unsupported model architecture {name:?} (supported: llama)"),
+            "qwen2" => Ok(Arch::Qwen2),
+            _ => candle_core::bail!(
+                "unsupported model architecture {name:?} (supported: llama, qwen2)"
+            ),
         }
     }
 
@@ -62,7 +65,13 @@ impl Arch {
     fn qk_permuted(self) -> bool {
         match self {
             Arch::Llama => true,
+            Arch::Qwen2 => false,
         }
+    }
+
+    // Whether the Q/K/V projections have biases.
+    fn qkv_bias(self) -> bool {
+        matches!(self, Arch::Qwen2)
     }
 }
 
@@ -195,6 +204,7 @@ impl Model {
                     q = unpermute_rope_rows(&q, config.n_heads as usize)?;
                     k = unpermute_rope_rows(&k, config.n_kv_heads as usize)?;
                 }
+                let bias = config.arch.qkv_bias();
                 Ok(Layer {
                     attn_norm: load(&format!("blk.{i}.attn_norm.weight"), &[hidden_dim])?,
                     attn: Attention {
@@ -203,6 +213,15 @@ impl Model {
                         k,
                         v: load(&format!("blk.{i}.attn_v.weight"), &[kv_dim, hidden_dim])?,
                         o: load(&format!("blk.{i}.attn_output.weight"), &[hidden_dim, q_dim])?,
+                        q_bias: bias
+                            .then(|| load(&format!("blk.{i}.attn_q.bias"), &[q_dim]))
+                            .transpose()?,
+                        k_bias: bias
+                            .then(|| load(&format!("blk.{i}.attn_k.bias"), &[kv_dim]))
+                            .transpose()?,
+                        v_bias: bias
+                            .then(|| load(&format!("blk.{i}.attn_v.bias"), &[kv_dim]))
+                            .transpose()?,
                     },
                     ffn_norm: load(&format!("blk.{i}.ffn_norm.weight"), &[hidden_dim])?,
                     ffn: Ffn {
@@ -434,6 +453,19 @@ mod tests {
         md
     }
 
+    // `tiny_llama_metadata` for another architecture: the same values under
+    // that architecture's key prefix.
+    fn tiny_metadata(arch: &str) -> HashMap<String, Value> {
+        tiny_llama_metadata()
+            .into_iter()
+            .map(|(key, value)| match key.strip_prefix("llama.") {
+                Some(name) => (format!("{arch}.{name}"), value),
+                None => (key, value),
+            })
+            .chain([("general.architecture".into(), Value::String(arch.into()))])
+            .collect()
+    }
+
     // Writes `md` and `tensors` (stored as F32) to a temporary GGUF file and
     // runs `Model::load` on it.
     fn load_gguf(
@@ -485,6 +517,49 @@ mod tests {
         let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
         assert_eq!(values(&model.layers[0].attn.q)?, values(&q)?);
         assert_eq!(values(&model.layers[0].attn.k)?, values(&k)?);
+        assert!(model.layers[0].attn.q_bias.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn load_qwen2_keeps_qk_rows_and_reads_biases() -> Result<()> {
+        let (q, k) = (rows(8, 8)?, rows(4, 8)?);
+        // llama.cpp stores Qwen2's Q/K rows in HF order, unpermuted.
+        let mut tensors = tiny_llama_tensors(&q, &k)?;
+        for (name, tensor) in &mut tensors {
+            match *name {
+                "blk.0.attn_q.weight" => *tensor = q.clone(),
+                "blk.0.attn_k.weight" => *tensor = k.clone(),
+                _ => {}
+            }
+        }
+        let md = tiny_metadata("qwen2");
+        let Err(err) = load_gguf("qwen2-no-bias", &md, &tensors) else {
+            panic!("loaded a qwen2 file without its biases");
+        };
+        assert!(err.to_string().contains("blk.0.attn_q.bias"), "{err}");
+
+        let q_bias = Tensor::arange(0f32, 8., &Device::Cpu)?;
+        let k_bias = Tensor::arange(10f32, 14., &Device::Cpu)?;
+        let v_bias = Tensor::arange(20f32, 24., &Device::Cpu)?;
+        tensors.extend([
+            ("blk.0.attn_q.bias", q_bias.clone()),
+            ("blk.0.attn_k.bias", k_bias.clone()),
+            ("blk.0.attn_v.bias", v_bias.clone()),
+        ]);
+        let model = load_gguf("qwen2", &md, &tensors)?;
+        assert_eq!(model.config.arch, Arch::Qwen2);
+        let values = |t: &Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_vec1() };
+        let attn = &model.layers[0].attn;
+        assert_eq!(values(&attn.q)?, values(&q)?);
+        assert_eq!(values(&attn.k)?, values(&k)?);
+        for (got, want) in [
+            (&attn.q_bias, &q_bias),
+            (&attn.k_bias, &k_bias),
+            (&attn.v_bias, &v_bias),
+        ] {
+            assert_eq!(values(got.as_ref().unwrap())?, values(want)?);
+        }
         Ok(())
     }
 

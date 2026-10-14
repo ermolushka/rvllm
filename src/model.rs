@@ -8,6 +8,7 @@ use crate::kv_storage::{GatherPlan, KvStorage};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Arch {
     Llama,
+    Qwen2,
 }
 
 // Model hyperparameters, read from the GGUF metadata by `Model::load`. The
@@ -90,6 +91,10 @@ pub(crate) struct Attention {
     pub(crate) k: Tensor,
     pub(crate) v: Tensor,
     pub(crate) o: Tensor,
+    // Biases of the Q/K/V projections, for families that have them (Qwen2).
+    pub(crate) q_bias: Option<Tensor>,
+    pub(crate) k_bias: Option<Tensor>,
+    pub(crate) v_bias: Option<Tensor>,
 }
 
 // The SwiGLU FFN's projections (see `swiglu_ffn`).
@@ -211,6 +216,15 @@ pub fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     x.reshape((rows, in_features))?
         .matmul(&weight.t()?)?
         .reshape(out_dims)
+}
+
+// `linear`, plus `bias` ([out_features]) when the projection has one.
+fn linear_bias(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let y = linear(x, weight)?;
+    match bias {
+        Some(bias) => y.broadcast_add(bias),
+        None => Ok(y),
+    }
 }
 
 // SwiGLU FFN: down(silu(gate(x)) * up(x)).
@@ -428,13 +442,13 @@ impl Layer {
         // heads. Then split the projected dim into per-head chunks and move
         // the head axis in front of the sequence axis:
         // [batch, q_len, heads * head_dim] -> [batch, heads, q_len, head_dim].
-        let q = linear(&normed, &self.attn.q)?
+        let q = linear_bias(&normed, &self.attn.q, self.attn.q_bias.as_ref())?
             .reshape((batch, q_len, n_heads, head_dim))?
             .transpose(1, 2)?;
-        let k = linear(&normed, &self.attn.k)?
+        let k = linear_bias(&normed, &self.attn.k, self.attn.k_bias.as_ref())?
             .reshape((batch, q_len, n_kv_heads, head_dim))?
             .transpose(1, 2)?;
-        let v = linear(&normed, &self.attn.v)?
+        let v = linear_bias(&normed, &self.attn.v, self.attn.v_bias.as_ref())?
             .reshape((batch, q_len, n_kv_heads, head_dim))?
             .transpose(1, 2)?;
 
@@ -785,6 +799,9 @@ mod tests {
                 k: rand((n_kv_heads * head_dim, hidden_dim)),
                 v: rand((n_kv_heads * head_dim, hidden_dim)),
                 o: rand((hidden_dim, n_heads * head_dim)),
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
             },
             ffn_norm: ones(),
             ffn: Ffn {
@@ -850,6 +867,38 @@ mod tests {
 
         assert_eq!(out.dims(), &[1, 2, 4]);
         assert_ne!(flat(&out), flat(&x), "block should transform its input");
+    }
+
+    #[test]
+    fn layer_forward_adds_v_bias() {
+        let device = Device::Cpu;
+        let mut model = tiny_model();
+        // With V's weight zeroed, every position's value is the bias, so
+        // attention returns it whatever the scores. An identity output
+        // projection and a zeroed FFN then make the block add exactly
+        // [bias, bias] (one copy per query head) to its input.
+        let attn = &mut model.layers[0].attn;
+        attn.v = Tensor::zeros((2, 4), DType::F32, &device).unwrap();
+        attn.v_bias = Some(Tensor::new(&[0.5f32, -2.], &device).unwrap());
+        attn.o = Tensor::eye(4, DType::F32, &device).unwrap();
+        let ffn = &mut model.layers[0].ffn;
+        ffn.down = Tensor::zeros((4, 4), DType::F32, &device).unwrap();
+
+        let mut kv = KvStorage::new(1, 1, 2, 1, 2, &device).unwrap();
+        let blocks = [BlockID(0)];
+        let mut writes = Vec::new();
+        let items = [item(&[0, 2], 0, &blocks, 2, &mut writes)];
+        let ctx = StepCtx::new(&model.config, &items, &device).unwrap();
+        let x =
+            Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6., 7., 8.], (1, 2, 4), &device).unwrap();
+        let out = model.layers[0]
+            .forward(&x, &model.config, &ctx, &mut kv)
+            .unwrap();
+
+        let want = [1.5f32, 0., 3.5, 2., 5.5, 4., 7.5, 6.];
+        for (got, want) in flat(&out).iter().zip(&want) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
     }
 
     #[test]

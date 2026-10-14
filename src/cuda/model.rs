@@ -512,6 +512,9 @@ pub(crate) fn unsupported(model: &Model) -> Option<&'static str> {
     if model.config.rope_factors.is_some() {
         return Some("Llama 3 RoPE scaling");
     }
+    if model.layers.iter().any(|l| l.attn.q_bias.is_some()) {
+        return Some("attention biases");
+    }
     None
 }
 
@@ -653,6 +656,13 @@ mod tests {
         assert_eq!(unsupported(&model), Some("Llama 3 RoPE scaling"));
     }
 
+    #[test]
+    fn attention_biases_are_unsupported() {
+        let mut model = tiny_model();
+        model.layers[0].attn.q_bias = Some(Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap());
+        assert_eq!(unsupported(&model), Some("attention biases"));
+    }
+
     // Same tiny fake model as model.rs's own `tiny_model` test helper: 1
     // layer, hidden_dim=4, n_heads=2, n_kv_heads=1 (head_dim=2), ffn_dim=4,
     // vocab_size=5.
@@ -673,6 +683,9 @@ mod tests {
                 k: rand((n_kv_heads * head_dim, hidden_dim)),
                 v: rand((n_kv_heads * head_dim, hidden_dim)),
                 o: rand((hidden_dim, n_heads * head_dim)),
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
             },
             ffn_norm: ones(),
             ffn: Ffn {

@@ -13,6 +13,9 @@ pub struct ChatMessage {
 // that doesn't start with one.
 const SMOLLM2_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
 
+// Likewise for Qwen2.5-Instruct.
+const QWEN2_5_SYSTEM: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+
 // Terminates each ChatML turn.
 pub const END_OF_TURN: &str = "<|im_end|>";
 
@@ -31,6 +34,9 @@ impl ChatFormat {
     pub const SMOLLM2: ChatFormat = ChatFormat::ChatMl {
         default_system: Some(SMOLLM2_SYSTEM),
     };
+    pub const QWEN2_5: ChatFormat = ChatFormat::ChatMl {
+        default_system: Some(QWEN2_5_SYSTEM),
+    };
 
     // The chat format of `config`'s model, if rvllm knows its family. Within
     // an architecture, the GGUF's tokenizer family tells models apart.
@@ -38,6 +44,7 @@ impl ChatFormat {
         match (config.arch, config.tokenizer_pre.as_deref()) {
             (Arch::Llama, Some("smollm")) => Some(ChatFormat::SMOLLM2),
             (Arch::Llama, Some("llama-bpe")) => Some(ChatFormat::Llama3),
+            (Arch::Qwen2, Some("qwen2")) => Some(ChatFormat::QWEN2_5),
             _ => None,
         }
     }
@@ -173,18 +180,40 @@ mod tests {
         );
     }
 
+    // Qwen2.5-0.5B-Instruct's own template, rendered as HF does.
+    #[test]
+    fn qwen2_5_matches_its_template() {
+        assert_eq!(
+            ChatFormat::QWEN2_5.render(&[msg("user", "hi")]),
+            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful \
+             assistant.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
     #[test]
     fn format_follows_the_tokenizer_family() {
-        let format = |pre: Option<&str>| {
+        let format = |arch: Arch, pre: Option<&str>| {
             ChatFormat::for_model(&Config {
+                arch,
                 tokenizer_pre: pre.map(Into::into),
                 ..Config::for_tests()
             })
         };
-        assert_eq!(format(Some("smollm")), Some(ChatFormat::SMOLLM2));
-        assert_eq!(format(Some("llama-bpe")), Some(ChatFormat::Llama3));
-        assert_eq!(format(Some("default")), None);
-        assert_eq!(format(None), None);
+        assert_eq!(
+            format(Arch::Llama, Some("smollm")),
+            Some(ChatFormat::SMOLLM2)
+        );
+        assert_eq!(
+            format(Arch::Llama, Some("llama-bpe")),
+            Some(ChatFormat::Llama3)
+        );
+        assert_eq!(
+            format(Arch::Qwen2, Some("qwen2")),
+            Some(ChatFormat::QWEN2_5)
+        );
+        assert_eq!(format(Arch::Llama, Some("qwen2")), None);
+        assert_eq!(format(Arch::Llama, Some("default")), None);
+        assert_eq!(format(Arch::Llama, None), None);
     }
 
     #[test]
