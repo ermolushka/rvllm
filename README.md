@@ -34,8 +34,9 @@ These models are supported, in Q8_0 GGUF form with their `tokenizer.json`:
 - `gemma-3-270m-it` Q8_0 GGUF (`gemma3`): chat in Gemma's turn format.
 - `LFM2.5-1.2B-Instruct` Q8_0 GGUF (`lfm2`): chat in ChatML.
 
-Each is tested end to end, including multi-turn history via `--chat` and
-`/v1/chat/completions` and stopping at the end of the model's turn. `--chat`
+Each is tested end to end on the CPU and on CUDA, including multi-turn history
+via `--chat` and `/v1/chat/completions` and stopping at the end of the model's
+turn. `--chat`
 uses the model's chat format where rvllm knows it and refuses otherwise; plain
 completion works either way. Other models of these architectures may load, but
 aren't tested. Base models aren't chat-tuned, so don't expect sensible answers
@@ -43,10 +44,8 @@ from `--chat` with a base file.
 
 Everything is dequantized to F32 on load (F16 on the GPU), so a model needs
 about 4 bytes of RAM per parameter: roughly 1.5 GB for SmolLM2-360M and 5 GB for
-Llama-3.2-1B. The CUDA backend runs SmolLM2 only; `--device cuda` refuses models
-that need more (such as Llama 3's RoPE scaling, Qwen2's attention biases, Qwen3's
-Q/K normalization, Gemma 3's sliding-window attention or LFM2's short
-convolutions).
+Llama-3.2-1B. The CUDA backend runs every model listed above, with the same
+greedy output as the CPU path (see the CUDA support section).
 
 `--tokenizer` defaults to the `tokenizer.json` next to the model file, then
 `./tokenizer.json`. A tokenizer that gives the model's BOS or EOS token a
@@ -226,13 +225,34 @@ runtime - no separate build step, no `nvcc` needed.
 
 ```
 cargo build --release --features cuda
-cargo test --features cuda          # kernel/model unit tests; each skips
-                                     # instead of failing if no CUDA device
-                                     # is present (e.g. on a Mac)
+cargo test --features cuda          # kernel/model unit tests, CPU vs CUDA
+RVLLM_REQUIRE_CUDA=1 cargo test --features cuda   # fail, not skip, without a GPU
 ```
+
+Without a GPU the CUDA tests skip with a note on stderr, so a plain
+`cargo test --features cuda` can pass without running anything on the GPU. Set
+`RVLLM_REQUIRE_CUDA=1` to make a missing device a failure. CI builds and tests
+only the CPU path.
 
 Builds and runs unchanged on machines without a GPU - the feature is opt-in,
 and the default (CPU/Candle) path is untouched by it.
+
+On WSL2, a stale `libcuda.so.1` elsewhere on the loader path can shadow the
+WSL driver, and then CUDA reports `CUDA_ERROR_NO_DEVICE` even though
+`nvidia-smi` works. Run with `LD_LIBRARY_PATH=/usr/lib/wsl/lib` in that case,
+or remove the stale library.
+
+Which features run on the GPU, and how each was checked:
+
+- Llama 3 RoPE scaling, Qwen2 attention biases, Qwen3 Q/K normalization,
+  Gemma 3 (local sliding-window attention with its own RoPE base, GELU
+  feed-forward, post-attention and post-FFN norms, scaled embeddings) and
+  LFM2's short convolutions, with its conv state kept on the GPU per sequence
+  and per cached block, so prefix-cache hits resume correctly.
+- Each feature is compared with the CPU path by a unit test on a tiny model,
+  including a batched decode and a prefix-cache resume for short convolutions.
+- On RTX 4060 (WSL2), every README model's greedy output matches the CPU
+  path, with the GGUF files checked against their Hugging Face LFS hashes.
 
 Every command (`cli`, `serve`, `bench`) takes `--device cuda` to run through the
 custom-written CUDA inference path (`cuda::model::CudaModel` +
