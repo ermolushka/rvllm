@@ -23,30 +23,30 @@ Features: `server` (axum API), `tui` (ratatui UI), `cli` (default; both plus the
 
 ## Supported models
 
-These models are tested end to end, as Q8_0 GGUF files with their
-`tokenizer.json`:
+These models are supported, in Q8_0 GGUF form with their `tokenizer.json`:
 
-| Model | GGUF architecture | Chat format | Devices |
-|---|---|---|---|
-| SmolLM2-360M, SmolLM2-360M-Instruct | `llama` | ChatML | CPU, CUDA |
-| Llama-3.2-1B-Instruct | `llama` | Llama 3 | CPU |
-| Qwen2.5-0.5B-Instruct | `qwen2` | ChatML | CPU |
-| Qwen3-0.6B | `qwen3` | ChatML, thinking off | CPU |
-| gemma-3-270m-it | `gemma3` | Gemma | CPU |
-| LFM2.5-1.2B-Instruct | `lfm2` | ChatML | CPU |
+- `SmolLM2-360M.Q8_0.gguf` (base, `llama` architecture): plain completions.
+- `SmolLM2-360M-Instruct` Q8_0 GGUF (`llama`): chat in ChatML.
+- `Llama-3.2-1B-Instruct` Q8_0 GGUF (`llama`, with Llama 3's RoPE scaling): chat
+  in Llama 3's header format.
+- `Qwen2.5-0.5B-Instruct` Q8_0 GGUF (`qwen2`): chat in ChatML.
+- `Qwen3-0.6B` Q8_0 GGUF (`qwen3`): chat in ChatML, with thinking off.
+- `gemma-3-270m-it` Q8_0 GGUF (`gemma3`): chat in Gemma's turn format.
+- `LFM2.5-1.2B-Instruct` Q8_0 GGUF (`lfm2`): chat in ChatML.
 
-Base models do plain completions; instruct models also chat, via `--chat` and
-`/v1/chat/completions`, with multi-turn history and stopping at the end of their
-turn. `--chat` uses the model's chat format where rvllm knows it and refuses
-otherwise; plain completion works either way. Other models of these architectures
-may load, but aren't tested.
+Each is tested end to end, including multi-turn history via `--chat` and
+`/v1/chat/completions` and stopping at the end of the model's turn. `--chat`
+uses the model's chat format where rvllm knows it and refuses otherwise; plain
+completion works either way. Other models of these architectures may load, but
+aren't tested. Base models aren't chat-tuned, so don't expect sensible answers
+from `--chat` with a base file.
 
 Everything is dequantized to F32 on load (F16 on the GPU), so a model needs
 about 4 bytes of RAM per parameter: roughly 1.5 GB for SmolLM2-360M and 5 GB for
-Llama-3.2-1B. The CUDA backend implements SmolLM2's architecture only;
-`--device cuda` refuses models that need more (such as Llama 3's RoPE scaling,
-Qwen2's attention biases, Qwen3's Q/K normalization, Gemma 3's sliding-window
-attention or LFM2's short convolutions).
+Llama-3.2-1B. The CUDA backend runs SmolLM2 only; `--device cuda` refuses models
+that need more (such as Llama 3's RoPE scaling, Qwen2's attention biases, Qwen3's
+Q/K normalization, Gemma 3's sliding-window attention or LFM2's short
+convolutions).
 
 `--tokenizer` defaults to the `tokenizer.json` next to the model file, then
 `./tokenizer.json`. A tokenizer that gives the model's BOS or EOS token a
