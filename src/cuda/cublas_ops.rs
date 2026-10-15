@@ -236,7 +236,7 @@ mod tests {
     use super::*;
 
     fn runtime() -> Option<CudaRuntime> {
-        CudaRuntime::new(0).ok()
+        crate::cuda::context::test_runtime()
     }
 
     #[test]

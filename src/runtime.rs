@@ -25,12 +25,6 @@ impl<'m> Runtime<'m> {
             }),
             #[cfg(feature = "cuda")]
             "cuda" => {
-                if let Some(feature) = crate::cuda::model::unsupported(model) {
-                    return Err(format!(
-                        "the CUDA backend doesn't support {feature} yet; use --device cpu"
-                    )
-                    .into());
-                }
                 let runtime = crate::cuda::context::CudaRuntime::new(0)
                     .map_err(|e| format!("CUDA init failed: {e}"))?;
                 let cuda_model = crate::cuda::model::CudaModel::upload(&runtime, model)

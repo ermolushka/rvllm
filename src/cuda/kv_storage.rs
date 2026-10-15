@@ -8,6 +8,7 @@ use cudarc::driver::CudaSlice;
 use kv_cache_scheduler::block_pool::BlockID;
 
 use super::context::CudaRuntime;
+use super::conv_cache::CudaConvCache;
 use super::ops::{kv_gather_wrapper, kv_write_wrapper};
 
 // Built once per forward call (block tables don't change between layers)
@@ -67,6 +68,9 @@ pub struct CudaKvStorage {
     block_size: u32,
     n_kv_heads: u32,
     head_dim: u32,
+    // LFM2's short-conv state, kept alongside the KV cache the way the CPU
+    // KvStorage keeps its ConvCache.
+    pub(crate) conv: CudaConvCache,
 }
 
 impl CudaKvStorage {
@@ -91,6 +95,7 @@ impl CudaKvStorage {
             block_size: block_size as u32,
             n_kv_heads: n_kv_heads as u32,
             head_dim: head_dim as u32,
+            conv: CudaConvCache::new(block_size),
         })
     }
 
@@ -164,7 +169,7 @@ mod tests {
     use super::*;
 
     fn runtime() -> Option<CudaRuntime> {
-        CudaRuntime::new(0).ok()
+        crate::cuda::context::test_runtime()
     }
 
     // Same layout as kv_storage.rs's write_tokens_then_gather_round_trips_across_blocks:

@@ -14,16 +14,49 @@ use crate::model::{Mixer, Model};
 
 use super::context::CudaRuntime;
 
+// An attention layer's weights, the GPU side of model::Attention.
+pub struct CudaAttention {
+    // Index of this layer's slot in the KV cache.
+    pub kv_index: usize,
+    pub local: bool,
+    pub q: CudaSlice<f16>,
+    pub k: CudaSlice<f16>,
+    pub v: CudaSlice<f16>,
+    pub o: CudaSlice<f16>,
+    pub q_bias: Option<CudaSlice<f32>>,
+    pub k_bias: Option<CudaSlice<f32>>,
+    pub v_bias: Option<CudaSlice<f32>>,
+    pub q_norm: Option<CudaSlice<f32>>,
+    pub k_norm: Option<CudaSlice<f32>>,
+}
+
+// A short-convolution layer's weights, the GPU side of model::ShortConv.
+pub struct CudaShortConv {
+    // Index of this layer's state in the conv cache.
+    pub conv_index: usize,
+    // Taps per channel: the conv's kernel size.
+    pub kernel: usize,
+    pub in_proj: CudaSlice<f16>,
+    // [hidden, kernel], one filter per channel, oldest tap first.
+    pub filter: CudaSlice<f32>,
+    pub out_proj: CudaSlice<f16>,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum CudaMixer {
+    Attention(CudaAttention),
+    ShortConv(CudaShortConv),
+}
+
 pub struct CudaLayer {
     pub attn_norm: CudaSlice<f32>,
-    pub attn_q: CudaSlice<f16>,
-    pub attn_k: CudaSlice<f16>,
-    pub attn_v: CudaSlice<f16>,
-    pub attn_output: CudaSlice<f16>,
+    pub mixer: CudaMixer,
+    pub post_attn_norm: Option<CudaSlice<f32>>,
     pub ffn_norm: CudaSlice<f32>,
     pub ffn_gate: CudaSlice<f16>,
     pub ffn_up: CudaSlice<f16>,
     pub ffn_down: CudaSlice<f16>,
+    pub post_ffn_norm: Option<CudaSlice<f32>>,
 }
 
 pub struct CudaWeights {
@@ -50,6 +83,14 @@ fn upload_f16(
     Ok(cuda_runtime.stream.clone_htod(&host)?)
 }
 
+// `upload` for an optional tensor: None stays None.
+fn upload_optional(
+    cuda_runtime: &CudaRuntime,
+    t: Option<&Tensor>,
+) -> Result<Option<CudaSlice<f32>>, Box<dyn std::error::Error>> {
+    t.map(|t| upload(cuda_runtime, t)).transpose()
+}
+
 impl CudaWeights {
     pub fn upload(
         cuda_runtime: &CudaRuntime,
@@ -60,19 +101,37 @@ impl CudaWeights {
             .layers
             .iter()
             .map(|l| -> Result<CudaLayer, Box<dyn std::error::Error>> {
-                let Mixer::Attention(attn) = &l.mixer else {
-                    return Err("short-convolution layers aren't supported on CUDA".into());
+                let mixer = match &l.mixer {
+                    Mixer::Attention(attn) => CudaMixer::Attention(CudaAttention {
+                        kv_index: attn.kv_index,
+                        local: attn.local,
+                        q: upload_f16(cuda_runtime, &attn.q)?,
+                        k: upload_f16(cuda_runtime, &attn.k)?,
+                        v: upload_f16(cuda_runtime, &attn.v)?,
+                        o: upload_f16(cuda_runtime, &attn.o)?,
+                        q_bias: upload_optional(cuda_runtime, attn.q_bias.as_ref())?,
+                        k_bias: upload_optional(cuda_runtime, attn.k_bias.as_ref())?,
+                        v_bias: upload_optional(cuda_runtime, attn.v_bias.as_ref())?,
+                        q_norm: upload_optional(cuda_runtime, attn.q_norm.as_ref())?,
+                        k_norm: upload_optional(cuda_runtime, attn.k_norm.as_ref())?,
+                    }),
+                    Mixer::ShortConv(conv) => CudaMixer::ShortConv(CudaShortConv {
+                        conv_index: conv.conv_index,
+                        kernel: conv.conv.dim(1)?,
+                        in_proj: upload_f16(cuda_runtime, &conv.in_proj)?,
+                        filter: upload(cuda_runtime, &conv.conv)?,
+                        out_proj: upload_f16(cuda_runtime, &conv.out_proj)?,
+                    }),
                 };
                 Ok(CudaLayer {
                     attn_norm: upload(cuda_runtime, &l.attn_norm)?,
-                    attn_q: upload_f16(cuda_runtime, &attn.q)?,
-                    attn_k: upload_f16(cuda_runtime, &attn.k)?,
-                    attn_v: upload_f16(cuda_runtime, &attn.v)?,
-                    attn_output: upload_f16(cuda_runtime, &attn.o)?,
+                    mixer,
+                    post_attn_norm: upload_optional(cuda_runtime, l.post_attn_norm.as_ref())?,
                     ffn_norm: upload(cuda_runtime, &l.ffn_norm)?,
                     ffn_gate: upload_f16(cuda_runtime, &l.ffn.gate)?,
                     ffn_up: upload_f16(cuda_runtime, &l.ffn.up)?,
                     ffn_down: upload_f16(cuda_runtime, &l.ffn.down)?,
+                    post_ffn_norm: upload_optional(cuda_runtime, l.post_ffn_norm.as_ref())?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -94,7 +153,7 @@ mod tests {
     use candle_core::{DType, Device};
 
     fn runtime() -> Option<CudaRuntime> {
-        CudaRuntime::new(0).ok()
+        crate::cuda::context::test_runtime()
     }
 
     // Tiny fake model, same shape convention as model.rs's own `tiny_model`
@@ -165,7 +224,10 @@ mod tests {
             unreachable!("the tiny model's layer is attention");
         };
         let want_q: Vec<f32> = attn.q.flatten_all().unwrap().to_vec1().unwrap();
-        let got_q = rt.stream.clone_dtoh(&weights.layers[0].attn_q).unwrap();
+        let CudaMixer::Attention(cuda_attn) = &weights.layers[0].mixer else {
+            unreachable!("the tiny model's layer is attention");
+        };
+        let got_q = rt.stream.clone_dtoh(&cuda_attn.q).unwrap();
         for (g, w) in got_q.iter().zip(want_q.iter()) {
             assert!(
                 (g.to_f32() - w).abs() < 1e-3,
