@@ -99,12 +99,14 @@ impl ChatFormat {
                     Some((first, rest)) if first.role == "system" => (first.content.trim(), rest),
                     _ => ("", messages),
                 };
-                // The date the template falls back to without a clock; fixed,
-                // so the same conversation always gives the same prompt.
+                // The template also writes "Today Date: <date>" here, and falls
+                // back to a fixed 26 Jul 2024 without a clock. A wrong date is
+                // worse than none, and today's date would make the same
+                // conversation give a different prompt each day, so the line
+                // is left out, as Ollama's Llama 3.2 template does.
                 out.push_str(&format!(
                     "<|start_header_id|>system<|end_header_id|>\n\n\
-                     Cutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n\
-                     {system}<|eot_id|>"
+                     Cutting Knowledge Date: December 2023\n\n{system}<|eot_id|>"
                 ));
                 for m in turns {
                     out.push_str(&format!(
@@ -208,13 +210,14 @@ mod tests {
     }
 
     // Expected strings are Llama-3.2-1B-Instruct's own Jinja template, rendered
-    // as HF's `apply_chat_template` does, minus the leading BOS.
+    // as HF's `apply_chat_template` does, minus the leading BOS and the
+    // "Today Date" line.
     #[test]
     fn llama3_matches_its_template() {
         assert_eq!(
             ChatFormat::Llama3.render(&[msg("user", " hi\n")]),
-            "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\
-             Today Date: 26 Jul 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n\
+            "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\n\
+             <|eot_id|><|start_header_id|>user<|end_header_id|>\n\n\
              hi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
         assert_eq!(
@@ -224,8 +227,8 @@ mod tests {
                 msg("assistant", "b"),
                 msg("user", "c"),
             ]),
-            "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\
-             Today Date: 26 Jul 2024\n\nbe terse<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n\
+            "<|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n\n\
+             be terse<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n\
              a<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nb<|eot_id|>\
              <|start_header_id|>user<|end_header_id|>\n\nc<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n"
