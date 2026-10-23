@@ -5,6 +5,8 @@
 use std::fmt::Display;
 use std::time::{Duration, Instant};
 
+use kv_cache_scheduler::sequence::SequenceId;
+
 use crate::engine::{Backend, BoxError};
 use crate::model::{BatchItem, Config};
 use crate::sampler::Sampler;
@@ -66,7 +68,7 @@ impl<'a> CudaBackend<'a> {
         let config = &model.config;
         let kv_storage = CudaKvStorage::new(
             runtime,
-            config.n_layers as usize,
+            config.n_attention_layers(),
             num_blocks,
             block_size,
             config.n_kv_heads as usize,
@@ -158,5 +160,11 @@ impl Backend for CudaBackend<'_> {
             self.breakdown.sample += sample;
         }
         Ok(next)
+    }
+
+    // Drops the short-conv state the sequence kept, once it finished, was
+    // aborted or was preempted (the CPU backend does the same).
+    fn release(&mut self, seq_id: SequenceId) {
+        self.kv_storage.conv.release(seq_id);
     }
 }

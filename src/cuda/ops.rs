@@ -57,6 +57,165 @@ pub fn silu_gate_multiply_wrapper(
     Ok(())
 }
 
+// Adds `bias` ([n_cols]) to every row of `x` ([rows, n_cols]), in place.
+pub fn add_bias_wrapper(
+    cuda_runtime: &CudaRuntime,
+    x: &mut CudaSlice<f32>,
+    bias: &CudaSlice<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = x.len() as u32;
+    let n_cols = bias.len() as u32;
+
+    if n == 0 || n_cols == 0 || !n.is_multiple_of(n_cols) {
+        return Err("add_bias: x length must be a non-zero multiple of the bias length".into());
+    }
+    match cuda_runtime.kernels_mapping.get("add_bias") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(x);
+            builder.arg(bias);
+            builder.arg(&n_cols);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'add_bias' not found".into()),
+    }
+    Ok(())
+}
+
+// output = gelu_tanh(gate) * up, elementwise (Gemma's GeGLU feed-forward).
+pub fn gelu_gate_multiply_wrapper(
+    cuda_runtime: &CudaRuntime,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = gate.len() as u32;
+
+    if output.len() != gate.len() || up.len() != output.len() {
+        return Err("gelu_gate_multiply: input and output have different lengths".into());
+    }
+    if n == 0 {
+        return Err("gelu_gate_multiply: input len is 0".into());
+    }
+    match cuda_runtime.kernels_mapping.get("gelu_gate_multiply") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(gate);
+            builder.arg(up);
+            builder.arg(output);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'gelu_gate_multiply' not found".into()),
+    }
+    Ok(())
+}
+
+// x *= scale, elementwise, in place.
+pub fn scale_inplace_wrapper(
+    cuda_runtime: &CudaRuntime,
+    x: &mut CudaSlice<f32>,
+    scale: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = x.len() as u32;
+
+    if n == 0 {
+        return Err("scale_inplace: input len is 0".into());
+    }
+    match cuda_runtime.kernels_mapping.get("scale_inplace") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(x);
+            builder.arg(&scale);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'scale_inplace' not found".into()),
+    }
+    Ok(())
+}
+
+// bx[r, c] = B[r, c] * x[r, c] from the short conv's in_proj output `proj`
+// ([rows, 3 * hidden], B, C, x in that order). bx is [rows, hidden].
+pub fn short_conv_bx_wrapper(
+    cuda_runtime: &CudaRuntime,
+    proj: &CudaSlice<f32>,
+    bx: &mut CudaSlice<f32>,
+    hidden: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = bx.len() as u32;
+
+    if n == 0 || hidden == 0 || !n.is_multiple_of(hidden) {
+        return Err("short_conv_bx: bx length must be a non-zero multiple of hidden".into());
+    }
+    if proj.len() as u32 != 3 * n {
+        return Err("short_conv_bx: proj must be [rows, 3 * hidden]".into());
+    }
+    match cuda_runtime.kernels_mapping.get("short_conv_bx") {
+        Some(kernel) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel);
+
+            builder.arg(proj);
+            builder.arg(bx);
+            builder.arg(&hidden);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'short_conv_bx' not found".into()),
+    }
+    Ok(())
+}
+
+// out[r, c] = C[r, c] * sum_k filter[c, k] * window[b, t + k, c], for each
+// new row r = (b, t). window is [batch, kernel - 1 + q_len, hidden] (the
+// kernel - 1 bx rows before the new ones, then the new ones); filter is
+// [hidden, kernel]; proj is the in_proj output. out is [batch * q_len, hidden].
+pub fn short_conv_filter_gate_wrapper(
+    cuda_runtime: &CudaRuntime,
+    window: &CudaSlice<f32>,
+    filter: &CudaSlice<f32>,
+    proj: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    batch: u32,
+    q_len: u32,
+    hidden: u32,
+    kernel: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let n = out.len() as u32;
+
+    if n != batch * q_len * hidden {
+        return Err("short_conv_filter_gate: out must be [batch * q_len, hidden]".into());
+    }
+    if window.len() as u32 != batch * (kernel - 1 + q_len) * hidden
+        || filter.len() as u32 != hidden * kernel
+        || proj.len() as u32 != 3 * n
+    {
+        return Err("short_conv_filter_gate: window, filter or proj has the wrong length".into());
+    }
+    match cuda_runtime.kernels_mapping.get("short_conv_filter_gate") {
+        Some(kernel_fn) => {
+            let mut builder = cuda_runtime.stream.launch_builder(kernel_fn);
+
+            builder.arg(window);
+            builder.arg(filter);
+            builder.arg(proj);
+            builder.arg(out);
+            builder.arg(&batch);
+            builder.arg(&q_len);
+            builder.arg(&hidden);
+            builder.arg(&kernel);
+            builder.arg(&n);
+            unsafe { builder.launch(LaunchConfig::for_num_elems(n)) }?;
+        }
+        None => return Err("Error: kernel 'short_conv_filter_gate' not found".into()),
+    }
+    Ok(())
+}
+
 pub fn rmsnorm_wrapper(
     cuda_runtime: &CudaRuntime,
     x: &CudaSlice<f32>,
@@ -581,7 +740,7 @@ mod tests {
 
     // None when there is no usable CUDA device, so tests skip instead of fail.
     fn runtime() -> Option<CudaRuntime> {
-        CudaRuntime::new(0).ok()
+        crate::cuda::context::test_runtime()
     }
 
     fn silu_cpu(x: f32) -> f32 {
@@ -847,7 +1006,7 @@ mod tests {
         // Pre-expand cos/sin per row, same as the host is responsible for doing
         // before calling rope_wrapper.
         let (cos_t, sin_t) =
-            crate::model::rope_cos_sin(rope_theta, head_dim, &positions, &cpu).unwrap();
+            crate::model::rope_cos_sin(rope_theta, None, head_dim, &positions, &cpu).unwrap();
         let cos: Vec<f32> = cos_t.flatten_all().unwrap().to_vec1().unwrap();
         let sin: Vec<f32> = sin_t.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(cos.len(), positions.len() * half);

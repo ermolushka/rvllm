@@ -1,13 +1,14 @@
 use std::io::{BufRead, Write};
+use std::path::Path;
 
 use clap::{Args, Parser, Subcommand};
-use rvllm::chat::{self, ChatMessage};
+use rvllm::chat::{self, ChatFormat, ChatMessage};
 use rvllm::engine::{self, BoxError, Engine, EngineConfig, Request, RequestSpec};
-use rvllm::model::{Config, Model};
+use rvllm::model::Model;
 use rvllm::runtime::Runtime;
 use rvllm::sampler::{Sampler, SamplingParams};
 use rvllm::server;
-use rvllm::tokenizer::{SmollLM230MTokenizer, StreamDecoder};
+use rvllm::tokenizer::{self, StreamDecoder, Tokenizer};
 
 #[derive(Parser)]
 #[command(about = "Small vLLM-style inference engine: terminal Q&A or an OpenAI-compatible server")]
@@ -31,8 +32,10 @@ struct ModelArgs {
     // Required, except with `cli --tui` where the model can be picked in the UI.
     #[arg(long)]
     model: Option<String>,
-    #[arg(long, default_value = "tokenizer.json")]
-    tokenizer: String,
+    // Defaults to the tokenizer.json next to the model file, else
+    // ./tokenizer.json.
+    #[arg(long)]
+    tokenizer: Option<String>,
     // "cpu" (default) or "cuda" - requires building with --features cuda.
     #[arg(long, default_value = "cpu")]
     device: String,
@@ -56,10 +59,13 @@ struct CliArgs {
     // Defaults to 20 with `--prompt`, 256 in the interactive loop.
     #[arg(long)]
     max_tokens: Option<usize>,
-    // Wrap input in the ChatML chat template (for -Instruct models). In the
+    // Wrap input in the model's chat format (for instruct models). In the
     // interactive loop the conversation history is kept between questions.
     #[arg(long)]
     chat: bool,
+    // System prompt for `--chat`, in place of the model's default one.
+    #[arg(long, requires = "chat")]
+    system: Option<String>,
     // One entry per `--prompt`, in the same order: the decode step at which
     // that request "arrives" (becomes eligible to be admitted). Requests
     // without a matching entry arrive at step 0. Simulates staggered arrival
@@ -139,16 +145,24 @@ fn blocks_for(tokens: usize, block_size: usize) -> usize {
     tokens.div_ceil(block_size).max(1)
 }
 
-fn load_tokenizer(path: &str, config: &Config) -> Result<SmollLM230MTokenizer, BoxError> {
-    SmollLM230MTokenizer::from_file(path, config.eos_token_id, config.bos_token_id)
+// The messages a chat starts with: the `--system` prompt, if given.
+fn opening_messages(args: &CliArgs) -> Vec<ChatMessage> {
+    args.system
+        .iter()
+        .map(|system| ChatMessage {
+            role: "system".into(),
+            content: system.clone(),
+        })
+        .collect()
 }
 
-// Tokens that end a generation: the model's EOS, plus the chat end-of-turn
-// marker when the vocabulary has one.
-fn stop_tokens(tokenizer: &SmollLM230MTokenizer) -> Vec<u32> {
-    let mut stops = vec![tokenizer.eos_token_id];
-    stops.extend(tokenizer.token_to_id(chat::END_OF_TURN));
-    stops
+fn tokenizer_path(args: &ModelArgs, model: &str) -> String {
+    match &args.tokenizer {
+        Some(path) => path.clone(),
+        None => tokenizer::path_for(Path::new(model), Path::new("tokenizer.json"))
+            .to_string_lossy()
+            .into_owned(),
+    }
 }
 
 // ---- cli ------------------------------------------------------------------
@@ -166,26 +180,42 @@ fn run_cli(args: CliArgs) -> Result<(), BoxError> {
             num_blocks: args.model.num_blocks,
             max_tokens: args.max_tokens.unwrap_or(256),
             chat: args.chat,
+            system: args.system,
             sampling,
-            fallback_tokenizer: args.model.tokenizer.into(),
+            fallback_tokenizer: args
+                .model
+                .tokenizer
+                .unwrap_or_else(|| "tokenizer.json".into())
+                .into(),
             models_dir: args.models_dir.into(),
             initial_model: args.model.model.map(Into::into),
         });
     }
-    let model = Model::load(model_path(&args.model)?)?;
-    let tokenizer = load_tokenizer(&args.model.tokenizer, &model.config)?;
+    let model_file = model_path(&args.model)?;
+    let model = Model::load(model_file)?;
+    let tokenizer = Tokenizer::for_model(&tokenizer_path(&args.model, model_file), &model.config)?;
+    let format = ChatFormat::for_model(&model.config);
+    let chat = match (args.chat, format) {
+        (false, _) => None,
+        (true, Some(format)) => Some(format),
+        (true, None) => return Err("this model's chat format is unknown; drop --chat".into()),
+    };
+    let stops = chat::stop_tokens(&tokenizer, format);
     let runtime = Runtime::new(&model, &args.model.device)?;
     if args.prompt.is_empty() {
-        interactive(&args, &runtime, &tokenizer, sampling)
+        interactive(&args, &runtime, &tokenizer, chat, &stops, sampling)
     } else {
-        one_shot(&args, &runtime, &tokenizer, sampling)
+        one_shot(&args, &runtime, &tokenizer, chat, &stops, sampling)
     }
 }
 
+// `chat` is the format to wrap prompts in, or None for plain completion.
 fn one_shot(
     args: &CliArgs,
     runtime: &Runtime,
-    tokenizer: &SmollLM230MTokenizer,
+    tokenizer: &Tokenizer,
+    chat: Option<ChatFormat>,
+    stops: &[u32],
     sampling: SamplingParams,
 ) -> Result<(), BoxError> {
     let context_length = runtime.model().config.context_length as usize;
@@ -197,13 +227,16 @@ fn one_shot(
         .iter()
         .enumerate()
         .map(|(i, prompt)| {
-            let text = if args.chat {
-                chat::chatml(&[ChatMessage {
-                    role: "user".into(),
-                    content: prompt.clone(),
-                }])
-            } else {
-                prompt.clone()
+            let text = match chat {
+                Some(format) => {
+                    let mut messages = opening_messages(args);
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: prompt.clone(),
+                    });
+                    format.render(&messages)
+                }
+                None => prompt.clone(),
             };
             Ok(RequestSpec {
                 tokens: tokenizer.encode(&text)?,
@@ -236,9 +269,9 @@ fn one_shot(
             num_blocks,
             max_running: usize::MAX,
         },
+        stops,
     )?;
 
-    let stops = stop_tokens(tokenizer);
     for (i, generated) in result.generated.iter().enumerate() {
         // A request that ended on a stop token has it as its last entry.
         let ids: Vec<u32> = match generated.split_last() {
@@ -281,7 +314,9 @@ fn one_shot(
 fn interactive(
     args: &CliArgs,
     runtime: &Runtime,
-    tokenizer: &SmollLM230MTokenizer,
+    tokenizer: &Tokenizer,
+    chat: Option<ChatFormat>,
+    stops: &[u32],
     sampling: SamplingParams,
 ) -> Result<(), BoxError> {
     let context_length = runtime.model().config.context_length as usize;
@@ -299,10 +334,8 @@ fn interactive(
             max_running: 1,
         },
     );
-    let stops = stop_tokens(tokenizer);
-
     eprintln!("Type a question and press Enter. Ctrl-D or `exit` to quit.");
-    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut history = opening_messages(args);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     loop {
@@ -319,19 +352,20 @@ fn interactive(
             break;
         }
 
-        let prompt = if args.chat {
-            history.push(ChatMessage {
-                role: "user".into(),
-                content: line.to_string(),
-            });
-            chat::chatml(&history)
-        } else {
-            line.to_string()
+        let prompt = match chat {
+            Some(format) => {
+                history.push(ChatMessage {
+                    role: "user".into(),
+                    content: line.to_string(),
+                });
+                format.render(&history)
+            }
+            None => line.to_string(),
         };
         let request = Request {
             tokens: tokenizer.encode(&prompt)?,
             max_tokens,
-            stop_tokens: stops.clone(),
+            stop_tokens: stops.to_vec(),
             sampler: Sampler::from_params(sampling),
         };
         let id = match engine.add_request(request) {
@@ -382,7 +416,7 @@ fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
     let model_file = model_path(&args.model)?.to_string();
     server::run(
         &model_file,
-        &args.model.tokenizer,
+        &tokenizer_path(&args.model, &model_file),
         server::ServeOptions {
             device: args.model.device,
             addr: format!("{}:{}", args.host, args.port),

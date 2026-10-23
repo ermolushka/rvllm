@@ -7,12 +7,12 @@
 use std::sync::mpsc;
 use std::thread;
 
-use crate::chat::{self, ChatMessage};
+use crate::chat::{self, ChatFormat, ChatMessage};
 use crate::engine::{self, BoxError, EngineConfig, RequestSpec};
 use crate::model::{Config, Model};
 use crate::runtime::Runtime;
 use crate::sampler::SamplingParams;
-use crate::tokenizer::SmollLM230MTokenizer;
+use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
@@ -40,6 +40,7 @@ struct Task {
     requests: Vec<RequestSpec>,
     opts: GenerateOptions,
     num_blocks: usize,
+    stop_tokens: Vec<u32>,
     reply: mpsc::Sender<Result<Vec<Vec<u32>>, BoxError>>,
 }
 
@@ -50,7 +51,9 @@ pub struct Generator {
     tasks: Option<mpsc::Sender<Task>>,
     thread: Option<thread::JoinHandle<()>>,
     config: Config,
-    tokenizer: SmollLM230MTokenizer,
+    tokenizer: Tokenizer,
+    chat_format: Option<ChatFormat>,
+    stop_tokens: Vec<u32>,
 }
 
 fn device_thread(
@@ -81,6 +84,7 @@ fn device_thread(
                         num_blocks: task.num_blocks,
                         max_running: usize::MAX,
                     },
+                    &task.stop_tokens,
                 )
             })
             .map(|r| r.generated);
@@ -98,16 +102,16 @@ impl Generator {
         let config = ready_rx
             .recv()
             .map_err(|_| "generator thread died during startup")??;
-        let tokenizer = SmollLM230MTokenizer::from_file(
-            tokenizer_path,
-            config.eos_token_id,
-            config.bos_token_id,
-        )?;
+        let tokenizer = Tokenizer::for_model(tokenizer_path, &config)?;
+        let chat_format = ChatFormat::for_model(&config);
+        let stop_tokens = chat::stop_tokens(&tokenizer, chat_format);
         Ok(Self {
             tasks: Some(tasks_tx),
             thread: Some(thread),
             config,
             tokenizer,
+            chat_format,
+            stop_tokens,
         })
     }
 
@@ -115,7 +119,7 @@ impl Generator {
         &self.config
     }
 
-    pub fn tokenizer(&self) -> &SmollLM230MTokenizer {
+    pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
 
@@ -160,18 +164,17 @@ impl Generator {
                 requests,
                 opts: opts.clone(),
                 num_blocks,
+                stop_tokens: self.stop_tokens.clone(),
                 reply,
             })
             .map_err(|_| "generator thread is gone")?;
         let generated = reply_rx.recv().map_err(|_| "generator thread died")??;
 
-        let mut stops = vec![self.tokenizer.eos_token_id];
-        stops.extend(self.tokenizer.token_to_id(chat::END_OF_TURN));
         generated
             .iter()
             .map(|g| {
                 let ids = match g.split_last() {
-                    Some((last, rest)) if stops.contains(last) => rest,
+                    Some((last, rest)) if self.stop_tokens.contains(last) => rest,
                     _ => g.as_slice(),
                 };
                 self.tokenizer.decode(ids)
@@ -179,14 +182,16 @@ impl Generator {
             .collect()
     }
 
-    // Chat completion over a message history using the ChatML template
-    // (SmolLM2-Instruct models).
+    // Chat completion over a message history, in the model's chat format.
     pub fn chat(
         &self,
         messages: &[ChatMessage],
         opts: &GenerateOptions,
     ) -> Result<String, BoxError> {
-        self.complete(&chat::chatml(messages), opts)
+        let format = self
+            .chat_format
+            .ok_or("this model's chat format is unknown; use `complete`")?;
+        self.complete(&format.render(messages), opts)
     }
 }
 

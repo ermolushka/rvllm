@@ -23,23 +23,38 @@ Features: `server` (axum API), `tui` (ratatui UI), `cli` (default; both plus the
 
 ## Supported models
 
-Only the SmolLM2-360M family is supported right now, in Q8_0 GGUF form with its
-`tokenizer.json`:
+These models are supported, in Q8_0 GGUF form with their `tokenizer.json`:
 
-- `SmolLM2-360M.Q8_0.gguf` (base): plain completions.
-- `SmolLM2-360M-Instruct` Q8_0 GGUF (use the Instruct repo's `tokenizer.json`):
-  chat, via `--chat` and `/v1/chat/completions`. Tested end to end, including
-  multi-turn history and stopping on `<|im_end|>`.
+- `SmolLM2-360M.Q8_0.gguf` (base, `llama` architecture): plain completions.
+- `SmolLM2-360M-Instruct` Q8_0 GGUF (`llama`): chat in ChatML.
+- `Llama-3.2-1B-Instruct` Q8_0 GGUF (`llama`, with Llama 3's RoPE scaling): chat
+  in Llama 3's header format.
+- `Qwen2.5-0.5B-Instruct` Q8_0 GGUF (`qwen2`): chat in ChatML.
+- `Qwen3-0.6B` Q8_0 GGUF (`qwen3`): chat in ChatML, with thinking off.
+- `gemma-3-270m-it` Q8_0 GGUF (`gemma3`): chat in Gemma's turn format.
+- `LFM2.5-1.2B-Instruct` Q8_0 GGUF (`lfm2`): chat in ChatML.
 
-These are the only models this has been developed and tested against. The loader
-reads Llama-style GGUF metadata (`llama.*` keys) and dequantizes everything to F32
-on load (F16 on the GPU), so other Llama-architecture models might load, but
-nothing else is tested, and the tokenizer wrapper and the hardcoded ChatML chat
-template are specific to SmolLM2. Base models aren't chat-tuned, so don't expect
-sensible answers from `--chat` with the base file.
+Each is tested end to end on the CPU and on CUDA, including multi-turn history
+via `--chat` and `/v1/chat/completions` and stopping at the end of the model's
+turn. `--chat`
+uses the model's chat format where rvllm knows it and refuses otherwise; plain
+completion works either way. Other models of these architectures load with a
+warning on stderr, because they aren't tested: a model counts as tested when its
+architecture, layer count and width match one of the models above. Base models aren't chat-tuned, so don't expect sensible answers
+from `--chat` with a base file.
 
-GGUF files store Q/K weights in llama.cpp's interleaved RoPE layout; the loader
-reorders them to the rotate-half layout the kernels use (`weights.rs`).
+Everything is dequantized to F32 on load (F16 on the GPU), so a model needs
+about 4 bytes of RAM per parameter: roughly 1.5 GB for SmolLM2-360M and 5 GB for
+Llama-3.2-1B. The CUDA backend runs every model listed above, with the same
+greedy output as the CPU path (see the CUDA support section).
+
+`--tokenizer` defaults to the `tokenizer.json` next to the model file, then
+`./tokenizer.json`. A tokenizer that gives the model's BOS or EOS token a
+different id belongs to another model and is rejected.
+
+llama.cpp stores Llama-architecture Q/K weights in an interleaved RoPE layout;
+the loader reorders them to the rotate-half layout the kernels use
+(`weights.rs`). The other supported families are stored that way already.
 
 ## CLI mode
 
@@ -52,8 +67,9 @@ cargo run --release -- cli \
   --tokenizer tokenizer.json
 ```
 
-Pass `--chat` to wrap input in the ChatML template (use this with `-Instruct`
-models); the conversation history is then kept between questions.
+Pass `--chat` to wrap input in the model's chat format (use this with instruct
+models); the conversation history is then kept between questions. `--system
+"..."` sets the system prompt, replacing the model's default one.
 
 With `--prompt` the CLI runs the given prompts once and exits. Multiple
 `--prompt`s run concurrently through continuous batching, all sharing one KV
@@ -95,8 +111,8 @@ The picker lists the `.gguf` files under `--models-dir` (default `.`, plus one
 level of subdirectories); each model uses a `tokenizer.json` next to it, else
 `--tokenizer`. `--model` skips the picker and preloads that file. Keys: Enter
 send, Esc stop generating, Ctrl-O switch model, Ctrl-N new conversation,
-PgUp/PgDn scroll, Ctrl-C quit. The sampling, `--chat`, `--max-tokens`,
-`--device` and KV flags apply as in the plain interactive loop;
+PgUp/PgDn scroll, Ctrl-C quit. The sampling, `--chat`, `--system`,
+`--max-tokens`, `--device` and KV flags apply as in the plain interactive loop;
 `--prompt`/`--debug`/`--arrival-step` can't be combined with `--tui`.
 
 ## Server mode
@@ -145,8 +161,8 @@ KV capacity is `--num-blocks` blocks of `--block-size` tokens; by default
 `--max-running` x `--tokens-per-seq` (2048) tokens. A single request can use
 at most the whole pool (and never more than the model's context length).
 `--default-max-tokens`, `--default-temperature` and `--default-top-p` apply
-to requests that omit them. SmolLM2 base models aren't chat-tuned: for real
-chat use a `-Instruct` GGUF (the chat template is ChatML).
+to requests that omit them. Base models aren't chat-tuned: for real chat use an
+instruct GGUF. `/v1/chat/completions` uses the model's chat format, like `--chat`.
 
 ## Sampling
 
@@ -210,13 +226,34 @@ runtime - no separate build step, no `nvcc` needed.
 
 ```
 cargo build --release --features cuda
-cargo test --features cuda          # kernel/model unit tests; each skips
-                                     # instead of failing if no CUDA device
-                                     # is present (e.g. on a Mac)
+cargo test --features cuda          # kernel/model unit tests, CPU vs CUDA
+RVLLM_REQUIRE_CUDA=1 cargo test --features cuda   # fail, not skip, without a GPU
 ```
+
+Without a GPU the CUDA tests skip with a note on stderr, so a plain
+`cargo test --features cuda` can pass without running anything on the GPU. Set
+`RVLLM_REQUIRE_CUDA=1` to make a missing device a failure. CI builds and tests
+only the CPU path.
 
 Builds and runs unchanged on machines without a GPU - the feature is opt-in,
 and the default (CPU/Candle) path is untouched by it.
+
+On WSL2, a stale `libcuda.so.1` elsewhere on the loader path can shadow the
+WSL driver, and then CUDA reports `CUDA_ERROR_NO_DEVICE` even though
+`nvidia-smi` works. Run with `LD_LIBRARY_PATH=/usr/lib/wsl/lib` in that case,
+or remove the stale library.
+
+Which features run on the GPU, and how each was checked:
+
+- Llama 3 RoPE scaling, Qwen2 attention biases, Qwen3 Q/K normalization,
+  Gemma 3 (local sliding-window attention with its own RoPE base, GELU
+  feed-forward, post-attention and post-FFN norms, scaled embeddings) and
+  LFM2's short convolutions, with its conv state kept on the GPU per sequence
+  and per cached block, so prefix-cache hits resume correctly.
+- Each feature is compared with the CPU path by a unit test on a tiny model,
+  including a batched decode and a prefix-cache resume for short convolutions.
+- On RTX 4060 (WSL2), every README model's greedy output matches the CPU
+  path, with the GGUF files checked against their Hugging Face LFS hashes.
 
 Every command (`cli`, `serve`, `bench`) takes `--device cuda` to run through the
 custom-written CUDA inference path (`cuda::model::CudaModel` +

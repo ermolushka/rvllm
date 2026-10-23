@@ -20,12 +20,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::chat::{self, ChatMessage};
+use crate::chat::{self, ChatFormat, ChatMessage};
 use crate::engine::{self, BoxError, Engine, EngineConfig, Request};
 use crate::model::Model;
 use crate::runtime::Runtime;
 use crate::sampler::{Sampler, SamplingParams};
-use crate::tokenizer::{SmollLM230MTokenizer, StreamDecoder};
+use crate::tokenizer::{self, StreamDecoder, Tokenizer};
 
 pub struct TuiOptions {
     pub device: String,
@@ -33,6 +33,8 @@ pub struct TuiOptions {
     pub num_blocks: Option<usize>,
     pub max_tokens: usize,
     pub chat: bool,
+    // System prompt for chat mode, in place of the model's default one.
+    pub system: Option<String>,
     pub sampling: SamplingParams,
     // Used for models with no `tokenizer.json` next to them.
     pub fallback_tokenizer: PathBuf,
@@ -58,15 +60,6 @@ impl ModelEntry {
     }
 }
 
-fn tokenizer_for(model: &Path, fallback: &Path) -> PathBuf {
-    let sibling = model.with_file_name("tokenizer.json");
-    if sibling.exists() {
-        sibling
-    } else {
-        fallback.to_path_buf()
-    }
-}
-
 // `.gguf` files in `dir` and one level of subdirectories.
 fn discover(dir: &Path, fallback: &Path) -> Vec<ModelEntry> {
     fn scan(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -88,7 +81,7 @@ fn discover(dir: &Path, fallback: &Path) -> Vec<ModelEntry> {
     paths
         .into_iter()
         .map(|path| ModelEntry {
-            tokenizer: tokenizer_for(&path, fallback),
+            tokenizer: tokenizer::path_for(&path, fallback),
             size: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             path,
         })
@@ -183,11 +176,8 @@ fn session(
     let _ = ctx.tx.send(Event::Loading(name.clone()));
 
     let model = Model::load(&model_path.to_string_lossy())?;
-    let tokenizer = SmollLM230MTokenizer::from_file(
-        &tokenizer_path.to_string_lossy(),
-        model.config.eos_token_id,
-        model.config.bos_token_id,
-    )?;
+    let tokenizer = Tokenizer::for_model(&tokenizer_path.to_string_lossy(), &model.config)?;
+    let chat_format = ChatFormat::for_model(&model.config);
     let runtime = Runtime::new(&model, device)?;
     let context = model.config.context_length as usize;
     let num_blocks = opts
@@ -201,21 +191,30 @@ fn session(
             max_running: 1,
         },
     );
-    let mut stops = vec![tokenizer.eos_token_id];
-    stops.extend(tokenizer.token_to_id(chat::END_OF_TURN));
     let _ = ctx.tx.send(Event::Ready { name, context });
 
-    let mut history: Vec<ChatMessage> = Vec::new();
+    // Every chat, including one started with Ctrl-N, opens with the system
+    // prompt, if one was given.
+    let opening = || -> Vec<ChatMessage> {
+        opts.system
+            .iter()
+            .map(|system| ChatMessage {
+                role: "system".into(),
+                content: system.clone(),
+            })
+            .collect()
+    };
+    let mut history = opening();
     loop {
         match rx.recv() {
-            Ok(Cmd::NewChat) => history.clear(),
+            Ok(Cmd::NewChat) => history = opening(),
             Ok(load @ Cmd::Load { .. }) => return Ok(Some(load)),
             Ok(Cmd::Send(line, settings)) => {
                 if let Err(e) = generate(
                     ctx,
                     &mut engine,
                     &tokenizer,
-                    &stops,
+                    chat_format,
                     &mut history,
                     line,
                     &settings,
@@ -231,26 +230,27 @@ fn session(
 fn generate<B: engine::Backend>(
     ctx: &WorkerCtx,
     engine: &mut Engine<B>,
-    tokenizer: &SmollLM230MTokenizer,
-    stops: &[u32],
+    tokenizer: &Tokenizer,
+    chat_format: Option<ChatFormat>,
     history: &mut Vec<ChatMessage>,
     line: String,
     settings: &Settings,
 ) -> Result<(), BoxError> {
     let chat = settings.chat;
     let prompt = if chat {
+        let format = chat_format.ok_or("this model's chat format is unknown; turn chat off")?;
         history.push(ChatMessage {
             role: "user".into(),
             content: line,
         });
-        chat::chatml(history)
+        format.render(history)
     } else {
         line
     };
     let request = Request {
         tokens: tokenizer.encode(&prompt)?,
         max_tokens: settings.max_tokens,
-        stop_tokens: stops.to_vec(),
+        stop_tokens: chat::stop_tokens(tokenizer, chat_format),
         sampler: Sampler::from_params(settings.sampling),
     };
     let id = match engine.add_request(request) {
@@ -953,7 +953,7 @@ pub fn run(opts: TuiOptions) -> Result<(), BoxError> {
     };
     match &opts.initial_model {
         Some(path) => app.load(&ModelEntry {
-            tokenizer: tokenizer_for(path, &opts.fallback_tokenizer),
+            tokenizer: tokenizer::path_for(path, &opts.fallback_tokenizer),
             path: path.clone(),
             size: 0,
         }),

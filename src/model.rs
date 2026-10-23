@@ -1,57 +1,197 @@
 use candle_core::{D, Device, Result, Tensor};
 use candle_nn::ops::{silu, softmax};
 use kv_cache_scheduler::block_pool::BlockID;
+use kv_cache_scheduler::sequence::SequenceId;
 
+use crate::conv_cache::{ConvCache, ConvItem};
 use crate::kv_storage::{GatherPlan, KvStorage};
 
-// Model hyperparameters, read from the GGUF metadata by `Model::load`.
+// Model family, from the GGUF's `general.architecture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arch {
+    Llama,
+    Qwen2,
+    Qwen3,
+    Gemma3,
+    Lfm2,
+}
+
+// Model hyperparameters, read from the GGUF metadata by `Model::load`. The
+// crate-private fields mean only rvllm can build a `Config`, so fields can be
+// added without breaking downstream code.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub(crate) arch: Arch,
     pub n_layers: u32,
     pub n_heads: u32,
     pub n_kv_heads: u32,
     pub hidden_dim: u32,
+    pub(crate) head_dim: u32,
     pub ffn_dim: u32,
     pub rope_theta: f32,
+    // Llama 3's RoPE scaling: one factor per dimension pair, dividing that
+    // pair's frequency (the GGUF's `rope_freqs.weight`).
+    pub(crate) rope_factors: Option<Vec<f32>>,
+    // Set when some layers attend locally (Gemma 3).
+    pub(crate) local_attention: Option<LocalAttention>,
+    // Set when some layers are short convolutions instead of attention (LFM2).
+    pub(crate) conv: Option<ConvLayers>,
     pub rms_eps: f32,
     pub vocab_size: u32,
     pub context_length: u32,
     pub eos_token_id: u32,
     pub bos_token_id: u32,
+    // Whether prompts start with BOS, as the model was trained.
+    pub(crate) add_bos: bool,
+    // `tokenizer.ggml.pre`: which tokenizer family the GGUF was converted with.
+    pub(crate) tokenizer_pre: Option<String>,
+    // The BOS and EOS token strings, for checking a tokenizer.json against the model.
+    pub(crate) bos_token: Option<String>,
+    pub(crate) eos_token: Option<String>,
+    // Multiplies the token embeddings (Gemma: sqrt(hidden_dim)).
+    pub(crate) embedding_scale: Option<f32>,
+    pub(crate) activation: Activation,
+}
+
+// Gemma 3's local layers attend only to the last `window` positions, and
+// rotate with their own RoPE base.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LocalAttention {
+    pub(crate) window: usize,
+    pub(crate) rope_theta: f32,
+}
+
+// LFM2's short-convolution layers: their indices, and how many tokens (the
+// newest included) each output mixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConvLayers {
+    pub(crate) layers: Vec<usize>,
+    pub(crate) kernel: usize,
+}
+
+// The nonlinearity on the FFN's gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Activation {
+    // SwiGLU (Llama, Qwen).
+    Silu,
+    // GELU with the tanh approximation, i.e. GeGLU (Gemma).
+    GeluTanh,
 }
 
 impl Config {
     pub fn head_dim(&self) -> usize {
-        (self.hidden_dim / self.n_heads) as usize
+        self.head_dim as usize
+    }
+
+    // Layers with attention, each needing its slot in `KvStorage`.
+    pub fn n_attention_layers(&self) -> usize {
+        self.n_layers as usize - self.conv.as_ref().map_or(0, |conv| conv.layers.len())
+    }
+}
+
+#[cfg(test)]
+impl Config {
+    // The 1-layer shape the tests' tiny models use; override fields with
+    // struct-update syntax.
+    pub(crate) fn for_tests() -> Config {
+        Config {
+            arch: Arch::Llama,
+            n_layers: 1,
+            n_heads: 2,
+            n_kv_heads: 1,
+            hidden_dim: 4,
+            head_dim: 2,
+            ffn_dim: 4,
+            rope_theta: 10000.0,
+            rope_factors: None,
+            local_attention: None,
+            conv: None,
+            rms_eps: 1e-5,
+            vocab_size: 5,
+            context_length: 8,
+            eos_token_id: 99,
+            bos_token_id: 0,
+            add_bos: false,
+            tokenizer_pre: None,
+            bos_token: None,
+            eos_token: None,
+            embedding_scale: None,
+            activation: Activation::Silu,
+        }
     }
 }
 
 // One transformer block's weights, all F32 in candle Linear convention
-// ([out_features, in_features]) except the two norm vectors.
-pub struct Layer {
+// ([out_features, in_features]) except the norm vectors.
+pub(crate) struct Layer {
+    // Normalizes the mixer's input, whichever kind it is.
+    pub(crate) attn_norm: Tensor,
+    pub(crate) mixer: Mixer,
+    // Normalizes the mixer's output before the residual add (Gemma).
+    pub(crate) post_attn_norm: Option<Tensor>,
+    pub(crate) ffn_norm: Tensor,
+    pub(crate) ffn: Ffn,
+    // Likewise for the FFN output.
+    pub(crate) post_ffn_norm: Option<Tensor>,
+}
+
+// What mixes information across positions: attention, or LFM2's short
+// convolution in some of its layers.
+pub(crate) enum Mixer {
+    Attention(Attention),
+    ShortConv(ShortConv),
+}
+
+pub(crate) struct Attention {
     // Index of this layer's slot in `KvStorage`.
-    pub index: usize,
-    pub attn_norm: Tensor,
-    pub attn_q: Tensor,
-    pub attn_k: Tensor,
-    pub attn_v: Tensor,
-    pub attn_output: Tensor,
-    pub ffn_norm: Tensor,
-    pub ffn_gate: Tensor,
-    pub ffn_up: Tensor,
-    pub ffn_down: Tensor,
+    pub(crate) kv_index: usize,
+    // Whether this is a local layer (see `LocalAttention`).
+    pub(crate) local: bool,
+    pub(crate) q: Tensor,
+    pub(crate) k: Tensor,
+    pub(crate) v: Tensor,
+    pub(crate) o: Tensor,
+    // Biases of the Q/K/V projections, for families that have them (Qwen2).
+    pub(crate) q_bias: Option<Tensor>,
+    pub(crate) k_bias: Option<Tensor>,
+    pub(crate) v_bias: Option<Tensor>,
+    // RMSNorm weights ([head_dim]) applied to each Q and K head before RoPE,
+    // for families that normalize them (Qwen3).
+    pub(crate) q_norm: Option<Tensor>,
+    pub(crate) k_norm: Option<Tensor>,
+}
+
+// LFM2's short-convolution mixer. `in_proj` gives each token two gates, B and
+// C, and an input x. B*x goes through a causal depthwise convolution over the
+// last `kernel` tokens, and C gates the result before `out_proj`.
+pub(crate) struct ShortConv {
+    // Index of this layer's rows in `ConvCache`.
+    pub(crate) conv_index: usize,
+    // [3 * hidden_dim, hidden_dim]: B, C and x, in that order.
+    pub(crate) in_proj: Tensor,
+    // [hidden_dim, kernel]: one filter per channel, oldest token first.
+    pub(crate) conv: Tensor,
+    pub(crate) out_proj: Tensor,
+}
+
+// The gated FFN's projections: down(act(gate(x)) * up(x)), with SiLU (see
+// `swiglu_ffn`) or GELU as `act`.
+pub(crate) struct Ffn {
+    pub(crate) gate: Tensor,
+    pub(crate) up: Tensor,
+    pub(crate) down: Tensor,
 }
 
 // The whole model. `Model::load` (in weights.rs) builds one from a GGUF file.
 pub struct Model {
     pub config: Config,
     // [vocab_size, hidden_dim]
-    pub token_embd: Tensor,
-    pub layers: Vec<Layer>,
-    pub output_norm: Tensor,
+    pub(crate) token_embd: Tensor,
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) output_norm: Tensor,
     // [vocab_size, hidden_dim]. Shares storage with `token_embd` when the
     // model ties its input and output embeddings.
-    pub output: Tensor,
+    pub(crate) output: Tensor,
 }
 
 // RMSNorm: rescale each row by its root-mean-square, then apply a learned
@@ -78,15 +218,22 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
 // slower - so different pairs encode position at different resolutions, like
 // clock hands moving at different speeds. Depends only on positions, so it is
 // built once per forward call and shared by every layer and head.
+// `factors` (Llama 3) divides each pair's frequency by its own factor, which
+// slows the low-frequency pairs down for contexts longer than the model was
+// first trained on.
 pub fn rope_cos_sin(
     rope_theta: f32,
+    factors: Option<&[f32]>,
     head_dim: usize,
     positions: &[usize],
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let theta: Vec<f32> = (0..half)
-        .map(|j| rope_theta.powf(-2.0 * j as f32 / head_dim as f32))
+        .map(|j| {
+            let theta = rope_theta.powf(-2.0 * j as f32 / head_dim as f32);
+            factors.map_or(theta, |factors| theta / factors[j])
+        })
         .collect();
     let theta = Tensor::from_vec(theta, (1, half), device)?;
 
@@ -119,7 +266,7 @@ pub fn rope_apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 // `positions` (same order as `x`'s rows).
 pub fn rope(x: &Tensor, rope_theta: f32, device: &Device, positions: &[usize]) -> Result<Tensor> {
     let (_, head_dim) = x.dims2()?;
-    let (cos, sin) = rope_cos_sin(rope_theta, head_dim, positions, device)?;
+    let (cos, sin) = rope_cos_sin(rope_theta, None, head_dim, positions, device)?;
     rope_apply(x, &cos, &sin)
 }
 
@@ -147,6 +294,23 @@ pub fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     x.reshape((rows, in_features))?
         .matmul(&weight.t()?)?
         .reshape(out_dims)
+}
+
+// `rms_norm` with `weight`, or `x` unchanged when there is no weight.
+fn optional_rms_norm(x: Tensor, weight: Option<&Tensor>, eps: f32) -> Result<Tensor> {
+    match weight {
+        Some(weight) => rms_norm(&x, weight, eps),
+        None => Ok(x),
+    }
+}
+
+// `linear`, plus `bias` ([out_features]) when the projection has one.
+fn linear_bias(x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let y = linear(x, weight)?;
+    match bias {
+        Some(bias) => y.broadcast_add(bias),
+        None => Ok(y),
+    }
 }
 
 // SwiGLU FFN: down(silu(gate(x)) * up(x)).
@@ -177,11 +341,14 @@ pub fn swiglu_ffn(
 // batch-padding tail every other sequence's longer context leaves behind for
 // this one. Masked positions get -inf so softmax assigns them exactly 0.
 // position_offset[b]: position of item b's first query row in its sequence.
+// `window` additionally hides keys that many positions or more behind the
+// query, for sliding-window attention.
 pub fn batch_mask(
     position_offset: &[usize],
     read_num_tokens: &[usize],
     q_len: usize,
     ctx_len: usize,
+    window: Option<usize>,
     device: &Device,
 ) -> Result<Tensor> {
     let batch = position_offset.len();
@@ -191,7 +358,8 @@ pub fn batch_mask(
         let valid_len = read_num_tokens[b];
         for i in 0..q_len {
             for j in 0..ctx_len {
-                if j >= valid_len || j > offset + i {
+                let outside_window = window.is_some_and(|w| j + w <= offset + i);
+                if j >= valid_len || j > offset + i || outside_window {
                     mask_data[(b * q_len + i) * ctx_len + j] = f32::NEG_INFINITY;
                 }
             }
@@ -252,6 +420,8 @@ pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Resul
 // each with a single token. `tokens.len()` must be equal across the batch
 // (the query axis is not padded).
 pub struct BatchItem<'a> {
+    // The sequence these tokens extend.
+    pub seq_id: SequenceId,
     // This call's new tokens for the sequence.
     pub tokens: &'a [u32],
     // (block, slot) each new token's K/V is written to, one per token.
@@ -265,20 +435,29 @@ pub struct BatchItem<'a> {
     pub position_offset: usize,
 }
 
-// Everything that depends only on this call's items, not on the layer: RoPE
-// cos/sin, the attention mask, the cache read plan and the flattened cache
-// write positions. Built once per call and shared by every layer instead of
-// being rebuilt per layer.
-pub struct StepCtx {
+// RoPE cos/sin and the attention mask for one kind of attention layer.
+struct AttnCtx {
     // [batch, 1, q_len, head_dim / 2]
     cos: Tensor,
     sin: Tensor,
     // [batch, 1, q_len, ctx_len]
     mask: Tensor,
+}
+
+// Everything that depends only on this call's items, not on the layer: RoPE
+// cos/sin, the attention mask, the cache read plan and the flattened cache
+// write positions. Built once per call and shared by every layer instead of
+// being rebuilt per layer.
+pub struct StepCtx {
+    global: AttnCtx,
+    // The local layers' own tables, when the model has local layers.
+    local: Option<AttnCtx>,
     gather: GatherPlan,
     // Every item's write positions, concatenated in (batch, q_len) row-major
     // order to match the flattened K/V rows.
     writes: Vec<(BlockID, usize)>,
+    // Each item as the short-conv layers' cache sees it, if there are any.
+    conv: Vec<ConvItem>,
 }
 
 impl StepCtx {
@@ -296,10 +475,6 @@ impl StepCtx {
             .iter()
             .flat_map(|item| item.position_offset..item.position_offset + q_len)
             .collect();
-        let (cos, sin) = rope_cos_sin(config.rope_theta, head_dim, &positions, device)?;
-        let rope_shape = (items.len(), 1, q_len, head_dim / 2);
-        let cos = cos.reshape(rope_shape)?;
-        let sin = sin.reshape(rope_shape)?;
 
         let gather_items: Vec<(&[BlockID], usize)> = items
             .iter()
@@ -309,32 +484,74 @@ impl StepCtx {
 
         let position_offsets: Vec<usize> = items.iter().map(|i| i.position_offset).collect();
         let read_num_tokens: Vec<usize> = items.iter().map(|i| i.read_num_tokens).collect();
-        let mask = batch_mask(
-            &position_offsets,
-            &read_num_tokens,
-            q_len,
-            gather.ctx_len(),
-            device,
-        )?;
+        let attn_ctx = |rope_theta: f32, factors: Option<&[f32]>, window: Option<usize>| {
+            let (cos, sin) = rope_cos_sin(rope_theta, factors, head_dim, &positions, device)?;
+            let rope_shape = (items.len(), 1, q_len, head_dim / 2);
+            Ok::<_, candle_core::Error>(AttnCtx {
+                cos: cos.reshape(rope_shape)?,
+                sin: sin.reshape(rope_shape)?,
+                mask: batch_mask(
+                    &position_offsets,
+                    &read_num_tokens,
+                    q_len,
+                    gather.ctx_len(),
+                    window,
+                    device,
+                )?,
+            })
+        };
+        let global = attn_ctx(config.rope_theta, config.rope_factors.as_deref(), None)?;
+        let local = config
+            .local_attention
+            .map(|local| attn_ctx(local.rope_theta, None, Some(local.window)))
+            .transpose()?;
 
         let writes = items
             .iter()
             .flat_map(|item| item.write_positions.iter().copied())
             .collect();
+        let conv = match config.conv {
+            Some(_) => items
+                .iter()
+                .map(|item| ConvItem {
+                    seq_id: item.seq_id,
+                    position: item.position_offset,
+                    blocks: item.read_blocks.to_vec(),
+                    writes: item.write_positions.to_vec(),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         Ok(StepCtx {
-            cos,
-            sin,
-            mask,
+            global,
+            local,
             gather,
             writes,
+            conv,
         })
     }
 }
 
+impl Ffn {
+    fn forward(&self, x: &Tensor, activation: Activation) -> Result<Tensor> {
+        match activation {
+            Activation::Silu => swiglu_ffn(x, &self.gate, &self.up, &self.down),
+            // The same gating, through GELU instead of SiLU.
+            Activation::GeluTanh => {
+                let gate = linear(x, &self.gate)?.gelu()?;
+                linear(&gate.mul(&linear(x, &self.up)?)?, &self.down)
+            }
+        }
+    }
+}
+
 impl Layer {
-    // One Llama transformer block:
-    //   h   = x + attention(rms_norm(x, attn_norm)) // aka residual
-    //   out = h + swiglu_ffn(rms_norm(h, ffn_norm))
+    // One transformer block:
+    //   h   = x + mixer(rms_norm(x, attn_norm)) // aka residual
+    //   out = h + ffn(rms_norm(h, ffn_norm))
+    // The mixer is attention, or a short convolution in some LFM2 layers.
+    // Gemma also RMS-normalizes the mixer and FFN outputs before adding them
+    // (`post_attn_norm`, `post_ffn_norm`).
     // x: [batch, q_len, hidden_dim]; returns the same shape.
     pub fn forward(
         &self,
@@ -343,41 +560,78 @@ impl Layer {
         ctx: &StepCtx,
         kv_storage: &mut KvStorage,
     ) -> Result<Tensor> {
-        let (batch, q_len, _) = x.dims3()?;
-        let n_heads = config.n_heads as usize;
-        let n_kv_heads = config.n_kv_heads as usize;
-        let head_dim = config.head_dim();
-
-        // Normalize before attention (pre-norm), not after - this is the
+        // Normalize before the mixer (pre-norm), not after - this is the
         // convention Llama uses, and it's what keeps deep stacks of these
         // blocks stable to train/run.
         let normed = rms_norm(x, &self.attn_norm, config.rms_eps)?;
+        let mixed = match &self.mixer {
+            Mixer::Attention(attn) => attn.forward(&normed, config, ctx, kv_storage)?,
+            Mixer::ShortConv(conv) => conv.forward(&normed, ctx, &mut kv_storage.conv)?,
+        };
+        let mixed = optional_rms_norm(mixed, self.post_attn_norm.as_ref(), config.rms_eps)?;
+
+        // Residual connection: the block adds *to* x rather than replacing it,
+        // so gradients (and, at inference time, information) can flow straight
+        // through even if the mixer contributes very little.
+        let h = x.add(&mixed)?;
+
+        // Same pre-norm pattern before the FFN half of the block.
+        let normed2 = rms_norm(&h, &self.ffn_norm, config.rms_eps)?;
+        let ffn_out = self.ffn.forward(&normed2, config.activation)?;
+        let ffn_out = optional_rms_norm(ffn_out, self.post_ffn_norm.as_ref(), config.rms_eps)?;
+
+        // Second residual connection - this is the block's output.
+        h.add(&ffn_out)
+    }
+}
+
+impl Attention {
+    // normed: [batch, q_len, hidden_dim], the block's normalized input;
+    // returns attention's output, the same shape.
+    fn forward(
+        &self,
+        normed: &Tensor,
+        config: &Config,
+        ctx: &StepCtx,
+        kv_storage: &mut KvStorage,
+    ) -> Result<Tensor> {
+        let (batch, q_len, _) = normed.dims3()?;
+        let n_heads = config.n_heads as usize;
+        let n_kv_heads = config.n_kv_heads as usize;
+        let head_dim = config.head_dim();
 
         // Project into query/key/value space. Q gets n_heads worth of output,
         // K/V get fewer (n_kv_heads) since GQA shares them across several Q
         // heads. Then split the projected dim into per-head chunks and move
         // the head axis in front of the sequence axis:
         // [batch, q_len, heads * head_dim] -> [batch, heads, q_len, head_dim].
-        let q = linear(&normed, &self.attn_q)?
-            .reshape((batch, q_len, n_heads, head_dim))?
-            .transpose(1, 2)?;
-        let k = linear(&normed, &self.attn_k)?
+        let q = linear_bias(normed, &self.q, self.q_bias.as_ref())?
+            .reshape((batch, q_len, n_heads, head_dim))?;
+        let q = optional_rms_norm(q, self.q_norm.as_ref(), config.rms_eps)?.transpose(1, 2)?;
+        let k = linear_bias(normed, &self.k, self.k_bias.as_ref())?
+            .reshape((batch, q_len, n_kv_heads, head_dim))?;
+        let k = optional_rms_norm(k, self.k_norm.as_ref(), config.rms_eps)?.transpose(1, 2)?;
+        let v = linear_bias(normed, &self.v, self.v_bias.as_ref())?
             .reshape((batch, q_len, n_kv_heads, head_dim))?
             .transpose(1, 2)?;
-        let v = linear(&normed, &self.attn_v)?
-            .reshape((batch, q_len, n_kv_heads, head_dim))?
-            .transpose(1, 2)?;
+
+        // Local layers rotate with their own RoPE base and see only their
+        // window of the context.
+        let attn_ctx = match &ctx.local {
+            Some(local) if self.local => local,
+            _ => &ctx.global,
+        };
 
         // RoPE rotates every head identically given the position, so one call
         // per tensor covers all heads. Only Q and K get rotated - V carries
         // content, not position.
-        let q = rope_apply(&q, &ctx.cos, &ctx.sin)?;
-        let k = rope_apply(&k, &ctx.cos, &ctx.sin)?;
+        let q = rope_apply(&q, &attn_ctx.cos, &attn_ctx.sin)?;
+        let k = rope_apply(&k, &attn_ctx.cos, &attn_ctx.sin)?;
 
         // Write this call's tokens into their block slots. The cache wants
         // token-major rows: [batch * q_len, n_kv_heads, head_dim].
         kv_storage.write_tokens(
-            self.index,
+            self.kv_index,
             &ctx.writes,
             &k.transpose(1, 2)?
                 .reshape((batch * q_len, n_kv_heads, head_dim))?,
@@ -386,8 +640,8 @@ impl Layer {
         )?;
         // Read back every sequence's full cached K/V (padded to the batch's
         // longest context) and attend against it.
-        let (k_full, v_full) = kv_storage.gather(self.index, &ctx.gather)?;
-        let attn_out = gqa_attention(&q, &k_full, &v_full, &ctx.mask)?;
+        let (k_full, v_full) = kv_storage.gather(self.kv_index, &ctx.gather)?;
+        let attn_out = gqa_attention(&q, &k_full, &v_full, &attn_ctx.mask)?;
 
         // Merge the heads back into one dimension - inverse of the earlier
         // split - and project down to hidden_dim so it can be added to the
@@ -395,19 +649,42 @@ impl Layer {
         let attn_out = attn_out
             .transpose(1, 2)?
             .reshape((batch, q_len, n_heads * head_dim))?;
-        let attn_out = linear(&attn_out, &self.attn_output)?;
+        linear(&attn_out, &self.o)
+    }
+}
 
-        // Residual connection: the block adds *to* x rather than replacing it,
-        // so gradients (and, at inference time, information) can flow straight
-        // through even if attention contributes very little.
-        let h = x.add(&attn_out)?;
+impl ShortConv {
+    // normed: [batch, q_len, hidden_dim], the block's normalized input;
+    // returns the mixer's output, the same shape.
+    fn forward(&self, normed: &Tensor, ctx: &StepCtx, cache: &mut ConvCache) -> Result<Tensor> {
+        let (_, q_len, hidden) = normed.dims3()?;
+        let kernel = self.conv.dim(1)?;
+        let bcx = linear(normed, &self.in_proj)?;
+        let gate_c = bcx.narrow(2, hidden, hidden)?;
+        let bx = bcx
+            .narrow(2, 0, hidden)?
+            .mul(&bcx.narrow(2, 2 * hidden, hidden)?)?;
 
-        // Same pre-norm pattern before the FFN half of the block.
-        let normed2 = rms_norm(&h, &self.ffn_norm, config.rms_eps)?;
-        let ffn_out = swiglu_ffn(&normed2, &self.ffn_gate, &self.ffn_up, &self.ffn_down)?;
+        // Each item's B*x rows of the `kernel - 1` tokens before this call,
+        // then its new ones: [batch, kernel - 1 + q_len, hidden].
+        let before = ctx
+            .conv
+            .iter()
+            .map(|item| {
+                cache.rows_before(self.conv_index, item, kernel - 1, hidden, normed.device())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rows = Tensor::cat(&[&Tensor::stack(&before, 0)?, &bx], 1)?;
+        cache.update(self.conv_index, &ctx.conv, &rows, kernel - 1)?;
 
-        // Second residual connection - this is the block's output.
-        h.add(&ffn_out)
+        // Token t's output weighs rows t .. t + kernel, i.e. the token itself
+        // and the kernel - 1 before it, with one filter per channel.
+        let tap = |k: usize| self.conv.narrow(1, k, 1)?.squeeze(1);
+        let mut conv = rows.narrow(1, 0, q_len)?.broadcast_mul(&tap(0)?)?;
+        for k in 1..kernel {
+            conv = conv.add(&rows.narrow(1, k, q_len)?.broadcast_mul(&tap(k)?)?)?;
+        }
+        linear(&gate_c.mul(&conv)?, &self.out_proj)
     }
 }
 
@@ -432,6 +709,9 @@ impl Model {
             q_len,
             self.config.hidden_dim as usize,
         ))?;
+        if let Some(scale) = self.config.embedding_scale {
+            x = x.affine(scale as f64, 0.0)?;
+        }
 
         let ctx = StepCtx::new(&self.config, items, device)?;
         // Run through every layer in sequence, each one refining x a bit more.
@@ -528,6 +808,21 @@ mod tests {
     }
 
     #[test]
+    fn rope_factors_divide_each_pairs_frequency() {
+        // head_dim=4, rope_theta=10000 -> theta = [1, 0.01]; factors [2, 4]
+        // make it [0.5, 0.0025], so position 1 rotates by those angles.
+        let (cos, sin) = rope_cos_sin(10000.0, Some(&[2., 4.]), 4, &[1], &Device::Cpu).unwrap();
+        let want_cos = [0.5f32.cos(), 0.0025f32.cos()];
+        let want_sin = [0.5f32.sin(), 0.0025f32.sin()];
+        for (got, want) in flat(&cos).iter().zip(&want_cos) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+        for (got, want) in flat(&sin).iter().zip(&want_sin) {
+            assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
     fn embed_looks_up_rows_in_order() {
         let device = Device::Cpu;
         // vocab_size=3, hidden_dim=2
@@ -605,7 +900,7 @@ mod tests {
         )
         .unwrap();
 
-        let mask = batch_mask(&[0], &[2], 2, 2, &device).unwrap();
+        let mask = batch_mask(&[0], &[2], 2, 2, None, &device).unwrap();
         let out = flat(&gqa_attention(&q, &k, &v, &mask).unwrap());
 
         // Causal mask means position0 can only attend to position0, so its
@@ -662,7 +957,7 @@ mod tests {
         let q = Tensor::randn(0f32, 1., (batch, n_heads, q_len, head_dim), &device).unwrap();
         let k = Tensor::randn(0f32, 1., (batch, n_kv_heads, ctx_len, head_dim), &device).unwrap();
         let v = Tensor::randn(0f32, 1., (batch, n_kv_heads, ctx_len, head_dim), &device).unwrap();
-        let mask = batch_mask(&[3, 1], &[5, 3], q_len, ctx_len, &device).unwrap();
+        let mask = batch_mask(&[3, 1], &[5, 3], q_len, ctx_len, None, &device).unwrap();
 
         let out = gqa_attention(&q, &k, &v, &mask).unwrap();
         assert_eq!(out.dims(), &[batch, n_heads, q_len, head_dim]);
@@ -693,16 +988,28 @@ mod tests {
 
         let token_embd = rand((vocab_size, hidden_dim));
         let layer = Layer {
-            index: 0,
             attn_norm: ones(),
-            attn_q: rand((n_heads * head_dim, hidden_dim)),
-            attn_k: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_v: rand((n_kv_heads * head_dim, hidden_dim)),
-            attn_output: rand((hidden_dim, n_heads * head_dim)),
+            mixer: Mixer::Attention(Attention {
+                kv_index: 0,
+                local: false,
+                q: rand((n_heads * head_dim, hidden_dim)),
+                k: rand((n_kv_heads * head_dim, hidden_dim)),
+                v: rand((n_kv_heads * head_dim, hidden_dim)),
+                o: rand((hidden_dim, n_heads * head_dim)),
+                q_bias: None,
+                k_bias: None,
+                v_bias: None,
+                q_norm: None,
+                k_norm: None,
+            }),
+            post_attn_norm: None,
             ffn_norm: ones(),
-            ffn_gate: rand((ffn_dim, hidden_dim)),
-            ffn_up: rand((ffn_dim, hidden_dim)),
-            ffn_down: rand((hidden_dim, ffn_dim)),
+            ffn: Ffn {
+                gate: rand((ffn_dim, hidden_dim)),
+                up: rand((ffn_dim, hidden_dim)),
+                down: rand((hidden_dim, ffn_dim)),
+            },
+            post_ffn_norm: None,
         };
         Model {
             config: Config {
@@ -710,19 +1017,41 @@ mod tests {
                 n_heads: n_heads as u32,
                 n_kv_heads: n_kv_heads as u32,
                 hidden_dim: hidden_dim as u32,
+                head_dim: head_dim as u32,
                 ffn_dim: ffn_dim as u32,
-                rope_theta: 10000.0,
-                rms_eps: 1e-5,
                 vocab_size: vocab_size as u32,
-                context_length: 8,
-                eos_token_id: 99,
-                bos_token_id: 0,
+                ..Config::for_tests()
             },
             token_embd,
             layers: vec![layer],
             output_norm: ones(),
             output: rand((vocab_size, hidden_dim)),
         }
+    }
+
+    // The tiny model's only layer's attention.
+    fn attention(model: &mut Model) -> &mut Attention {
+        match &mut model.layers[0].mixer {
+            Mixer::Attention(attn) => attn,
+            Mixer::ShortConv(_) => unreachable!("the tiny model's layer is attention"),
+        }
+    }
+
+    // `tiny_model` with a short convolution (kernel 3) for its layer.
+    fn tiny_conv_model() -> Model {
+        let rand = |shape: (usize, usize)| Tensor::rand(0f32, 1., shape, &Device::Cpu).unwrap();
+        let mut model = tiny_model();
+        model.layers[0].mixer = Mixer::ShortConv(ShortConv {
+            conv_index: 0,
+            in_proj: rand((12, 4)),
+            conv: rand((4, 3)),
+            out_proj: rand((4, 4)),
+        });
+        model.config.conv = Some(ConvLayers {
+            layers: vec![0],
+            kernel: 3,
+        });
+        model
     }
 
     // Prefill-shaped item for a sequence living in `blocks` (block_size slots
@@ -738,6 +1067,7 @@ mod tests {
             .map(|p| (blocks[p / block_size], p % block_size))
             .collect();
         BatchItem {
+            seq_id: SequenceId(0),
             tokens,
             write_positions: writes,
             read_blocks: blocks,
@@ -764,6 +1094,252 @@ mod tests {
 
         assert_eq!(out.dims(), &[1, 2, 4]);
         assert_ne!(flat(&out), flat(&x), "block should transform its input");
+    }
+
+    #[test]
+    fn layer_forward_adds_v_bias() {
+        let device = Device::Cpu;
+        let mut model = tiny_model();
+        // With V's weight zeroed, every position's value is the bias, so
+        // attention returns it whatever the scores. An identity output
+        // projection and a zeroed FFN then make the block add exactly
+        // [bias, bias] (one copy per query head) to its input.
+        let attn = attention(&mut model);
+        attn.v = Tensor::zeros((2, 4), DType::F32, &device).unwrap();
+        attn.v_bias = Some(Tensor::new(&[0.5f32, -2.], &device).unwrap());
+        attn.o = Tensor::eye(4, DType::F32, &device).unwrap();
+        let ffn = &mut model.layers[0].ffn;
+        ffn.down = Tensor::zeros((4, 4), DType::F32, &device).unwrap();
+
+        let mut kv = KvStorage::new(1, 1, 2, 1, 2, &device).unwrap();
+        let blocks = [BlockID(0)];
+        let mut writes = Vec::new();
+        let items = [item(&[0, 2], 0, &blocks, 2, &mut writes)];
+        let ctx = StepCtx::new(&model.config, &items, &device).unwrap();
+        let x =
+            Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6., 7., 8.], (1, 2, 4), &device).unwrap();
+        let out = model.layers[0]
+            .forward(&x, &model.config, &ctx, &mut kv)
+            .unwrap();
+
+        let want = [1.5f32, 0., 3.5, 2., 5.5, 4., 7.5, 6.];
+        for (got, want) in flat(&out).iter().zip(&want) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn qk_norm_cancels_the_scale_of_the_qk_projections() {
+        let device = Device::Cpu;
+        let run = |model: &Model| {
+            let mut kv = KvStorage::new(1, 1, 4, 1, 2, &device).unwrap();
+            let blocks = [BlockID(0)];
+            let mut writes = Vec::new();
+            let items = [item(&[0, 2, 1], 0, &blocks, 4, &mut writes)];
+            flat(&model.forward(&items, &mut kv).unwrap())
+        };
+        let scale_qk = |model: &mut Model| {
+            let attn = attention(model);
+            attn.q = attn.q.affine(7.0, 0.0).unwrap();
+            attn.k = attn.k.affine(7.0, 0.0).unwrap();
+        };
+
+        // Without the norms, scaling Q and K sharpens attention.
+        let mut model = tiny_model();
+        let before = run(&model);
+        scale_qk(&mut model);
+        assert_ne!(run(&model), before);
+
+        // With them, each head is normalized before RoPE, so it can't.
+        let norm = Tensor::new(&[0.5f32, 2.], &device).unwrap();
+        attention(&mut model).q_norm = Some(norm.clone());
+        attention(&mut model).k_norm = Some(norm);
+        let before = run(&model);
+        scale_qk(&mut model);
+        for (got, want) in run(&model).iter().zip(&before) {
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn gelu_ffn_identity_weights() {
+        let device = Device::Cpu;
+        // As `swiglu_ffn_identity_weights`, through GELU's tanh approximation
+        // (torch's gelu(approximate="tanh")): gelu([1, 2]) * up([1, 2]).
+        let identity = Tensor::new(&[[1f32, 0.], [0., 1.]], &device).unwrap();
+        let ffn = Ffn {
+            gate: identity.clone(),
+            up: identity.clone(),
+            down: identity,
+        };
+        let x = Tensor::new(&[[1f32, 2.]], &device).unwrap();
+        let out = flat(&ffn.forward(&x, Activation::GeluTanh).unwrap());
+        let expected = [0.841192f32, 3.909195];
+        for (got, want) in out.iter().zip(&expected) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn batch_mask_limits_attention_to_the_window() {
+        // Four queries from position 0 over four keys, window 2: each query
+        // sees itself and the position before it.
+        let mask = flat(&batch_mask(&[0], &[4], 4, 4, Some(2), &Device::Cpu).unwrap());
+        let x = f32::NEG_INFINITY;
+        let rows = [
+            [0., x, x, x],
+            [0., 0., x, x],
+            [x, 0., 0., x],
+            [x, x, 0., 0.],
+        ];
+        assert_eq!(mask, rows.concat());
+    }
+
+    // Logits after `tokens`, run from position 0 on a fresh cache.
+    fn last_logits(model: &Model, tokens: &[u32]) -> Vec<f32> {
+        let mut kv = KvStorage::new(1, 1, 4, 1, 2, &Device::Cpu).unwrap();
+        let blocks = [BlockID(0)];
+        let mut writes = Vec::new();
+        let items = [item(tokens, 0, &blocks, 4, &mut writes)];
+        flat(&model.forward_last(&items, &mut kv).unwrap())
+    }
+
+    #[test]
+    fn local_layer_sees_only_its_window() {
+        let mut model = tiny_model();
+        model.config.local_attention = Some(LocalAttention {
+            window: 1,
+            rope_theta: 10000.0,
+        });
+        // A global layer mixes in the earlier token...
+        let alone = last_logits(&model, &[2]);
+        assert_ne!(last_logits(&model, &[0, 2]), alone);
+        // ...but with a one-position window, a token attends to itself only,
+        // so its output can't depend on what came before.
+        attention(&mut model).local = true;
+        for (got, want) in last_logits(&model, &[0, 2]).iter().zip(&alone) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn post_norms_cancel_the_scale_of_attention_and_ffn_outputs() {
+        let scale_outputs = |model: &mut Model| {
+            let attn = attention(model);
+            attn.o = attn.o.affine(7.0, 0.0).unwrap();
+            let ffn = &mut model.layers[0].ffn;
+            ffn.down = ffn.down.affine(7.0, 0.0).unwrap();
+        };
+        let mut model = tiny_model();
+        let before = last_logits(&model, &[0, 2, 1]);
+        scale_outputs(&mut model);
+        assert_ne!(last_logits(&model, &[0, 2, 1]), before);
+
+        let norm = Tensor::new(&[0.5f32, 2., 1., 3.], &Device::Cpu).unwrap();
+        model.layers[0].post_attn_norm = Some(norm.clone());
+        model.layers[0].post_ffn_norm = Some(norm);
+        let before = last_logits(&model, &[0, 2, 1]);
+        scale_outputs(&mut model);
+        for (got, want) in last_logits(&model, &[0, 2, 1]).iter().zip(&before) {
+            assert!((got - want).abs() < 1e-4, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn embedding_scale_multiplies_the_embeddings() {
+        let mut model = tiny_model();
+        model.config.embedding_scale = Some(3.0);
+        let scaled = last_logits(&model, &[0, 2]);
+        model.config.embedding_scale = None;
+        model.token_embd = model.token_embd.affine(3.0, 0.0).unwrap();
+        for (got, want) in last_logits(&model, &[0, 2]).iter().zip(&scaled) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn short_conv_hand_computed() {
+        let device = Device::Cpu;
+        // hidden_dim 1, and in_proj makes B, C and x all the input, so the
+        // convolution sees x^2 and C gates it with x. Filter [1, 10, 100]
+        // (oldest token first) over inputs [1, 2, 3] from position 0:
+        // conv = [100*1, 10*1 + 100*4, 1*1 + 10*4 + 100*9] = [100, 410, 941],
+        // times x = [100, 820, 2823].
+        let conv = ShortConv {
+            conv_index: 0,
+            in_proj: Tensor::ones((3, 1), DType::F32, &device).unwrap(),
+            conv: Tensor::new(&[[1f32, 10., 100.]], &device).unwrap(),
+            out_proj: Tensor::ones((1, 1), DType::F32, &device).unwrap(),
+        };
+        let config = Config {
+            conv: Some(ConvLayers {
+                layers: vec![0],
+                kernel: 3,
+            }),
+            ..Config::for_tests()
+        };
+        let blocks = [BlockID(0)];
+        let mut writes = Vec::new();
+        let items = [item(&[0, 0, 0], 0, &blocks, 4, &mut writes)];
+        let ctx = StepCtx::new(&config, &items, &device).unwrap();
+        let x = Tensor::new(&[[[1f32], [2.], [3.]]], &device).unwrap();
+        let out = conv.forward(&x, &ctx, &mut ConvCache::new(4)).unwrap();
+        assert_eq!(flat(&out), [100., 820., 2823.]);
+    }
+
+    #[test]
+    fn short_conv_carries_its_state_across_calls() {
+        let model = tiny_conv_model();
+        let tokens = [1u32, 3, 2, 0, 4];
+        let blocks = [BlockID(0), BlockID(1), BlockID(2)];
+        let mut writes = Vec::new();
+        let kv = || KvStorage::new(0, 3, 2, 1, 2, &Device::Cpu).unwrap();
+        let all = model
+            .forward(&[item(&tokens, 0, &blocks, 2, &mut writes)], &mut kv())
+            .unwrap();
+
+        // The same sequence, one token per call.
+        let mut kv = kv();
+        for (p, &token) in tokens.iter().enumerate() {
+            let token = [token];
+            let one = [item(&token, p, &blocks, 2, &mut writes)];
+            let got = flat(&model.forward(&one, &mut kv).unwrap());
+            let want = flat(&all.get(0).unwrap().get(p).unwrap());
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-5, "position {p}: got {g}, want {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn short_conv_resumes_from_cached_blocks() {
+        let model = tiny_conv_model();
+        let tokens = [1u32, 3, 2, 0, 4, 1];
+        let blocks = [BlockID(0), BlockID(1), BlockID(2)];
+        let mut writes = Vec::new();
+        let mut kv = KvStorage::new(0, 3, 2, 1, 2, &Device::Cpu).unwrap();
+        let cold = model
+            .forward(&[item(&tokens, 0, &blocks, 2, &mut writes)], &mut kv)
+            .unwrap();
+
+        // Another sequence with the same prompt reuses its blocks and runs
+        // only the rest: from the end of block 1, or one token before it.
+        for from in [4, 3] {
+            let mut rest = item(&tokens[from..], from, &blocks, 2, &mut writes);
+            rest.seq_id = SequenceId(1);
+            let got = flat(&model.forward(&[rest], &mut kv).unwrap());
+            let want = flat(
+                &cold
+                    .get(0)
+                    .unwrap()
+                    .narrow(0, from, tokens.len() - from)
+                    .unwrap(),
+            );
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-5, "from {from}: got {g}, want {w}");
+            }
+            kv.release(SequenceId(1));
+        }
     }
 
     #[test]

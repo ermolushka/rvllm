@@ -33,10 +33,10 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::chat::{self, END_OF_TURN};
+use crate::chat::{self, ChatFormat};
 use crate::engine::FinishReason;
 use crate::sampler::SamplingParams;
-use crate::tokenizer::{SmollLM230MTokenizer, StreamDecoder};
+use crate::tokenizer::{StreamDecoder, Tokenizer};
 
 use api::*;
 use stop::StopFilter;
@@ -59,7 +59,8 @@ pub struct ServerConfig {
 
 pub struct AppState {
     cfg: ServerConfig,
-    tokenizer: SmollLM230MTokenizer,
+    tokenizer: Tokenizer,
+    chat_format: Option<ChatFormat>,
     jobs: UnboundedSender<Job>,
     slots: Arc<Semaphore>,
     status: Arc<WorkerStatus>,
@@ -69,18 +70,17 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         cfg: ServerConfig,
-        tokenizer: SmollLM230MTokenizer,
+        tokenizer: Tokenizer,
+        chat_format: Option<ChatFormat>,
         jobs: UnboundedSender<Job>,
         status: Arc<WorkerStatus>,
     ) -> Arc<Self> {
         let slots = Arc::new(Semaphore::new(cfg.max_running + cfg.max_queue));
-        let mut stop_tokens = vec![tokenizer.eos_token_id];
-        if let Some(id) = tokenizer.token_to_id(END_OF_TURN) {
-            stop_tokens.push(id);
-        }
+        let stop_tokens = chat::stop_tokens(&tokenizer, chat_format);
         Arc::new(AppState {
             cfg,
             tokenizer,
+            chat_format,
             jobs,
             slots,
             status,
@@ -454,6 +454,11 @@ async fn chat_completions(
     if body.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
+    let Some(format) = state.chat_format else {
+        return Err(ApiError::bad_request(
+            "this model's chat format is unknown; use /v1/completions",
+        ));
+    };
     let messages: Vec<chat::ChatMessage> = body
         .messages
         .into_iter()
@@ -465,7 +470,7 @@ async fn chat_completions(
     let rx = start_generation(
         &state,
         GenRequest {
-            prompt: chat::chatml(&messages),
+            prompt: format.render(&messages),
             max_tokens: body.max_completion_tokens.or(body.max_tokens),
             temperature: body.temperature,
             top_p: body.top_p,
@@ -586,6 +591,15 @@ mod tests {
     }
 
     fn harness(max_running: usize, max_queue: usize, delay_ms: u64) -> Harness {
+        harness_with_format(max_running, max_queue, delay_ms, Some(ChatFormat::SMOLLM2))
+    }
+
+    fn harness_with_format(
+        max_running: usize,
+        max_queue: usize,
+        delay_ms: u64,
+        chat_format: Option<ChatFormat>,
+    ) -> Harness {
         let backend = SlowBackend {
             inner: CountingBackend::new(512),
             delay: Duration::from_millis(delay_ms),
@@ -603,7 +617,7 @@ mod tests {
         let status = Arc::new(WorkerStatus::default());
         let worker_status = status.clone();
         std::thread::spawn(move || worker::run_worker(engine, job_rx, worker_status));
-        let tokenizer = SmollLM230MTokenizer::from_file("tokenizer.json", 999, 0).unwrap();
+        let tokenizer = Tokenizer::from_file("tokenizer.json", 999, 0).unwrap();
         let state = AppState::new(
             ServerConfig {
                 model_name: "test-model".into(),
@@ -616,6 +630,7 @@ mod tests {
                 max_sequence_tokens,
             },
             tokenizer,
+            chat_format,
             job_tx,
             status.clone(),
         );
@@ -771,6 +786,22 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(err["error"]["type"], "invalid_request_error");
         }
+    }
+
+    #[tokio::test]
+    async fn chat_needs_a_known_chat_format() {
+        let h = harness_with_format(4, 4, 0, None);
+        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let resp = h
+            .app
+            .clone()
+            .oneshot(post("/v1/chat/completions", body))
+            .await
+            .unwrap();
+        let (status, err) = json_of(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = err["error"]["message"].as_str().unwrap();
+        assert!(message.contains("chat format is unknown"), "{message}");
     }
 
     #[tokio::test]

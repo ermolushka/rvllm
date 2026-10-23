@@ -66,6 +66,35 @@ impl CudaRuntime {
             include_str!("kernels/f32_to_f16.cu"),
             "f32_to_f16".to_string(),
         )?;
+        self.load_single_kernel(include_str!("kernels/add_bias.cu"), "add_bias".to_string())?;
+        self.load_single_kernel(
+            include_str!("kernels/gelu_gate_multiply.cu"),
+            "gelu_gate_multiply".to_string(),
+        )?;
+        self.load_single_kernel(
+            include_str!("kernels/scale_inplace.cu"),
+            "scale_inplace".to_string(),
+        )?;
+        self.load_module_kernels(
+            include_str!("kernels/short_conv.cu"),
+            &["short_conv_bx", "short_conv_filter_gate"],
+        )?;
+        Ok(())
+    }
+
+    // Like `load_single_kernel`, for a source file with several kernels: one
+    // compile, then every named function is taken from that module.
+    pub fn load_module_kernels(
+        &mut self,
+        source: &str,
+        kernel_names: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ptx = cudarc::nvrtc::compile_ptx(source)?;
+        let module = self.ctx.load_module(ptx)?;
+        for name in kernel_names {
+            let kernel = module.load_function(name)?;
+            self.kernels_mapping.insert(name.to_string(), kernel);
+        }
         Ok(())
     }
 
@@ -80,5 +109,24 @@ impl CudaRuntime {
         self.kernels_mapping.insert(kernel_name, kernel);
 
         Ok(())
+    }
+}
+
+// For GPU tests: a runtime on device 0, or None when there is no usable CUDA
+// device. Without a device the test is skipped with a note on stderr; set
+// RVLLM_REQUIRE_CUDA to make a missing device a test failure instead, so a
+// GPU test can't pass without running anything on the GPU.
+#[cfg(test)]
+pub fn test_runtime() -> Option<CudaRuntime> {
+    match CudaRuntime::new(0) {
+        Ok(runtime) => Some(runtime),
+        Err(e) => {
+            assert!(
+                std::env::var_os("RVLLM_REQUIRE_CUDA").is_none(),
+                "RVLLM_REQUIRE_CUDA is set but CUDA init failed: {e}"
+            );
+            eprintln!("skipping CUDA test: {e}");
+            None
+        }
     }
 }
