@@ -35,6 +35,29 @@ fn metadata<'a, T>(
     }
 }
 
+// The (architecture, layers, width) of each model the README lists as tested.
+const TESTED_SHAPES: &[(Arch, u32, u32)] = &[
+    (Arch::Llama, 32, 960),  // SmolLM2-360M, base and Instruct
+    (Arch::Llama, 16, 2048), // Llama-3.2-1B-Instruct
+    (Arch::Qwen2, 24, 896),  // Qwen2.5-0.5B-Instruct
+    (Arch::Qwen3, 28, 1024), // Qwen3-0.6B
+    (Arch::Gemma3, 18, 640), // gemma-3-270m-it
+    (Arch::Lfm2, 16, 2048),  // LFM2.5-1.2B-Instruct
+];
+
+// Whether the model has the shape of one the README lists as tested. Shapes
+// are the only thing to compare: `general.name` varies between conversions.
+fn is_tested_shape(config: &Config) -> bool {
+    TESTED_SHAPES.contains(&(config.arch, config.n_layers, config.hidden_dim))
+}
+
+// The RoPE scaling the metadata declares, from `{arch}.rope.scaling.type`.
+fn rope_scaling_type(md: &HashMap<String, Value>) -> Result<Option<&str>> {
+    let arch = metadata(md, "general.architecture", Value::to_string)?;
+    let key = format!("{arch}.rope.scaling.type");
+    Ok(optional_metadata(md, &key, Value::to_string)?.map(String::as_str))
+}
+
 // A count from a GGUF integer array: llama.cpp writes per-layer values as
 // I32, single ones as U32.
 fn count(value: &Value) -> Result<u32> {
@@ -233,6 +256,16 @@ impl Config {
                 .cloned()
         };
 
+        // Only Llama 3's frequency factors are implemented, and they arrive as a
+        // tensor (see `Model::load`). Any other scaling would silently run
+        // unscaled RoPE, so refuse it instead.
+        match rope_scaling_type(md)? {
+            None | Some("none") | Some("llama3") => {}
+            Some(other) => candle_core::bail!(
+                "unsupported RoPE scaling {other:?} in {arch_name} (only llama3 is implemented)"
+            ),
+        }
+
         Ok(Config {
             arch,
             n_layers,
@@ -274,6 +307,15 @@ impl Model {
         };
         let mut config =
             Config::from_gguf_metadata(&content.metadata, token_embd_info.shape.dim(0)? as u32)?;
+        // Other sizes of a supported family load, since their shapes are checked
+        // below, but nothing has been verified for them, so say so.
+        if !is_tested_shape(&config) {
+            let arch_name = metadata(&content.metadata, "general.architecture", Value::to_string)?;
+            eprintln!(
+                "warning: this {arch_name} model ({} layers, width {}) is not one of rvllm's tested models; its output is unverified",
+                config.n_layers, config.hidden_dim
+            );
+        }
         let device = Device::Cpu;
         // Checking each weight's shape against the config makes a file whose
         // tensors and metadata disagree fail here, not on the first request.
@@ -306,6 +348,10 @@ impl Model {
         if content.tensor_infos.contains_key("rope_freqs.weight") {
             let factors = load("rope_freqs.weight", &[config.head_dim() / 2])?;
             config.rope_factors = Some(factors.to_vec1()?);
+        } else if rope_scaling_type(&content.metadata)? == Some("llama3") {
+            candle_core::bail!(
+                "the GGUF declares llama3 RoPE scaling but has no rope_freqs.weight tensor"
+            );
         }
 
         let conv_layers = config
@@ -740,6 +786,53 @@ mod tests {
         let factors = Tensor::new(&[1f32, 8.], &Device::Cpu)?;
         tensors.push(("rope_freqs.weight", factors));
         let model = load_gguf("rope-freqs", &tiny_llama_metadata(), &tensors)?;
+        assert_eq!(model.config.rope_factors, Some(vec![1., 8.]));
+        Ok(())
+    }
+
+    #[test]
+    fn tested_shapes_are_recognised() -> Result<()> {
+        // SmolLM2-360M's shape is in the tested list; the tiny test model's isn't.
+        let config = Config::from_gguf_metadata(&smollm2_metadata(), 49152)?;
+        assert!(is_tested_shape(&config));
+        let tiny = Config::from_gguf_metadata(&tiny_llama_metadata(), 5)?;
+        assert!(!is_tested_shape(&tiny));
+        Ok(())
+    }
+
+    #[test]
+    fn rope_scaling_other_than_llama3_is_refused() {
+        let mut md = tiny_llama_metadata();
+        md.insert(
+            "llama.rope.scaling.type".into(),
+            Value::String("yarn".into()),
+        );
+        let err = Config::from_gguf_metadata(&md, 5).unwrap_err();
+        assert!(err.to_string().contains("yarn"), "{err}");
+
+        md.insert(
+            "llama.rope.scaling.type".into(),
+            Value::String("none".into()),
+        );
+        assert!(Config::from_gguf_metadata(&md, 5).is_ok());
+    }
+
+    #[test]
+    fn llama3_scaling_needs_its_factor_tensor() -> Result<()> {
+        let mut md = tiny_llama_metadata();
+        md.insert(
+            "llama.rope.scaling.type".into(),
+            Value::String("llama3".into()),
+        );
+        let mut tensors = tiny_llama_tensors(&rows(8, 8)?, &rows(4, 8)?)?;
+        let Err(err) = load_gguf("llama3-no-freqs", &md, &tensors) else {
+            panic!("loaded llama3 scaling without rope_freqs.weight");
+        };
+        assert!(err.to_string().contains("rope_freqs.weight"), "{err}");
+
+        // head_dim 4: one factor per dimension pair.
+        tensors.push(("rope_freqs.weight", Tensor::new(&[1f32, 8.], &Device::Cpu)?));
+        let model = load_gguf("llama3-freqs", &md, &tensors)?;
         assert_eq!(model.config.rope_factors, Some(vec![1., 8.]));
         Ok(())
     }

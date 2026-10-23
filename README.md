@@ -38,8 +38,9 @@ Each is tested end to end on the CPU and on CUDA, including multi-turn history
 via `--chat` and `/v1/chat/completions` and stopping at the end of the model's
 turn. `--chat`
 uses the model's chat format where rvllm knows it and refuses otherwise; plain
-completion works either way. Other models of these architectures may load, but
-aren't tested. Base models aren't chat-tuned, so don't expect sensible answers
+completion works either way. Other models of these architectures load with a
+warning on stderr, because they aren't tested: a model counts as tested when its
+architecture, layer count and width match one of the models above. Base models aren't chat-tuned, so don't expect sensible answers
 from `--chat` with a base file.
 
 Everything is dequantized to F32 on load (F16 on the GPU), so a model needs
