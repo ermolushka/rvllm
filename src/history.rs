@@ -77,6 +77,9 @@ struct Budget {
     // Where compaction stops. Below `limit`, so a long chat isn't compacted
     // again on every turn.
     target: usize,
+    // Tokens of the answer so far. They count towards the prompt, but not
+    // towards a summary request, which is a request of its own.
+    pending: usize,
 }
 
 // One chat: the system prompt, the summary of turns folded away so far, and
@@ -135,9 +138,10 @@ impl History {
 
     // Compacts the history so the prompt fits: the most one request can hold
     // (`max_sequence_tokens`) less the `max_tokens` the answer may take.
-    // `measure` counts the tokens of rendered messages. `summarize` writes a
-    // summary of the messages it's given, at most the number of tokens it's
-    // also given.
+    // `measure` counts the tokens of rendered messages. `pending` is how many
+    // tokens of the answer so far count towards the prompt too. `summarize`
+    // writes a summary of the messages it's given, at most the number of tokens
+    // it's also given.
     //
     // Does nothing if the prompt already fits. If the system prompt and the
     // newest message don't fit on their own, nothing changes either, so the
@@ -147,6 +151,7 @@ impl History {
         strategy: Strategy,
         max_sequence_tokens: usize,
         max_tokens: usize,
+        pending: usize,
         measure: M,
         mut summarize: S,
     ) -> Result<Compaction, BoxError>
@@ -158,7 +163,7 @@ impl History {
         // holds beside it. If that is nothing, nothing can be compacted to fit.
         let limit = max_sequence_tokens.saturating_sub(max_tokens);
         let mut report = Compaction::default();
-        if measure(&self.messages())? <= limit {
+        if measure(&self.messages())? + pending <= limit {
             return Ok(report);
         }
         let newest_alone = History {
@@ -166,7 +171,7 @@ impl History {
             summary: None,
             turns: self.turns.last().cloned().into_iter().collect(),
         };
-        if measure(&newest_alone.messages())? > limit {
+        if measure(&newest_alone.messages())? + pending > limit {
             return Ok(report);
         }
 
@@ -174,6 +179,7 @@ impl History {
             max_sequence: max_sequence_tokens,
             limit,
             target: limit * 3 / 4,
+            pending,
         };
         if strategy == Strategy::Summarize && self.turns.len() > 1 {
             match self.summarize_oldest(budget, &measure, &mut summarize)? {
@@ -209,7 +215,7 @@ impl History {
         M: Fn(&[ChatMessage]) -> Result<usize, BoxError>,
         S: FnMut(&[ChatMessage], usize) -> Result<String, BoxError>,
     {
-        let before = measure(&self.messages())?;
+        let before = measure(&self.messages())? + budget.pending;
         let cap = summary_cap(budget.limit);
         // While folding, the summary counts as a placeholder of `cap` tokens.
         // The old summary is replaced by the new one, and a summary stands in
@@ -220,7 +226,8 @@ impl History {
         // At least one pair is always folded, so an old summary is rolled
         // forward rather than silently dropped to make room.
         while rest.turns.len() > 1
-            && (folded.is_empty() || measure(&rest.messages())? + cap > budget.target)
+            && (folded.is_empty()
+                || measure(&rest.messages())? + budget.pending + cap > budget.target)
         {
             let n = 2.min(rest.turns.len() - 1);
             folded.extend(rest.turns.drain(..n));
@@ -250,7 +257,7 @@ impl History {
             return Ok(Err("the model wrote no summary".into()));
         }
         rest.summary = Some(summary.to_string());
-        if measure(&rest.messages())? >= before {
+        if measure(&rest.messages())? + budget.pending >= before {
             return Ok(Err("the summary doesn't shrink the prompt".into()));
         }
         *self = rest;
@@ -266,13 +273,13 @@ impl History {
         M: Fn(&[ChatMessage]) -> Result<usize, BoxError>,
     {
         let mut dropped = 0;
-        while self.turns.len() > 1 && measure(&self.messages())? > budget.target {
+        while self.turns.len() > 1 && measure(&self.messages())? + budget.pending > budget.target {
             let n = 2.min(self.turns.len() - 1);
             self.turns.drain(..n);
             dropped += n;
         }
         let mut summary_dropped = false;
-        if self.summary.is_some() && measure(&self.messages())? > budget.limit {
+        if self.summary.is_some() && measure(&self.messages())? + budget.pending > budget.limit {
             self.summary = None;
             summary_dropped = true;
         }
@@ -356,6 +363,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |_, _| panic!("nothing to summarize"),
             )
@@ -368,9 +376,14 @@ mod tests {
     fn drop_removes_the_oldest_pairs_and_keeps_the_newest() {
         let mut history = chat(Some("sys"), 5);
         let report = history
-            .fit(Strategy::Drop, MAX_SEQUENCE, MAX_TOKENS, chars, |_, _| {
-                panic!("drop never summarizes")
-            })
+            .fit(
+                Strategy::Drop,
+                MAX_SEQUENCE,
+                MAX_TOKENS,
+                0,
+                chars,
+                |_, _| panic!("drop never summarizes"),
+            )
             .unwrap();
         assert!(report.dropped > 0 && report.dropped.is_multiple_of(2));
         assert_eq!(report.summarized, 0);
@@ -396,6 +409,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |messages, cap| {
                     asked.push((messages.to_vec(), cap));
@@ -433,6 +447,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |_, _| Ok("first".into()),
             )
@@ -447,6 +462,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |messages, _| {
                     request_text = messages[1].content.clone();
@@ -466,6 +482,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |_, _| Err("model refused".into()),
             )
@@ -485,6 +502,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |_, _| Ok("S".repeat(5000)),
             )
@@ -509,6 +527,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |_, _| panic!("nothing should be summarized"),
             )
@@ -525,6 +544,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |_, _| Ok("summary".into()),
             )
@@ -545,7 +565,7 @@ mod tests {
         history.push("user", tagged("N"));
         history.summary = Some("S".repeat(850));
         let report = history
-            .fit(Strategy::Summarize, 1000, 100, chars, |_, _| {
+            .fit(Strategy::Summarize, 1000, 100, 0, chars, |_, _| {
                 panic!("the request doesn't fit, so the model is not asked")
             })
             .unwrap();
@@ -568,7 +588,7 @@ mod tests {
         let mut history = chat(None, 5);
         let before: Vec<String> = history.messages().into_iter().map(|m| m.content).collect();
         let report = history
-            .fit(Strategy::Drop, 1000, 5000, chars, |_, _| {
+            .fit(Strategy::Drop, 1000, 5000, 0, chars, |_, _| {
                 panic!("drop never summarizes")
             })
             .unwrap();
@@ -580,6 +600,25 @@ mod tests {
     // Esc during the summary is not a failed summary: the error comes back, and
     // no turn is dropped.
     #[test]
+    fn answer_so_far_counts_towards_the_prompt_but_not_the_summary_request() {
+        // 1000 tokens in the pool and 100 for the answer leave 900 for the
+        // prompt. 500 tokens of answer so far push the prompt over that, but
+        // the summary request is a request of its own, so it still fits.
+        let mut history = chat(None, 4);
+        let mut asked = 0;
+        let report = history
+            .fit(Strategy::Summarize, 1000, 100, 500, chars, |_, _| {
+                asked += 1;
+                Ok("summary".into())
+            })
+            .unwrap();
+        assert_eq!(asked, 1);
+        assert!(!report.summary_failed());
+        assert!(report.summarized > 0);
+        assert!(chars(&history.messages()).unwrap() + 500 <= 900);
+    }
+
+    #[test]
     fn cancelled_summary_leaves_history_unchanged() {
         let mut history = chat(Some("sys"), 5);
         let before: Vec<String> = history.messages().into_iter().map(|m| m.content).collect();
@@ -588,6 +627,7 @@ mod tests {
                 Strategy::Summarize,
                 MAX_SEQUENCE,
                 MAX_TOKENS,
+                0,
                 chars,
                 |_, _| Err(Cancelled.into()),
             )
@@ -614,7 +654,7 @@ mod tests {
         }
         history.push("user", tagged("N"));
         history
-            .fit(Strategy::Summarize, 1000, 100, chars, |_, _| {
+            .fit(Strategy::Summarize, 1000, 100, 0, chars, |_, _| {
                 Ok("first".repeat(45))
             })
             .unwrap();
@@ -625,7 +665,7 @@ mod tests {
 
         let mut request_sizes = Vec::new();
         let report = history
-            .fit(Strategy::Summarize, 1000, 100, chars, |messages, cap| {
+            .fit(Strategy::Summarize, 1000, 100, 0, chars, |messages, cap| {
                 request_sizes.push(chars(messages).unwrap() + cap);
                 Ok("second".into())
             })
@@ -649,7 +689,7 @@ mod tests {
         let mut request = String::new();
         let mut request_size = 0;
         let report = history
-            .fit(Strategy::Summarize, 700, 100, chars, |messages, cap| {
+            .fit(Strategy::Summarize, 700, 100, 0, chars, |messages, cap| {
                 request = messages[1].content.clone();
                 request_size = chars(messages).unwrap() + cap;
                 Ok("summary".into())

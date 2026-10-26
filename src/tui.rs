@@ -291,8 +291,19 @@ fn generate<B: engine::Backend>(
     Ok(())
 }
 
+// The room kept free for an answer: its length, but at most a quarter of the
+// pool, so a long answer can't squeeze the history out. An answer that outgrows
+// that room is continued after compaction.
+fn answer_reserve(max_tokens: usize, pool: usize) -> usize {
+    max_tokens.min(pool / 4).max(1)
+}
+
+// How many times one answer may be continued after compaction.
+const MAX_CONTINUATIONS: usize = 64;
+
 // Builds the prompt for `turn`, then streams the reply to the transcript. In
-// chat, the history is compacted first, so the prompt fits the budget.
+// chat, an answer that fills the pool is continued after the history is
+// compacted, so the pool never cuts it short.
 fn send<B: engine::Backend>(
     ctx: &WorkerCtx,
     engine: &mut Engine<B>,
@@ -302,23 +313,104 @@ fn send<B: engine::Backend>(
     turn: &Turn,
     settings: &Settings,
 ) -> Result<Reply, BoxError> {
-    let prompt = match chat_format.filter(|_| settings.chat) {
+    let pool = engine.max_sequence_tokens();
+    let format = chat_format.filter(|_| settings.chat);
+    let mut base = match format {
         Some(format) => {
-            compact(ctx, engine, tokenizer, format, history, settings.max_tokens)?;
+            let reserve = answer_reserve(settings.max_tokens, pool);
+            compact(ctx, engine, tokenizer, format, history, reserve, 0)?;
             tokenizer.encode(&format.render(&history.messages()))?
         }
         None => tokenizer.encode(&turn.line)?,
     };
-    let request = Request {
-        tokens: prompt,
-        max_tokens: settings.max_tokens,
-        stop_tokens: chat::stop_tokens(tokenizer, chat_format),
-        sampler: Sampler::from_params(settings.sampling),
-    };
+    let stop_tokens = chat::stop_tokens(tokenizer, chat_format);
     let _ = ctx.tx.send(Event::Accepted(turn.id));
-    run_request(engine, tokenizer, &ctx.cancel, request, |text| {
-        ctx.tx.send(Event::Token(text.to_string())).is_ok()
-    })
+    let mut reply = Reply::default();
+    let mut continuations = 0;
+    loop {
+        // Each segment resumes from the prompt plus the answer so far. It grows
+        // until the pool is full; then the history is compacted and it carries
+        // on, if the pool has room for `reserve` tokens after that.
+        let remaining = settings.max_tokens - reply.ids.len();
+        let mut tokens = base.clone();
+        tokens.extend_from_slice(&reply.ids);
+        let room = match format {
+            Some(_) => pool.saturating_sub(tokens.len()),
+            None => remaining,
+        };
+        let segment = remaining.min(room);
+        if segment == 0 {
+            let _ = ctx.tx.send(Event::Notice(
+                "the answer stopped: the history can't make room to continue it".into(),
+            ));
+            break;
+        }
+        let request = Request {
+            tokens,
+            max_tokens: segment,
+            stop_tokens: stop_tokens.clone(),
+            sampler: Sampler::from_params(settings.sampling),
+        };
+        let part = run_request(
+            engine,
+            tokenizer,
+            &ctx.cancel,
+            request,
+            format.is_some(),
+            |text| ctx.tx.send(Event::Token(text.to_string())).is_ok(),
+        )?;
+        reply.text.push_str(&part.text);
+        reply.ids.extend_from_slice(&part.ids);
+        reply.tokens += part.tokens;
+        reply.secs += part.secs;
+        reply.hit_limit = part.hit_limit && segment == remaining;
+        reply.cancelled = part.cancelled;
+        // The segment ended for want of room, not because the answer is done.
+        let continues = part.pool_full || (part.hit_limit && segment < remaining);
+        if !continues || part.cancelled {
+            break;
+        }
+        continuations += 1;
+        if continuations > MAX_CONTINUATIONS {
+            let _ = ctx.tx.send(Event::Notice(format!(
+                "the answer stopped after {MAX_CONTINUATIONS} continuations"
+            )));
+            break;
+        }
+        let Some(chat_format) = format else { break };
+        // Compact the older turns to make room beside the answer so far, then
+        // carry on from there. The budget is the pool less the reserve, as for
+        // the first prompt.
+        let reserve = answer_reserve(settings.max_tokens - reply.ids.len(), pool);
+        match compact(
+            ctx,
+            engine,
+            tokenizer,
+            chat_format,
+            history,
+            reserve,
+            reply.ids.len(),
+        ) {
+            Ok(_) => {}
+            // Esc during the summary keeps the answer so far.
+            Err(e) if e.is::<history::Cancelled>() => {
+                reply.cancelled = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+        base = tokenizer.encode(&chat_format.render(&history.messages()))?;
+        if pool.saturating_sub(base.len() + reply.ids.len()) < reserve {
+            let _ = ctx.tx.send(Event::Notice(
+                "the answer stopped: the history can't make room to continue it".into(),
+            ));
+            break;
+        }
+        let _ = ctx.tx.send(Event::Notice(
+            "continuing the answer after compacting the history".into(),
+        ));
+    }
+    Ok(reply)
 }
 
 // What a request produced. `secs` is the time from its first step on, so it
@@ -327,7 +419,11 @@ fn send<B: engine::Backend>(
 struct Reply {
     text: String,
     tokens: usize,
+    // The generated token ids, in order, so a continuation resumes exactly.
+    ids: Vec<u32>,
     hit_limit: bool,
+    // The pool filled while this was the only request, so it can be continued.
+    pool_full: bool,
     cancelled: bool,
     secs: f64,
 }
@@ -335,15 +431,20 @@ struct Reply {
 // Runs `request` to the end, handing each piece of its text to `on_text`,
 // which returns false to stop early. Setting `cancel` stops it too. If it
 // fails part way, the request is aborted, so it doesn't keep running in the
-// engine.
+// engine. A `continuable` request may stop with `pool_full`.
 fn run_request<B: engine::Backend>(
     engine: &mut Engine<B>,
     tokenizer: &Tokenizer,
     cancel: &AtomicBool,
     request: Request,
+    continuable: bool,
     mut on_text: impl FnMut(&str) -> bool,
 ) -> Result<Reply, BoxError> {
-    let id = engine.add_request(request)?;
+    let id = if continuable {
+        engine.add_continuable_request(request)?
+    } else {
+        engine.add_request(request)?
+    };
     let mut reply = Reply::default();
     let started = Instant::now();
     if let Err(e) = decode_request(engine, tokenizer, cancel, id, &mut reply, &mut on_text) {
@@ -376,6 +477,7 @@ fn decode_request<B: engine::Backend>(
                 continue;
             }
             reply.tokens += 1;
+            reply.ids.push(ev.token);
             // A stop token is not part of the text. The last token of any other
             // finish is followed by whatever the decoder still holds.
             let text = match ev.finish {
@@ -393,6 +495,7 @@ fn decode_request<B: engine::Backend>(
                 break 'generate;
             }
             reply.hit_limit = ev.finish == Some(engine::FinishReason::Length);
+            reply.pool_full = ev.finish == Some(engine::FinishReason::PoolFull);
             if ev.finish.is_some() {
                 break 'generate;
             }
@@ -402,7 +505,8 @@ fn decode_request<B: engine::Backend>(
 }
 
 // Fits the chat history under the prompt budget: the pool less `reserve`
-// tokens for the answer. Says in the transcript what that cost.
+// tokens for the answer. The `extra` tokens of the answer so far count towards
+// the prompt too. Says in the transcript what that cost.
 fn compact<B: engine::Backend>(
     ctx: &WorkerCtx,
     engine: &mut Engine<B>,
@@ -410,11 +514,13 @@ fn compact<B: engine::Backend>(
     format: ChatFormat,
     history: &mut History,
     reserve: usize,
+    extra: usize,
 ) -> Result<history::Compaction, BoxError> {
     let report = history.fit(
         ctx.opts.compact,
         engine.max_sequence_tokens(),
         reserve,
+        extra,
         |messages| Ok(tokenizer.encode(&format.render(messages))?.len()),
         |messages, cap| {
             // Shown before the model starts writing, since the summary isn't streamed.
@@ -450,7 +556,7 @@ fn summarize<B: engine::Backend>(
             seed: 0,
         }),
     };
-    let reply = run_request(engine, tokenizer, &ctx.cancel, request, |_| true)?;
+    let reply = run_request(engine, tokenizer, &ctx.cancel, request, false, |_| true)?;
     if reply.cancelled {
         return Err(history::Cancelled.into());
     }
@@ -592,6 +698,8 @@ struct App {
     quit: bool,
     // Messages typed but not yet accepted by the worker.
     outbox: Outbox,
+    // The last transcript entry is the reply being written.
+    answering: bool,
 }
 
 #[derive(PartialEq)]
@@ -730,11 +838,21 @@ impl App {
                         answer.push_str(&text);
                     }
                 }
-                Event::Notice(text) => self.transcript.push((Role::Notice, text)),
+                Event::Notice(text) => {
+                    // While a reply is being written, its entry is the last one
+                    // and tokens still go to it, so the notice goes before it.
+                    if self.answering {
+                        let at = self.transcript.len() - 1;
+                        self.transcript.insert(at, (Role::Notice, text));
+                    } else {
+                        self.transcript.push((Role::Notice, text));
+                    }
+                }
                 Event::Accepted(id) => {
                     if let Some(text) = self.outbox.accepted(id) {
                         self.transcript.push((Role::User, text));
                         self.transcript.push((Role::Assistant, String::new()));
+                        self.answering = true;
                         self.scroll_up = 0;
                     }
                 }
@@ -750,6 +868,7 @@ impl App {
                     secs,
                     hit_limit,
                 } => {
+                    self.answering = false;
                     // A cancelled generation can finish after a model switch
                     // was already requested.
                     if self.status == Status::Generating {
@@ -765,6 +884,7 @@ impl App {
                     self.dispatch();
                 }
                 Event::Error(e) => {
+                    self.answering = false;
                     self.transcript.push((Role::Notice, format!("error: {e}")));
                     // A failed load leaves the previous model unusable (the
                     // worker already dropped it), so go back to the picker.
@@ -1259,6 +1379,7 @@ pub fn run(opts: TuiOptions) -> Result<(), BoxError> {
         picker: None,
         quit: false,
         outbox: Outbox::default(),
+        answering: false,
     };
     match &opts.initial_model {
         Some(path) => app.load(&ModelEntry {
@@ -1409,6 +1530,7 @@ mod tests {
             &tokenizer(),
             &cancel,
             request(vec![1, 2, 3], 3),
+            false,
             |_| true,
         );
         assert!(result.is_err());
@@ -1530,6 +1652,45 @@ mod tests {
         assert!(!outbox.refused());
         assert!(outbox.next_to_send().is_none());
         assert_eq!(outbox.texts().collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn answer_reserve_is_at_most_a_quarter_of_the_pool() {
+        assert_eq!(answer_reserve(256, 4096), 256);
+        assert_eq!(answer_reserve(2048, 4096), 1024);
+        assert_eq!(answer_reserve(300, 256), 64);
+        assert_eq!(answer_reserve(0, 256), 1);
+    }
+
+    #[test]
+    fn a_full_pool_stops_the_segment_with_its_tokens() {
+        // 4 blocks of 4 slots: from a 3-token prompt, 14 tokens fill the pool.
+        let mut engine = Engine::new(
+            CountingBackend::new(8192),
+            EngineConfig {
+                block_size: 4,
+                num_blocks: 4,
+                max_running: 4,
+            },
+        );
+        let id = engine
+            .add_continuable_request(request(vec![1, 2, 3], 40))
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut reply = empty_reply();
+        decode_request(
+            &mut engine,
+            &tokenizer(),
+            &cancel,
+            id,
+            &mut reply,
+            &mut |_| true,
+        )
+        .unwrap();
+        assert!(reply.pool_full);
+        assert!(!reply.hit_limit);
+        assert_eq!(reply.ids.len(), 14);
+        assert_eq!(reply.tokens, 14);
     }
 
     #[test]
