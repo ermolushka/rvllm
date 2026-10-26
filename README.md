@@ -115,6 +115,17 @@ PgUp/PgDn scroll, Ctrl-C quit. The sampling, `--chat`, `--system`,
 `--max-tokens`, `--device` and KV flags apply as in the plain interactive loop;
 `--prompt`/`--debug`/`--arrival-step` can't be combined with `--tui`.
 
+A chat resends its whole history each turn, so it eventually outgrows the KV
+cache. The pool is `--num-blocks` × `--block-size` tokens (the context length
+up to 4096 by default), capped at the context length. The answer keeps room for
+its full `--max-tokens`, and the prompt gets the rest. When the rendered prompt
+is over that budget, the TUI compacts the history to about three quarters of it
+and notes what it did in the transcript. `--compact summarize` (the default) has
+the loaded model fold the oldest turns into a summary kept in the system prompt;
+`--compact drop` removes the oldest user/assistant pairs instead. If the summary
+can't be written, the TUI drops turns. If the system prompt and newest message
+alone don't fit, the request is refused as before.
+
 ## Server mode
 
 ```

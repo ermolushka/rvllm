@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use kv_cache_scheduler::sequence::SequenceId;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,6 +24,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::chat::{self, ChatFormat, ChatMessage};
 use crate::engine::{self, BoxError, Engine, EngineConfig, Request};
+use crate::history::{self, History, Strategy};
 use crate::model::Model;
 use crate::runtime::Runtime;
 use crate::sampler::{Sampler, SamplingParams};
@@ -43,6 +45,8 @@ pub struct TuiOptions {
     pub models_dir: PathBuf,
     // Load this model right away instead of opening the picker.
     pub initial_model: Option<PathBuf>,
+    // What to do with old turns once a chat outgrows the KV budget.
+    pub compact: Strategy,
 }
 
 #[derive(Clone)]
@@ -136,8 +140,12 @@ enum Event {
         secs: f64,
         hit_limit: bool,
     },
+    // A line for the transcript, such as what compaction did.
+    Notice(String),
     // The worker took this message into the chat, so it is no longer unsent.
     Accepted(u64),
+    // The send was stopped before it got a reply, so no reply entry is kept.
+    Stopped,
     Error(String),
 }
 
@@ -204,20 +212,11 @@ fn session(
     let _ = ctx.tx.send(Event::Ready { name, context });
 
     // Every chat, including one started with Ctrl-N, opens with the system
-    // prompt: the model's default one, if it has one, then `--system`.
-    let opening = || -> Vec<ChatMessage> {
-        chat::system_prompt(chat_format, opts.system.as_deref())
-            .map(|system| ChatMessage {
-                role: "system".into(),
-                content: system,
-            })
-            .into_iter()
-            .collect()
-    };
-    let mut history = opening();
+    // prompt, if one was given.
+    let mut history = History::new(chat::system_prompt(chat_format, opts.system.as_deref()));
     loop {
         match rx.recv() {
-            Ok(Cmd::NewChat) => history = opening(),
+            Ok(Cmd::NewChat) => history.clear(),
             Ok(load @ Cmd::Load { .. }) => return Ok(Some(load)),
             Ok(Cmd::Send(id, line, settings)) => {
                 if let Err(e) = generate(
@@ -242,80 +241,237 @@ fn generate<B: engine::Backend>(
     engine: &mut Engine<B>,
     tokenizer: &Tokenizer,
     chat_format: Option<ChatFormat>,
-    history: &mut Vec<ChatMessage>,
+    history: &mut History,
     turn: Turn,
     settings: &Settings,
 ) -> Result<(), BoxError> {
     let chat = settings.chat;
-    let prompt = if chat {
-        let format = chat_format.ok_or("this model's chat format is unknown; turn chat off")?;
-        history.push(ChatMessage {
-            role: "user".into(),
-            content: turn.line,
-        });
-        format.render(history)
-    } else {
-        turn.line
+    // Cleared before compacting, so an Esc during a summary stops the send.
+    ctx.cancel.store(false, Ordering::Relaxed);
+    if chat {
+        if chat_format.is_none() {
+            return Err("this model's chat format is unknown; turn chat off".into());
+        }
+        history.push("user", turn.line.clone());
+    }
+    let reply = match send(
+        ctx,
+        engine,
+        tokenizer,
+        chat_format,
+        history,
+        &turn,
+        settings,
+    ) {
+        Ok(reply) => reply,
+        Err(e) => {
+            // The turn never got an answer, so it doesn't stay in the history.
+            if chat {
+                history.pop();
+            }
+            if e.is::<history::Cancelled>() {
+                // Esc while summarizing stops the send: no reply, and no error.
+                let _ = ctx.tx.send(Event::Notice(
+                    "stopped while summarizing; the message was not sent".into(),
+                ));
+                let _ = ctx.tx.send(Event::Stopped);
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
+    if chat {
+        history.push("assistant", reply.text);
+    }
+    let _ = ctx.tx.send(Event::Finished {
+        tokens: reply.tokens,
+        secs: reply.secs,
+        hit_limit: reply.hit_limit,
+    });
+    Ok(())
+}
+
+// Builds the prompt for `turn`, then streams the reply to the transcript. In
+// chat, the history is compacted first, so the prompt fits the budget.
+fn send<B: engine::Backend>(
+    ctx: &WorkerCtx,
+    engine: &mut Engine<B>,
+    tokenizer: &Tokenizer,
+    chat_format: Option<ChatFormat>,
+    history: &mut History,
+    turn: &Turn,
+    settings: &Settings,
+) -> Result<Reply, BoxError> {
+    let prompt = match chat_format.filter(|_| settings.chat) {
+        Some(format) => {
+            compact(ctx, engine, tokenizer, format, history, settings.max_tokens)?;
+            tokenizer.encode(&format.render(&history.messages()))?
+        }
+        None => tokenizer.encode(&turn.line)?,
     };
     let request = Request {
-        tokens: tokenizer.encode(&prompt)?,
+        tokens: prompt,
         max_tokens: settings.max_tokens,
         stop_tokens: chat::stop_tokens(tokenizer, chat_format),
         sampler: Sampler::from_params(settings.sampling),
     };
     let _ = ctx.tx.send(Event::Accepted(turn.id));
-    let id = match engine.add_request(request) {
-        Ok(id) => id,
-        Err(e) => {
-            if chat {
-                history.pop();
-            }
-            return Err(e.into());
-        }
-    };
+    run_request(engine, tokenizer, &ctx.cancel, request, |text| {
+        ctx.tx.send(Event::Token(text.to_string())).is_ok()
+    })
+}
 
-    ctx.cancel.store(false, Ordering::Relaxed);
+// What a request produced. `secs` is the time from its first step on, so it
+// leaves out any compaction that ran before the request.
+#[derive(Default)]
+struct Reply {
+    text: String,
+    tokens: usize,
+    hit_limit: bool,
+    cancelled: bool,
+    secs: f64,
+}
+
+// Runs `request` to the end, handing each piece of its text to `on_text`,
+// which returns false to stop early. Setting `cancel` stops it too. If it
+// fails part way, the request is aborted, so it doesn't keep running in the
+// engine.
+fn run_request<B: engine::Backend>(
+    engine: &mut Engine<B>,
+    tokenizer: &Tokenizer,
+    cancel: &AtomicBool,
+    request: Request,
+    mut on_text: impl FnMut(&str) -> bool,
+) -> Result<Reply, BoxError> {
+    let id = engine.add_request(request)?;
+    let mut reply = Reply::default();
     let started = Instant::now();
+    if let Err(e) = decode_request(engine, tokenizer, cancel, id, &mut reply, &mut on_text) {
+        engine.abort(id);
+        return Err(e);
+    }
+    reply.secs = started.elapsed().as_secs_f64();
+    Ok(reply)
+}
+
+// The decode loop behind `run_request`. Only events for `id` count, so tokens
+// from any other sequence never reach the reply.
+fn decode_request<B: engine::Backend>(
+    engine: &mut Engine<B>,
+    tokenizer: &Tokenizer,
+    cancel: &AtomicBool,
+    id: SequenceId,
+    reply: &mut Reply,
+    on_text: &mut impl FnMut(&str) -> bool,
+) -> Result<(), BoxError> {
     let mut decoder = StreamDecoder::new();
-    let mut answer = String::new();
-    let mut tokens = 0;
-    let mut hit_limit = false;
     'generate: while engine.has_work() {
-        if ctx.cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) {
             engine.abort(id);
+            reply.cancelled = true;
             break;
         }
         for ev in engine.step()? {
-            tokens += 1;
-            let stopped = ev.finish == Some(engine::FinishReason::Stop);
-            let text = if stopped {
-                decoder.flush(tokenizer)?
-            } else {
-                decoder.push(tokenizer, ev.token)?
+            if ev.id != id {
+                continue;
+            }
+            reply.tokens += 1;
+            // A stop token is not part of the text. The last token of any other
+            // finish is followed by whatever the decoder still holds.
+            let text = match ev.finish {
+                Some(engine::FinishReason::Stop) => decoder.flush(tokenizer)?,
+                Some(_) => {
+                    let mut text = decoder.push(tokenizer, ev.token)?;
+                    text.push_str(&decoder.flush(tokenizer)?);
+                    text
+                }
+                None => decoder.push(tokenizer, ev.token)?,
             };
-            answer.push_str(&text);
-            if ctx.tx.send(Event::Token(text)).is_err() {
+            reply.text.push_str(&text);
+            if !on_text(&text) {
                 engine.abort(id);
                 break 'generate;
             }
-            hit_limit = ev.finish == Some(engine::FinishReason::Length);
+            reply.hit_limit = ev.finish == Some(engine::FinishReason::Length);
             if ev.finish.is_some() {
                 break 'generate;
             }
         }
     }
-    if chat {
-        history.push(ChatMessage {
-            role: "assistant".into(),
-            content: answer,
-        });
-    }
-    let _ = ctx.tx.send(Event::Finished {
-        tokens,
-        secs: started.elapsed().as_secs_f64(),
-        hit_limit,
-    });
     Ok(())
+}
+
+// Fits the chat history under the prompt budget: the pool less `reserve`
+// tokens for the answer. Says in the transcript what that cost.
+fn compact<B: engine::Backend>(
+    ctx: &WorkerCtx,
+    engine: &mut Engine<B>,
+    tokenizer: &Tokenizer,
+    format: ChatFormat,
+    history: &mut History,
+    reserve: usize,
+) -> Result<history::Compaction, BoxError> {
+    let report = history.fit(
+        ctx.opts.compact,
+        engine.max_sequence_tokens(),
+        reserve,
+        |messages| Ok(tokenizer.encode(&format.render(messages))?.len()),
+        |messages, cap| {
+            // Shown before the model starts writing, since the summary isn't streamed.
+            let _ = ctx.tx.send(Event::Notice(
+                "summarizing the earlier conversation...".into(),
+            ));
+            summarize(ctx, engine, tokenizer, format, messages, cap)
+        },
+    )?;
+    if !report.is_empty() {
+        let _ = ctx.tx.send(Event::Notice(compaction_note(&report)));
+    }
+    Ok(report)
+}
+
+// Writes the model's summary of `messages`, with the same template, stop
+// tokens and engine as a reply. The summary is greedy and not streamed.
+fn summarize<B: engine::Backend>(
+    ctx: &WorkerCtx,
+    engine: &mut Engine<B>,
+    tokenizer: &Tokenizer,
+    format: ChatFormat,
+    messages: &[ChatMessage],
+    max_tokens: usize,
+) -> Result<String, BoxError> {
+    let request = Request {
+        tokens: tokenizer.encode(&format.render(messages))?,
+        max_tokens,
+        stop_tokens: chat::stop_tokens(tokenizer, Some(format)),
+        sampler: Sampler::from_params(SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: 0,
+        }),
+    };
+    let reply = run_request(engine, tokenizer, &ctx.cancel, request, |_| true)?;
+    if reply.cancelled {
+        return Err(history::Cancelled.into());
+    }
+    Ok(reply.text)
+}
+
+fn compaction_note(report: &history::Compaction) -> String {
+    let mut parts = Vec::new();
+    if report.summarized > 0 {
+        parts.push(format!("summarized {} earlier messages", report.summarized));
+    }
+    if report.dropped > 0 {
+        parts.push(format!("dropped {} earlier messages", report.dropped));
+    }
+    if report.summary_dropped {
+        parts.push("dropped the summary".to_string());
+    }
+    if let Some(reason) = &report.summary_error {
+        parts.push(format!("couldn't summarize: {reason}"));
+    }
+    format!("history over the prompt budget: {}", parts.join(", "))
 }
 
 // Messages typed but not yet accepted by the worker, oldest first. A message
@@ -325,10 +481,10 @@ fn generate<B: engine::Backend>(
 struct Outbox {
     next_id: u64,
     items: VecDeque<(u64, String)>,
-    // A message was handed to the worker and has not been accepted or refused
-    // yet.
+    // A message was handed to the worker and has not been accepted, stopped or
+    // refused yet.
     in_flight: bool,
-    // A send was refused, so nothing goes out until Enter.
+    // A send was stopped or refused, so nothing goes out until Enter.
     paused: bool,
 }
 
@@ -356,6 +512,13 @@ impl Outbox {
         }
         self.in_flight = false;
         self.items.pop_front().map(|(_, text)| text)
+    }
+
+    // The in-flight message was stopped before the worker took it: it stays
+    // unsent, and nothing goes out until Enter.
+    fn stopped(&mut self) {
+        self.in_flight = false;
+        self.paused = true;
     }
 
     // The worker refused the in-flight message: it is dropped, and nothing else
@@ -567,11 +730,19 @@ impl App {
                         answer.push_str(&text);
                     }
                 }
+                Event::Notice(text) => self.transcript.push((Role::Notice, text)),
                 Event::Accepted(id) => {
                     if let Some(text) = self.outbox.accepted(id) {
                         self.transcript.push((Role::User, text));
                         self.transcript.push((Role::Assistant, String::new()));
                         self.scroll_up = 0;
+                    }
+                }
+                Event::Stopped => {
+                    // Nothing was accepted, so the message stays unsent.
+                    self.outbox.stopped();
+                    if self.status == Status::Generating {
+                        self.status = Status::Idle;
                     }
                 }
                 Event::Finished {
@@ -624,7 +795,7 @@ impl App {
         if !line.is_empty() {
             self.outbox.push(line);
         }
-        // Enter also resumes sends that a refusal left unsent.
+        // Enter also resumes sends that a stop left unsent.
         self.outbox.resume();
         self.dispatch();
     }
@@ -1138,7 +1309,182 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), BoxEr
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::engine::testing::CountingBackend;
+    use crate::model::{BatchItem, Config};
+
+    // A backend whose forward pass fails from the first step on, and that
+    // records which sequences were released.
+    struct FailingBackend {
+        config: Config,
+        released: Arc<Mutex<Vec<SequenceId>>>,
+    }
+
+    impl engine::Backend for FailingBackend {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        fn forward_sample(
+            &mut self,
+            _items: &[BatchItem],
+            _last_only: bool,
+            _samplers: &mut [&mut Sampler],
+        ) -> Result<Vec<u32>, BoxError> {
+            Err("device lost".into())
+        }
+
+        fn release(&mut self, seq_id: SequenceId) {
+            self.released.lock().unwrap().push(seq_id);
+        }
+    }
+
+    fn engine_config() -> EngineConfig {
+        EngineConfig {
+            block_size: 16,
+            num_blocks: 64,
+            max_running: 4,
+        }
+    }
+
+    fn request(tokens: Vec<u32>, max_tokens: usize) -> Request {
+        Request {
+            tokens,
+            max_tokens,
+            stop_tokens: Vec::new(),
+            sampler: Sampler::from_params(SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                seed: 0,
+            }),
+        }
+    }
+
+    fn tokenizer() -> Tokenizer {
+        Tokenizer::from_file("tokenizer.json", 0, 0).unwrap()
+    }
+
+    fn empty_reply() -> Reply {
+        Reply::default()
+    }
+
+    fn options() -> TuiOptions {
+        TuiOptions {
+            device: "cpu".into(),
+            block_size: 16,
+            num_blocks: Some(64),
+            max_tokens: 8,
+            chat: true,
+            system: None,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                seed: 0,
+            },
+            fallback_tokenizer: "tokenizer.json".into(),
+            models_dir: ".".into(),
+            initial_model: None,
+            compact: Strategy::Summarize,
+        }
+    }
+
+    #[test]
+    fn a_failed_decode_aborts_the_request() {
+        let released = Arc::new(Mutex::new(Vec::new()));
+        let backend = FailingBackend {
+            config: Config {
+                context_length: 8192,
+                eos_token_id: 999,
+                vocab_size: 1000,
+                ..Config::for_tests()
+            },
+            released: released.clone(),
+        };
+        let mut engine = Engine::new(backend, engine_config());
+        let cancel = AtomicBool::new(false);
+        let result = run_request(
+            &mut engine,
+            &tokenizer(),
+            &cancel,
+            request(vec![1, 2, 3], 3),
+            |_| true,
+        );
+        assert!(result.is_err());
+        assert!(!engine.has_work());
+        assert_eq!(released.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn decode_counts_only_its_own_sequence() {
+        let mut engine = Engine::new(CountingBackend::new(8192), engine_config());
+        let own = engine.add_request(request(vec![1, 2, 3], 3)).unwrap();
+        engine.add_request(request(vec![5, 6], 10)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut reply = empty_reply();
+        let mut pieces = 0;
+        decode_request(
+            &mut engine,
+            &tokenizer(),
+            &cancel,
+            own,
+            &mut reply,
+            &mut |_| {
+                pieces += 1;
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(reply.tokens, 3);
+        assert!(reply.hit_limit);
+        assert_eq!(pieces, 3);
+    }
+
+    #[test]
+    fn a_cancelled_request_reports_no_reply() {
+        let mut engine = Engine::new(CountingBackend::new(8192), engine_config());
+        let id = engine.add_request(request(vec![1, 2], 5)).unwrap();
+        let cancel = AtomicBool::new(true);
+        let mut reply = empty_reply();
+        decode_request(
+            &mut engine,
+            &tokenizer(),
+            &cancel,
+            id,
+            &mut reply,
+            &mut |_| true,
+        )
+        .unwrap();
+        assert!(reply.cancelled);
+        assert_eq!(reply.tokens, 0);
+        assert!(!engine.has_work());
+    }
+
+    #[test]
+    fn a_cancelled_summary_is_reported_as_cancelled() {
+        let (tx, _rx) = mpsc::channel::<Event>();
+        let ctx = WorkerCtx {
+            opts: Arc::new(options()),
+            tx,
+            cancel: Arc::new(AtomicBool::new(true)),
+        };
+        let mut engine = Engine::new(CountingBackend::new(8192), engine_config());
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let error = summarize(
+            &ctx,
+            &mut engine,
+            &tokenizer(),
+            ChatFormat::SMOLLM2,
+            &messages,
+            8,
+        )
+        .unwrap_err();
+        assert!(error.is::<history::Cancelled>());
+    }
 
     #[test]
     fn outbox_hands_out_one_message_at_a_time() {
@@ -1163,6 +1509,18 @@ mod tests {
     }
 
     #[test]
+    fn outbox_stays_unsent_when_stopped_until_resumed() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        outbox.next_to_send().unwrap();
+        outbox.stopped();
+        assert!(outbox.next_to_send().is_none());
+        assert_eq!(outbox.texts().collect::<Vec<_>>(), vec!["a"]);
+        outbox.resume();
+        assert!(outbox.next_to_send().is_some());
+    }
+
+    #[test]
     fn outbox_drops_a_refused_message_and_pauses() {
         let mut outbox = Outbox::default();
         outbox.push("a".into());
@@ -1172,7 +1530,27 @@ mod tests {
         assert!(!outbox.refused());
         assert!(outbox.next_to_send().is_none());
         assert_eq!(outbox.texts().collect::<Vec<_>>(), vec!["b"]);
-        outbox.resume();
-        assert!(outbox.next_to_send().is_some());
+    }
+
+    #[test]
+    fn compaction_note_names_each_outcome() {
+        let summarized = history::Compaction {
+            summarized: 6,
+            ..Default::default()
+        };
+        assert_eq!(
+            compaction_note(&summarized),
+            "history over the prompt budget: summarized 6 earlier messages"
+        );
+        let failed = history::Compaction {
+            dropped: 2,
+            summary_dropped: true,
+            summary_error: Some("the summary request doesn't fit the pool".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            compaction_note(&failed),
+            "history over the prompt budget: dropped 2 earlier messages, dropped the summary, couldn't summarize: the summary request doesn't fit the pool"
+        );
     }
 }

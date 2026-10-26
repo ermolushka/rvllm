@@ -1,9 +1,10 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rvllm::chat::{self, ChatFormat, ChatMessage};
 use rvllm::engine::{self, BoxError, Engine, EngineConfig, Request, RequestSpec};
+use rvllm::history::Strategy;
 use rvllm::model::Model;
 use rvllm::runtime::Runtime;
 use rvllm::sampler::{Sampler, SamplingParams};
@@ -66,6 +67,11 @@ struct CliArgs {
     // System prompt for `--chat`, added after the model's default one.
     #[arg(long, requires = "chat")]
     system: Option<String>,
+    // With `--tui --chat`: what to do with the oldest turns once the chat
+    // outgrows the KV cache. `summarize` has the model fold them into a
+    // summary kept in the system prompt; `drop` removes them.
+    #[arg(long, value_enum, default_value_t = CompactArg::Summarize, requires = "chat")]
+    compact: CompactArg,
     // One entry per `--prompt`, in the same order: the decode step at which
     // that request "arrives" (becomes eligible to be admitted). Requests
     // without a matching entry arrive at step 0. Simulates staggered arrival
@@ -93,6 +99,12 @@ struct CliArgs {
     // subdirectories).
     #[arg(long, default_value = ".")]
     models_dir: String,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CompactArg {
+    Drop,
+    Summarize,
 }
 
 #[derive(Args)]
@@ -190,6 +202,10 @@ fn run_cli(args: CliArgs) -> Result<(), BoxError> {
                 .into(),
             models_dir: args.models_dir.into(),
             initial_model: args.model.model.map(Into::into),
+            compact: match args.compact {
+                CompactArg::Drop => Strategy::Drop,
+                CompactArg::Summarize => Strategy::Summarize,
+            },
         });
     }
     let model_file = model_path(&args.model)?;
