@@ -69,7 +69,7 @@ cargo run --release -- cli \
 
 Pass `--chat` to wrap input in the model's chat format (use this with instruct
 models); the conversation history is then kept between questions. `--system
-"..."` sets the system prompt, replacing the model's default one.
+"..."` is added after the model's default system prompt, so both apply.
 
 With `--prompt` the CLI runs the given prompts once and exits. Multiple
 `--prompt`s run concurrently through continuous batching, all sharing one KV

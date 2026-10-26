@@ -194,14 +194,14 @@ fn session(
     let _ = ctx.tx.send(Event::Ready { name, context });
 
     // Every chat, including one started with Ctrl-N, opens with the system
-    // prompt, if one was given.
+    // prompt: the model's default one, if it has one, then `--system`.
     let opening = || -> Vec<ChatMessage> {
-        opts.system
-            .iter()
+        chat::system_prompt(chat_format, opts.system.as_deref())
             .map(|system| ChatMessage {
                 role: "system".into(),
-                content: system.clone(),
+                content: system,
             })
+            .into_iter()
             .collect()
     };
     let mut history = opening();

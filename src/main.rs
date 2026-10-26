@@ -63,7 +63,7 @@ struct CliArgs {
     // interactive loop the conversation history is kept between questions.
     #[arg(long)]
     chat: bool,
-    // System prompt for `--chat`, in place of the model's default one.
+    // System prompt for `--chat`, added after the model's default one.
     #[arg(long, requires = "chat")]
     system: Option<String>,
     // One entry per `--prompt`, in the same order: the decode step at which
@@ -145,14 +145,15 @@ fn blocks_for(tokens: usize, block_size: usize) -> usize {
     tokens.div_ceil(block_size).max(1)
 }
 
-// The messages a chat starts with: the `--system` prompt, if given.
-fn opening_messages(args: &CliArgs) -> Vec<ChatMessage> {
-    args.system
-        .iter()
+// The messages a chat starts with: the model's default system prompt, if it
+// has one, and the `--system` text, if given.
+fn opening_messages(args: &CliArgs, format: Option<ChatFormat>) -> Vec<ChatMessage> {
+    chat::system_prompt(format, args.system.as_deref())
         .map(|system| ChatMessage {
             role: "system".into(),
-            content: system.clone(),
+            content: system,
         })
+        .into_iter()
         .collect()
 }
 
@@ -229,7 +230,7 @@ fn one_shot(
         .map(|(i, prompt)| {
             let text = match chat {
                 Some(format) => {
-                    let mut messages = opening_messages(args);
+                    let mut messages = opening_messages(args, chat);
                     messages.push(ChatMessage {
                         role: "user".into(),
                         content: prompt.clone(),
@@ -335,7 +336,7 @@ fn interactive(
         },
     );
     eprintln!("Type a question and press Enter. Ctrl-D or `exit` to quit.");
-    let mut history = opening_messages(args);
+    let mut history = opening_messages(args, chat);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     loop {
