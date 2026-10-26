@@ -188,7 +188,7 @@ enum Chunk {
 fn finish_str(f: FinishReason) -> &'static str {
     match f {
         FinishReason::Stop => "stop",
-        FinishReason::Length => "length",
+        FinishReason::Length | FinishReason::PoolFull => "length",
     }
 }
 
