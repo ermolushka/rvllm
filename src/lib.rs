@@ -4,6 +4,7 @@ mod conv_cache;
 pub mod cuda;
 pub mod engine;
 pub mod generator;
+pub mod history;
 pub mod kv_storage;
 pub mod model;
 pub mod runtime;

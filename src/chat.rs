@@ -4,6 +4,7 @@
 use crate::model::{Arch, Config};
 use crate::tokenizer::Tokenizer;
 
+#[derive(Clone)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
