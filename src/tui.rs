@@ -7,6 +7,7 @@
 // `Cmd` goes to the worker, `Event` comes back. Cancelling a generation uses a
 // shared flag the worker checks between decode steps.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,8 +113,15 @@ enum Cmd {
         tokenizer: PathBuf,
         device: String,
     },
-    Send(String, Settings),
+    Send(u64, String, Settings),
     NewChat,
+}
+
+// One message on its way to the model. `id` is how the UI learns that the
+// worker took it into the chat.
+struct Turn {
+    id: u64,
+    line: String,
 }
 
 enum Event {
@@ -128,6 +136,8 @@ enum Event {
         secs: f64,
         hit_limit: bool,
     },
+    // The worker took this message into the chat, so it is no longer unsent.
+    Accepted(u64),
     Error(String),
 }
 
@@ -209,14 +219,14 @@ fn session(
         match rx.recv() {
             Ok(Cmd::NewChat) => history = opening(),
             Ok(load @ Cmd::Load { .. }) => return Ok(Some(load)),
-            Ok(Cmd::Send(line, settings)) => {
+            Ok(Cmd::Send(id, line, settings)) => {
                 if let Err(e) = generate(
                     ctx,
                     &mut engine,
                     &tokenizer,
                     chat_format,
                     &mut history,
-                    line,
+                    Turn { id, line },
                     &settings,
                 ) {
                     let _ = ctx.tx.send(Event::Error(e.to_string()));
@@ -233,7 +243,7 @@ fn generate<B: engine::Backend>(
     tokenizer: &Tokenizer,
     chat_format: Option<ChatFormat>,
     history: &mut Vec<ChatMessage>,
-    line: String,
+    turn: Turn,
     settings: &Settings,
 ) -> Result<(), BoxError> {
     let chat = settings.chat;
@@ -241,11 +251,11 @@ fn generate<B: engine::Backend>(
         let format = chat_format.ok_or("this model's chat format is unknown; turn chat off")?;
         history.push(ChatMessage {
             role: "user".into(),
-            content: line,
+            content: turn.line,
         });
         format.render(history)
     } else {
-        line
+        turn.line
     };
     let request = Request {
         tokens: tokenizer.encode(&prompt)?,
@@ -253,6 +263,7 @@ fn generate<B: engine::Backend>(
         stop_tokens: chat::stop_tokens(tokenizer, chat_format),
         sampler: Sampler::from_params(settings.sampling),
     };
+    let _ = ctx.tx.send(Event::Accepted(turn.id));
     let id = match engine.add_request(request) {
         Ok(id) => id,
         Err(e) => {
@@ -307,6 +318,77 @@ fn generate<B: engine::Backend>(
     Ok(())
 }
 
+// Messages typed but not yet accepted by the worker, oldest first. A message
+// leaves the outbox when the worker takes it into the chat, so until then it
+// is shown as unsent.
+#[derive(Default)]
+struct Outbox {
+    next_id: u64,
+    items: VecDeque<(u64, String)>,
+    // A message was handed to the worker and has not been accepted or refused
+    // yet.
+    in_flight: bool,
+    // A send was refused, so nothing goes out until Enter.
+    paused: bool,
+}
+
+impl Outbox {
+    fn push(&mut self, text: String) {
+        self.items.push_back((self.next_id, text));
+        self.next_id += 1;
+    }
+
+    // The oldest unsent message, handed out once: nothing else goes out while
+    // one is in flight or while paused.
+    fn next_to_send(&mut self) -> Option<(u64, String)> {
+        if self.in_flight || self.paused {
+            return None;
+        }
+        let (id, text) = self.items.front()?.clone();
+        self.in_flight = true;
+        Some((id, text))
+    }
+
+    // The worker took message `id` into the chat: it leaves the outbox.
+    fn accepted(&mut self, id: u64) -> Option<String> {
+        if !self.in_flight || self.items.front()?.0 != id {
+            return None;
+        }
+        self.in_flight = false;
+        self.items.pop_front().map(|(_, text)| text)
+    }
+
+    // The worker refused the in-flight message: it is dropped, and nothing else
+    // goes out until Enter. Returns whether a message was in flight.
+    fn refused(&mut self) -> bool {
+        if !self.in_flight {
+            return false;
+        }
+        self.in_flight = false;
+        self.items.pop_front();
+        self.paused = true;
+        true
+    }
+
+    fn resume(&mut self) {
+        self.paused = false;
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.in_flight = false;
+        self.paused = false;
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    fn texts(&self) -> impl Iterator<Item = &str> {
+        self.items.iter().map(|(_, text)| text.as_str())
+    }
+}
+
 #[derive(PartialEq)]
 enum Status {
     NoModel,
@@ -345,6 +427,8 @@ struct App {
 
     picker: Option<Picker>,
     quit: bool,
+    // Messages typed but not yet accepted by the worker.
+    outbox: Outbox,
 }
 
 #[derive(PartialEq)]
@@ -468,6 +552,7 @@ impl App {
             match ev {
                 Event::Loading(name) => self.status = Status::Loading(name),
                 Event::Ready { name, context } => {
+                    self.outbox.clear();
                     self.transcript.clear();
                     self.transcript
                         .push((Role::Notice, format!("loaded {name}")));
@@ -480,6 +565,13 @@ impl App {
                 Event::Token(text) => {
                     if let Some((Role::Assistant, answer)) = self.transcript.last_mut() {
                         answer.push_str(&text);
+                    }
+                }
+                Event::Accepted(id) => {
+                    if let Some(text) = self.outbox.accepted(id) {
+                        self.transcript.push((Role::User, text));
+                        self.transcript.push((Role::Assistant, String::new()));
+                        self.scroll_up = 0;
                     }
                 }
                 Event::Finished {
@@ -499,6 +591,7 @@ impl App {
                             format!("stopped at the {}-token limit", self.settings.max_tokens),
                         ));
                     }
+                    self.dispatch();
                 }
                 Event::Error(e) => {
                     self.transcript.push((Role::Notice, format!("error: {e}")));
@@ -511,6 +604,9 @@ impl App {
                         self.device = self.good_device.clone();
                         self.open_picker();
                     } else {
+                        // A refused send leaves the outbox, and nothing else goes
+                        // out until Enter.
+                        self.outbox.refused();
                         self.status = Status::Idle;
                     }
                 }
@@ -521,18 +617,28 @@ impl App {
     fn submit(&mut self) {
         let line = self.input.trim().to_string();
         self.input.clear();
-        if line.is_empty() {
-            return;
-        }
         if matches!(line.as_str(), "exit" | "quit") {
             self.quit = true;
             return;
         }
-        self.transcript.push((Role::User, line.clone()));
-        self.transcript.push((Role::Assistant, String::new()));
-        self.scroll_up = 0;
-        self.status = Status::Generating;
-        let _ = self.cmd_tx.send(Cmd::Send(line, self.settings.clone()));
+        if !line.is_empty() {
+            self.outbox.push(line);
+        }
+        // Enter also resumes sends that a refusal left unsent.
+        self.outbox.resume();
+        self.dispatch();
+    }
+
+    // Hands the oldest unsent message to the worker, once the worker is idle.
+    fn dispatch(&mut self) {
+        if self.status != Status::Idle {
+            return;
+        }
+        if let Some((id, text)) = self.outbox.next_to_send() {
+            self.status = Status::Generating;
+            self.scroll_up = 0;
+            let _ = self.cmd_tx.send(Cmd::Send(id, text, self.settings.clone()));
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -557,6 +663,7 @@ impl App {
             KeyCode::Char('d') if ctrl => self.switch_device(),
             KeyCode::Char('n') if ctrl && self.status == Status::Idle => {
                 let _ = self.cmd_tx.send(Cmd::NewChat);
+                self.outbox.clear();
                 self.transcript.clear();
                 self.transcript
                     .push((Role::Notice, "new conversation".into()));
@@ -568,7 +675,7 @@ impl App {
             }
             KeyCode::PageUp => self.scroll_up = self.scroll_up.saturating_add(8),
             KeyCode::PageDown => self.scroll_up = self.scroll_up.saturating_sub(8),
-            KeyCode::Enter if self.status == Status::Idle => self.submit(),
+            KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -710,14 +817,20 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [main, input, status] = Layout::vertical([
+        let unsent = self.outbox.texts().count().min(3) as u16;
+        let queue_rows = if unsent == 0 { 0 } else { unsent + 2 };
+        let [main, queue, input, status] = Layout::vertical([
             Constraint::Min(3),
+            Constraint::Length(queue_rows),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
         .areas(frame.area());
 
         self.draw_transcript(frame, main);
+        if queue_rows > 0 {
+            self.draw_queue(frame, queue);
+        }
         self.draw_input(frame, input);
         self.draw_status(frame, status);
         if let Some(picker) = &mut self.picker {
@@ -766,12 +879,36 @@ impl App {
         );
     }
 
+    // The messages still unsent, above the input: at most three lines.
+    fn draw_queue(&self, frame: &mut Frame, area: Rect) {
+        let title = if self.outbox.is_paused() {
+            " unsent (Enter sends) "
+        } else {
+            " unsent "
+        };
+        let texts: Vec<&str> = self.outbox.texts().collect();
+        let mut lines: Vec<Line> = texts
+            .iter()
+            .take(3)
+            .map(|text| Line::styled(format!("you: {text}"), Style::new().fg(Color::Yellow)))
+            .collect();
+        if texts.len() > 3 {
+            lines.truncate(2);
+            lines.push(Line::styled(
+                format!("... {} more", texts.len() - 2),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        let block = Block::default().borders(Borders::ALL).title(title);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
         let ready = self.status == Status::Idle;
         let title = if ready {
             " message "
         } else {
-            " message (busy) "
+            " message (Enter queues it) "
         };
         let style = if ready {
             Style::new()
@@ -791,7 +928,7 @@ impl App {
             Paragraph::new(shown.clone()).style(style).block(block),
             area,
         );
-        if ready && self.picker.is_none() {
+        if self.picker.is_none() {
             frame.set_cursor_position((area.x + 1 + shown.chars().count() as u16, area.y + 1));
         }
     }
@@ -950,6 +1087,7 @@ pub fn run(opts: TuiOptions) -> Result<(), BoxError> {
         scroll_up: 0,
         picker: None,
         quit: false,
+        outbox: Outbox::default(),
     };
     match &opts.initial_model {
         Some(path) => app.load(&ModelEntry {
@@ -996,4 +1134,45 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), BoxEr
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbox_hands_out_one_message_at_a_time() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        outbox.push("b".into());
+        let (id_a, text) = outbox.next_to_send().unwrap();
+        assert_eq!(text, "a");
+        assert!(outbox.next_to_send().is_none());
+        assert_eq!(outbox.accepted(id_a).as_deref(), Some("a"));
+        let next = outbox.next_to_send().map(|(_, text)| text);
+        assert_eq!(next.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn outbox_ignores_acceptance_of_another_message() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        let (id, _) = outbox.next_to_send().unwrap();
+        assert!(outbox.accepted(id + 1).is_none());
+        assert!(outbox.next_to_send().is_none());
+    }
+
+    #[test]
+    fn outbox_drops_a_refused_message_and_pauses() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        outbox.push("b".into());
+        outbox.next_to_send().unwrap();
+        assert!(outbox.refused());
+        assert!(!outbox.refused());
+        assert!(outbox.next_to_send().is_none());
+        assert_eq!(outbox.texts().collect::<Vec<_>>(), vec!["b"]);
+        outbox.resume();
+        assert!(outbox.next_to_send().is_some());
+    }
 }
