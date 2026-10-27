@@ -1,6 +1,7 @@
 pub mod answer;
 pub mod chat;
 mod conv_cache;
+pub mod conversation;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod engine;

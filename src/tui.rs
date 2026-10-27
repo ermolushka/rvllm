@@ -12,9 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use kv_cache_scheduler::sequence::SequenceId;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,13 +21,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::chat::{self, ChatFormat, ChatMessage};
-use crate::engine::{self, BoxError, Engine, EngineConfig, Request};
-use crate::history::{self, History, Strategy};
+use crate::chat::{self, ChatFormat};
+use crate::conversation::{self, Chat};
+use crate::engine::{self, BoxError, Engine, EngineConfig};
+use crate::history::{self, Strategy};
 use crate::model::Model;
 use crate::runtime::Runtime;
-use crate::sampler::{Sampler, SamplingParams};
-use crate::tokenizer::{self, StreamDecoder, Tokenizer};
+use crate::sampler::SamplingParams;
+use crate::tokenizer::{self, Tokenizer};
 
 pub struct TuiOptions {
     pub device: String,
@@ -212,11 +212,21 @@ fn session(
     let _ = ctx.tx.send(Event::Ready { name, context });
 
     // Every chat, including one started with Ctrl-N, opens with the system
-    // prompt, if one was given.
-    let mut history = History::new(chat::system_prompt(chat_format, opts.system.as_deref()));
+    // prompt: the model's default one, if it has one, then `--system`.
+    let mut chat = chat_format.map(|format| {
+        Chat::new(
+            format,
+            chat::system_prompt(Some(format), opts.system.as_deref()),
+            opts.compact,
+        )
+    });
     loop {
         match rx.recv() {
-            Ok(Cmd::NewChat) => history.clear(),
+            Ok(Cmd::NewChat) => {
+                if let Some(chat) = chat.as_mut() {
+                    chat.clear();
+                }
+            }
             Ok(load @ Cmd::Load { .. }) => return Ok(Some(load)),
             Ok(Cmd::Send(id, line, settings)) => {
                 if let Err(e) = generate(
@@ -224,7 +234,7 @@ fn session(
                     &mut engine,
                     &tokenizer,
                     chat_format,
-                    &mut history,
+                    chat.as_mut(),
                     Turn { id, line },
                     &settings,
                 ) {
@@ -236,53 +246,59 @@ fn session(
     }
 }
 
+// Runs one message. In a chat it is added to the history and compacted first;
+// the answer streams into the transcript. Esc during a summary stops the send,
+// and the message stays unsent.
 fn generate<B: engine::Backend>(
     ctx: &WorkerCtx,
     engine: &mut Engine<B>,
     tokenizer: &Tokenizer,
     chat_format: Option<ChatFormat>,
-    history: &mut History,
+    chat: Option<&mut Chat>,
     turn: Turn,
     settings: &Settings,
 ) -> Result<(), BoxError> {
-    let chat = settings.chat;
     // Cleared before compacting, so an Esc during a summary stops the send.
     ctx.cancel.store(false, Ordering::Relaxed);
-    if chat {
-        if chat_format.is_none() {
-            return Err("this model's chat format is unknown; turn chat off".into());
-        }
-        history.push("user", turn.line.clone());
+    if settings.chat && chat.is_none() {
+        return Err("this model's chat format is unknown; turn chat off".into());
     }
-    let reply = match send(
-        ctx,
-        engine,
-        tokenizer,
-        chat_format,
-        history,
-        &turn,
-        settings,
-    ) {
-        Ok(reply) => reply,
-        Err(e) => {
-            // The turn never got an answer, so it doesn't stay in the history.
-            if chat {
-                history.pop();
-            }
-            if e.is::<history::Cancelled>() {
+    let opts = conversation::Options {
+        max_tokens: settings.max_tokens,
+        stop_tokens: chat::stop_tokens(tokenizer, chat_format),
+        sampling: settings.sampling,
+    };
+    let mut lines = Lines { tx: &ctx.tx };
+    let reply = match chat.filter(|_| settings.chat) {
+        Some(chat) => {
+            let prompt = match chat.begin_turn(
+                engine,
+                tokenizer,
+                turn.line,
+                settings.max_tokens,
+                &ctx.cancel,
+                &mut lines,
+            ) {
+                Ok(prompt) => prompt,
                 // Esc while summarizing stops the send: no reply, and no error.
-                let _ = ctx.tx.send(Event::Notice(
-                    "stopped while summarizing; the message was not sent".into(),
-                ));
-                let _ = ctx.tx.send(Event::Stopped);
-                return Ok(());
-            }
-            return Err(e);
+                Err(e) if e.is::<history::Cancelled>() => {
+                    let _ = ctx.tx.send(Event::Notice(
+                        "stopped while summarizing; the message was not sent".into(),
+                    ));
+                    let _ = ctx.tx.send(Event::Stopped);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            let _ = ctx.tx.send(Event::Accepted(turn.id));
+            chat.finish_turn(engine, tokenizer, prompt, &opts, &ctx.cancel, &mut lines)?
+        }
+        None => {
+            let prompt = tokenizer.encode(&turn.line)?;
+            let _ = ctx.tx.send(Event::Accepted(turn.id));
+            conversation::plain(engine, tokenizer, prompt, &opts, &ctx.cancel, &mut lines)?
         }
     };
-    if chat {
-        history.push("assistant", reply.text);
-    }
     let _ = ctx.tx.send(Event::Finished {
         tokens: reply.tokens,
         secs: reply.secs,
@@ -291,293 +307,19 @@ fn generate<B: engine::Backend>(
     Ok(())
 }
 
-// The room kept free for an answer: its length, but at most a quarter of the
-// pool, so a long answer can't squeeze the history out. An answer that outgrows
-// that room is continued after compaction.
-fn answer_reserve(max_tokens: usize, pool: usize) -> usize {
-    max_tokens.min(pool / 4).max(1)
+// Streams an answer into the transcript: text as tokens, notices as notices.
+struct Lines<'a> {
+    tx: &'a Sender<Event>,
 }
 
-// How many times one answer may be continued after compaction.
-const MAX_CONTINUATIONS: usize = 64;
+impl conversation::Sink for Lines<'_> {
+    fn text(&mut self, piece: &str) -> bool {
+        self.tx.send(Event::Token(piece.to_string())).is_ok()
+    }
 
-// Builds the prompt for `turn`, then streams the reply to the transcript. In
-// chat, an answer that fills the pool is continued after the history is
-// compacted, so the pool never cuts it short.
-fn send<B: engine::Backend>(
-    ctx: &WorkerCtx,
-    engine: &mut Engine<B>,
-    tokenizer: &Tokenizer,
-    chat_format: Option<ChatFormat>,
-    history: &mut History,
-    turn: &Turn,
-    settings: &Settings,
-) -> Result<Reply, BoxError> {
-    let pool = engine.max_sequence_tokens();
-    let format = chat_format.filter(|_| settings.chat);
-    let mut base = match format {
-        Some(format) => {
-            let reserve = answer_reserve(settings.max_tokens, pool);
-            compact(ctx, engine, tokenizer, format, history, reserve, 0)?;
-            tokenizer.encode(&format.render(&history.messages()))?
-        }
-        None => tokenizer.encode(&turn.line)?,
-    };
-    let stop_tokens = chat::stop_tokens(tokenizer, chat_format);
-    let _ = ctx.tx.send(Event::Accepted(turn.id));
-    let mut reply = Reply::default();
-    let mut continuations = 0;
-    loop {
-        // Each segment resumes from the prompt plus the answer so far. It grows
-        // until the pool is full; then the history is compacted and it carries
-        // on, if the pool has room for `reserve` tokens after that.
-        let remaining = settings.max_tokens - reply.ids.len();
-        let mut tokens = base.clone();
-        tokens.extend_from_slice(&reply.ids);
-        let room = match format {
-            Some(_) => pool.saturating_sub(tokens.len()),
-            None => remaining,
-        };
-        let segment = remaining.min(room);
-        if segment == 0 {
-            let _ = ctx.tx.send(Event::Notice(
-                "the answer stopped: the history can't make room to continue it".into(),
-            ));
-            break;
-        }
-        let request = Request {
-            tokens,
-            max_tokens: segment,
-            stop_tokens: stop_tokens.clone(),
-            sampler: Sampler::from_params(settings.sampling),
-        };
-        let part = run_request(
-            engine,
-            tokenizer,
-            &ctx.cancel,
-            request,
-            format.is_some(),
-            |text| ctx.tx.send(Event::Token(text.to_string())).is_ok(),
-        )?;
-        reply.text.push_str(&part.text);
-        reply.ids.extend_from_slice(&part.ids);
-        reply.tokens += part.tokens;
-        reply.secs += part.secs;
-        reply.hit_limit = part.hit_limit && segment == remaining;
-        reply.cancelled = part.cancelled;
-        // The segment ended for want of room, not because the answer is done.
-        let continues = part.pool_full || (part.hit_limit && segment < remaining);
-        if !continues || part.cancelled {
-            break;
-        }
-        continuations += 1;
-        if continuations > MAX_CONTINUATIONS {
-            let _ = ctx.tx.send(Event::Notice(format!(
-                "the answer stopped after {MAX_CONTINUATIONS} continuations"
-            )));
-            break;
-        }
-        let Some(chat_format) = format else { break };
-        // Compact the older turns to make room beside the answer so far, then
-        // carry on from there. The budget is the pool less the reserve, as for
-        // the first prompt.
-        let reserve = answer_reserve(settings.max_tokens - reply.ids.len(), pool);
-        match compact(
-            ctx,
-            engine,
-            tokenizer,
-            chat_format,
-            history,
-            reserve,
-            reply.ids.len(),
-        ) {
-            Ok(_) => {}
-            // Esc during the summary keeps the answer so far.
-            Err(e) if e.is::<history::Cancelled>() => {
-                reply.cancelled = true;
-                break;
-            }
-            Err(e) => return Err(e),
-        }
-        base = tokenizer.encode(&chat_format.render(&history.messages()))?;
-        if pool.saturating_sub(base.len() + reply.ids.len()) < reserve {
-            let _ = ctx.tx.send(Event::Notice(
-                "the answer stopped: the history can't make room to continue it".into(),
-            ));
-            break;
-        }
-        let _ = ctx.tx.send(Event::Notice(
-            "continuing the answer after compacting the history".into(),
-        ));
+    fn notice(&mut self, line: String) {
+        let _ = self.tx.send(Event::Notice(line));
     }
-    Ok(reply)
-}
-
-// What a request produced. `secs` is the time from its first step on, so it
-// leaves out any compaction that ran before the request.
-#[derive(Default)]
-struct Reply {
-    text: String,
-    tokens: usize,
-    // The generated token ids, in order, so a continuation resumes exactly.
-    ids: Vec<u32>,
-    hit_limit: bool,
-    // The pool filled while this was the only request, so it can be continued.
-    pool_full: bool,
-    cancelled: bool,
-    secs: f64,
-}
-
-// Runs `request` to the end, handing each piece of its text to `on_text`,
-// which returns false to stop early. Setting `cancel` stops it too. If it
-// fails part way, the request is aborted, so it doesn't keep running in the
-// engine. A `continuable` request may stop with `pool_full`.
-fn run_request<B: engine::Backend>(
-    engine: &mut Engine<B>,
-    tokenizer: &Tokenizer,
-    cancel: &AtomicBool,
-    request: Request,
-    continuable: bool,
-    mut on_text: impl FnMut(&str) -> bool,
-) -> Result<Reply, BoxError> {
-    let id = if continuable {
-        engine.add_continuable_request(request)?
-    } else {
-        engine.add_request(request)?
-    };
-    let mut reply = Reply::default();
-    let started = Instant::now();
-    if let Err(e) = decode_request(engine, tokenizer, cancel, id, &mut reply, &mut on_text) {
-        engine.abort(id);
-        return Err(e);
-    }
-    reply.secs = started.elapsed().as_secs_f64();
-    Ok(reply)
-}
-
-// The decode loop behind `run_request`. Only events for `id` count, so tokens
-// from any other sequence never reach the reply.
-fn decode_request<B: engine::Backend>(
-    engine: &mut Engine<B>,
-    tokenizer: &Tokenizer,
-    cancel: &AtomicBool,
-    id: SequenceId,
-    reply: &mut Reply,
-    on_text: &mut impl FnMut(&str) -> bool,
-) -> Result<(), BoxError> {
-    let mut decoder = StreamDecoder::new();
-    'generate: while engine.has_work() {
-        if cancel.load(Ordering::Relaxed) {
-            engine.abort(id);
-            reply.cancelled = true;
-            break;
-        }
-        for ev in engine.step()? {
-            if ev.id != id {
-                continue;
-            }
-            reply.tokens += 1;
-            reply.ids.push(ev.token);
-            // A stop token is not part of the text. The last token of any other
-            // finish is followed by whatever the decoder still holds.
-            let text = match ev.finish {
-                Some(engine::FinishReason::Stop) => decoder.flush(tokenizer)?,
-                Some(_) => {
-                    let mut text = decoder.push(tokenizer, ev.token)?;
-                    text.push_str(&decoder.flush(tokenizer)?);
-                    text
-                }
-                None => decoder.push(tokenizer, ev.token)?,
-            };
-            reply.text.push_str(&text);
-            if !on_text(&text) {
-                engine.abort(id);
-                break 'generate;
-            }
-            reply.hit_limit = ev.finish == Some(engine::FinishReason::Length);
-            reply.pool_full = ev.finish == Some(engine::FinishReason::PoolFull);
-            if ev.finish.is_some() {
-                break 'generate;
-            }
-        }
-    }
-    Ok(())
-}
-
-// Fits the chat history under the prompt budget: the pool less `reserve`
-// tokens for the answer. The `extra` tokens of the answer so far count towards
-// the prompt too. Says in the transcript what that cost.
-fn compact<B: engine::Backend>(
-    ctx: &WorkerCtx,
-    engine: &mut Engine<B>,
-    tokenizer: &Tokenizer,
-    format: ChatFormat,
-    history: &mut History,
-    reserve: usize,
-    extra: usize,
-) -> Result<history::Compaction, BoxError> {
-    let report = history.fit(
-        ctx.opts.compact,
-        engine.max_sequence_tokens(),
-        reserve,
-        extra,
-        |messages| Ok(tokenizer.encode(&format.render(messages))?.len()),
-        |messages, cap| {
-            // Shown before the model starts writing, since the summary isn't streamed.
-            let _ = ctx.tx.send(Event::Notice(
-                "summarizing the earlier conversation...".into(),
-            ));
-            summarize(ctx, engine, tokenizer, format, messages, cap)
-        },
-    )?;
-    if !report.is_empty() {
-        let _ = ctx.tx.send(Event::Notice(compaction_note(&report)));
-    }
-    Ok(report)
-}
-
-// Writes the model's summary of `messages`, with the same template, stop
-// tokens and engine as a reply. The summary is greedy and not streamed.
-fn summarize<B: engine::Backend>(
-    ctx: &WorkerCtx,
-    engine: &mut Engine<B>,
-    tokenizer: &Tokenizer,
-    format: ChatFormat,
-    messages: &[ChatMessage],
-    max_tokens: usize,
-) -> Result<String, BoxError> {
-    let request = Request {
-        tokens: tokenizer.encode(&format.render(messages))?,
-        max_tokens,
-        stop_tokens: chat::stop_tokens(tokenizer, Some(format)),
-        sampler: Sampler::from_params(SamplingParams {
-            temperature: 0.0,
-            top_p: 1.0,
-            seed: 0,
-        }),
-    };
-    let reply = run_request(engine, tokenizer, &ctx.cancel, request, false, |_| true)?;
-    if reply.cancelled {
-        return Err(history::Cancelled.into());
-    }
-    Ok(reply.text)
-}
-
-fn compaction_note(report: &history::Compaction) -> String {
-    let mut parts = Vec::new();
-    if report.summarized > 0 {
-        parts.push(format!("summarized {} earlier messages", report.summarized));
-    }
-    if report.dropped > 0 {
-        parts.push(format!("dropped {} earlier messages", report.dropped));
-    }
-    if report.summary_dropped {
-        parts.push("dropped the summary".to_string());
-    }
-    if let Some(reason) = &report.summary_error {
-        parts.push(format!("couldn't summarize: {reason}"));
-    }
-    format!("history over the prompt budget: {}", parts.join(", "))
 }
 
 // Messages typed but not yet accepted by the worker, oldest first. A message
@@ -666,11 +408,23 @@ enum Status {
     Generating,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Role {
     User,
     Assistant,
     Notice,
+}
+
+// A notice goes just before the reply being written, if there is one: its
+// entry is the last one, and tokens still go to it. Otherwise it goes at the
+// end.
+fn push_notice(transcript: &mut Vec<(Role, String)>, answering: bool, text: String) {
+    if answering && !transcript.is_empty() {
+        let at = transcript.len() - 1;
+        transcript.insert(at, (Role::Notice, text));
+    } else {
+        transcript.push((Role::Notice, text));
+    }
 }
 
 struct App {
@@ -838,16 +592,7 @@ impl App {
                         answer.push_str(&text);
                     }
                 }
-                Event::Notice(text) => {
-                    // While a reply is being written, its entry is the last one
-                    // and tokens still go to it, so the notice goes before it.
-                    if self.answering {
-                        let at = self.transcript.len() - 1;
-                        self.transcript.insert(at, (Role::Notice, text));
-                    } else {
-                        self.transcript.push((Role::Notice, text));
-                    }
-                }
+                Event::Notice(text) => push_notice(&mut self.transcript, self.answering, text),
                 Event::Accepted(id) => {
                     if let Some(text) = self.outbox.accepted(id) {
                         self.transcript.push((Role::User, text));
@@ -1430,183 +1175,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), BoxEr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
-    use crate::engine::testing::CountingBackend;
-    use crate::model::{BatchItem, Config};
-
-    // A backend whose forward pass fails from the first step on, and that
-    // records which sequences were released.
-    struct FailingBackend {
-        config: Config,
-        released: Arc<Mutex<Vec<SequenceId>>>,
-    }
-
-    impl engine::Backend for FailingBackend {
-        fn config(&self) -> &Config {
-            &self.config
-        }
-
-        fn forward_sample(
-            &mut self,
-            _items: &[BatchItem],
-            _last_only: bool,
-            _samplers: &mut [&mut Sampler],
-        ) -> Result<Vec<u32>, BoxError> {
-            Err("device lost".into())
-        }
-
-        fn release(&mut self, seq_id: SequenceId) {
-            self.released.lock().unwrap().push(seq_id);
-        }
-    }
-
-    fn engine_config() -> EngineConfig {
-        EngineConfig {
-            block_size: 16,
-            num_blocks: 64,
-            max_running: 4,
-        }
-    }
-
-    fn request(tokens: Vec<u32>, max_tokens: usize) -> Request {
-        Request {
-            tokens,
-            max_tokens,
-            stop_tokens: Vec::new(),
-            sampler: Sampler::from_params(SamplingParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                seed: 0,
-            }),
-        }
-    }
-
-    fn tokenizer() -> Tokenizer {
-        Tokenizer::from_file("tokenizer.json", 0, 0).unwrap()
-    }
-
-    fn empty_reply() -> Reply {
-        Reply::default()
-    }
-
-    fn options() -> TuiOptions {
-        TuiOptions {
-            device: "cpu".into(),
-            block_size: 16,
-            num_blocks: Some(64),
-            max_tokens: 8,
-            chat: true,
-            system: None,
-            sampling: SamplingParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                seed: 0,
-            },
-            fallback_tokenizer: "tokenizer.json".into(),
-            models_dir: ".".into(),
-            initial_model: None,
-            compact: Strategy::Summarize,
-        }
-    }
-
-    #[test]
-    fn a_failed_decode_aborts_the_request() {
-        let released = Arc::new(Mutex::new(Vec::new()));
-        let backend = FailingBackend {
-            config: Config {
-                context_length: 8192,
-                eos_token_id: 999,
-                vocab_size: 1000,
-                ..Config::for_tests()
-            },
-            released: released.clone(),
-        };
-        let mut engine = Engine::new(backend, engine_config());
-        let cancel = AtomicBool::new(false);
-        let result = run_request(
-            &mut engine,
-            &tokenizer(),
-            &cancel,
-            request(vec![1, 2, 3], 3),
-            false,
-            |_| true,
-        );
-        assert!(result.is_err());
-        assert!(!engine.has_work());
-        assert_eq!(released.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn decode_counts_only_its_own_sequence() {
-        let mut engine = Engine::new(CountingBackend::new(8192), engine_config());
-        let own = engine.add_request(request(vec![1, 2, 3], 3)).unwrap();
-        engine.add_request(request(vec![5, 6], 10)).unwrap();
-        let cancel = AtomicBool::new(false);
-        let mut reply = empty_reply();
-        let mut pieces = 0;
-        decode_request(
-            &mut engine,
-            &tokenizer(),
-            &cancel,
-            own,
-            &mut reply,
-            &mut |_| {
-                pieces += 1;
-                true
-            },
-        )
-        .unwrap();
-        assert_eq!(reply.tokens, 3);
-        assert!(reply.hit_limit);
-        assert_eq!(pieces, 3);
-    }
-
-    #[test]
-    fn a_cancelled_request_reports_no_reply() {
-        let mut engine = Engine::new(CountingBackend::new(8192), engine_config());
-        let id = engine.add_request(request(vec![1, 2], 5)).unwrap();
-        let cancel = AtomicBool::new(true);
-        let mut reply = empty_reply();
-        decode_request(
-            &mut engine,
-            &tokenizer(),
-            &cancel,
-            id,
-            &mut reply,
-            &mut |_| true,
-        )
-        .unwrap();
-        assert!(reply.cancelled);
-        assert_eq!(reply.tokens, 0);
-        assert!(!engine.has_work());
-    }
-
-    #[test]
-    fn a_cancelled_summary_is_reported_as_cancelled() {
-        let (tx, _rx) = mpsc::channel::<Event>();
-        let ctx = WorkerCtx {
-            opts: Arc::new(options()),
-            tx,
-            cancel: Arc::new(AtomicBool::new(true)),
-        };
-        let mut engine = Engine::new(CountingBackend::new(8192), engine_config());
-        let messages = vec![ChatMessage {
-            role: "user".into(),
-            content: "hi".into(),
-        }];
-        let error = summarize(
-            &ctx,
-            &mut engine,
-            &tokenizer(),
-            ChatFormat::SMOLLM2,
-            &messages,
-            8,
-        )
-        .unwrap_err();
-        assert!(error.is::<history::Cancelled>());
-    }
 
     #[test]
     fn outbox_hands_out_one_message_at_a_time() {
@@ -1655,63 +1224,34 @@ mod tests {
     }
 
     #[test]
-    fn answer_reserve_is_at_most_a_quarter_of_the_pool() {
-        assert_eq!(answer_reserve(256, 4096), 256);
-        assert_eq!(answer_reserve(2048, 4096), 1024);
-        assert_eq!(answer_reserve(300, 256), 64);
-        assert_eq!(answer_reserve(0, 256), 1);
+    fn a_notice_goes_at_the_end_when_no_reply_is_being_written() {
+        let mut transcript = vec![
+            (Role::User, "q".to_string()),
+            (Role::Assistant, "a".to_string()),
+        ];
+        push_notice(&mut transcript, false, "note".into());
+        assert_eq!(
+            transcript.last().unwrap(),
+            &(Role::Notice, "note".to_string())
+        );
+        assert_eq!(transcript.len(), 3);
     }
 
     #[test]
-    fn a_full_pool_stops_the_segment_with_its_tokens() {
-        // 4 blocks of 4 slots: from a 3-token prompt, 14 tokens fill the pool.
-        let mut engine = Engine::new(
-            CountingBackend::new(8192),
-            EngineConfig {
-                block_size: 4,
-                num_blocks: 4,
-                max_running: 4,
-            },
-        );
-        let id = engine
-            .add_continuable_request(request(vec![1, 2, 3], 40))
-            .unwrap();
-        let cancel = AtomicBool::new(false);
-        let mut reply = empty_reply();
-        decode_request(
-            &mut engine,
-            &tokenizer(),
-            &cancel,
-            id,
-            &mut reply,
-            &mut |_| true,
-        )
-        .unwrap();
-        assert!(reply.pool_full);
-        assert!(!reply.hit_limit);
-        assert_eq!(reply.ids.len(), 14);
-        assert_eq!(reply.tokens, 14);
+    fn a_notice_goes_before_the_reply_being_written() {
+        let mut transcript = vec![
+            (Role::User, "q".to_string()),
+            (Role::Assistant, "partial".to_string()),
+        ];
+        push_notice(&mut transcript, true, "note".into());
+        assert_eq!(transcript[1], (Role::Notice, "note".to_string()));
+        assert_eq!(transcript[2], (Role::Assistant, "partial".to_string()));
     }
 
     #[test]
-    fn compaction_note_names_each_outcome() {
-        let summarized = history::Compaction {
-            summarized: 6,
-            ..Default::default()
-        };
-        assert_eq!(
-            compaction_note(&summarized),
-            "history over the prompt budget: summarized 6 earlier messages"
-        );
-        let failed = history::Compaction {
-            dropped: 2,
-            summary_dropped: true,
-            summary_error: Some("the summary request doesn't fit the pool".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            compaction_note(&failed),
-            "history over the prompt budget: dropped 2 earlier messages, dropped the summary, couldn't summarize: the summary request doesn't fit the pool"
-        );
+    fn a_notice_while_answering_into_an_empty_transcript_does_not_panic() {
+        let mut transcript = Vec::new();
+        push_notice(&mut transcript, true, "note".into());
+        assert_eq!(transcript, vec![(Role::Notice, "note".to_string())]);
     }
 }

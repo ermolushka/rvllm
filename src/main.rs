@@ -1,15 +1,17 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rvllm::chat::{self, ChatFormat, ChatMessage};
-use rvllm::engine::{self, BoxError, Engine, EngineConfig, Request, RequestSpec};
+use rvllm::conversation::{self, Chat};
+use rvllm::engine::{self, BoxError, Engine, EngineConfig, RequestSpec};
 use rvllm::history::Strategy;
 use rvllm::model::Model;
 use rvllm::runtime::Runtime;
-use rvllm::sampler::{Sampler, SamplingParams};
+use rvllm::sampler::SamplingParams;
 use rvllm::server;
-use rvllm::tokenizer::{self, StreamDecoder, Tokenizer};
+use rvllm::tokenizer::{self, Tokenizer};
 
 #[derive(Parser)]
 #[command(about = "Small vLLM-style inference engine: terminal Q&A or an OpenAI-compatible server")]
@@ -107,6 +109,15 @@ enum CompactArg {
     Summarize,
 }
 
+impl From<CompactArg> for Strategy {
+    fn from(arg: CompactArg) -> Self {
+        match arg {
+            CompactArg::Drop => Strategy::Drop,
+            CompactArg::Summarize => Strategy::Summarize,
+        }
+    }
+}
+
 #[derive(Args)]
 struct ServeArgs {
     #[command(flatten)]
@@ -202,10 +213,7 @@ fn run_cli(args: CliArgs) -> Result<(), BoxError> {
                 .into(),
             models_dir: args.models_dir.into(),
             initial_model: args.model.model.map(Into::into),
-            compact: match args.compact {
-                CompactArg::Drop => Strategy::Drop,
-                CompactArg::Summarize => Strategy::Summarize,
-            },
+            compact: args.compact.into(),
         });
     }
     let model_file = model_path(&args.model)?;
@@ -352,9 +360,21 @@ fn interactive(
         },
     );
     eprintln!("Type a question and press Enter. Ctrl-D or `exit` to quit.");
-    let mut history = opening_messages(args, chat);
+    let mut chat = chat.map(|format| {
+        Chat::new(
+            format,
+            chat::system_prompt(Some(format), args.system.as_deref()),
+            args.compact.into(),
+        )
+    });
+    let options = conversation::Options {
+        max_tokens,
+        stop_tokens: stops.to_vec(),
+        sampling,
+    };
+    // Never set here: Ctrl-C ends the process, as it always has.
+    let cancel = AtomicBool::new(false);
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
     loop {
         eprint!("> ");
         let mut line = String::new();
@@ -369,62 +389,64 @@ fn interactive(
             break;
         }
 
-        let prompt = match chat {
-            Some(format) => {
-                history.push(ChatMessage {
-                    role: "user".into(),
-                    content: line.to_string(),
-                });
-                format.render(&history)
-            }
-            None => line.to_string(),
+        let mut terminal = Terminal {
+            out: std::io::stdout(),
         };
-        let request = Request {
-            tokens: tokenizer.encode(&prompt)?,
-            max_tokens,
-            stop_tokens: stops.to_vec(),
-            sampler: Sampler::from_params(sampling),
+        let result = match chat.as_mut() {
+            Some(chat) => match chat.begin_turn(
+                &mut engine,
+                tokenizer,
+                line.to_string(),
+                max_tokens,
+                &cancel,
+                &mut terminal,
+            ) {
+                Ok(prompt) => chat.finish_turn(
+                    &mut engine,
+                    tokenizer,
+                    prompt,
+                    &options,
+                    &cancel,
+                    &mut terminal,
+                ),
+                Err(e) => Err(e),
+            },
+            None => match tokenizer.encode(line) {
+                Ok(prompt) => conversation::plain(
+                    &mut engine,
+                    tokenizer,
+                    prompt,
+                    &options,
+                    &cancel,
+                    &mut terminal,
+                ),
+                Err(e) => Err(e),
+            },
         };
-        let id = match engine.add_request(request) {
-            Ok(id) => id,
-            Err(e) => {
-                eprintln!("error: {e}");
-                if args.chat {
-                    history.pop();
-                }
-                continue;
-            }
-        };
-
-        // Stream the answer as it is generated.
-        let mut decoder = StreamDecoder::new();
-        let mut answer = String::new();
-        'generate: while engine.has_work() {
-            for ev in engine.step()? {
-                debug_assert_eq!(ev.id, id);
-                let stopped = ev.finish == Some(engine::FinishReason::Stop);
-                let text = if stopped {
-                    decoder.flush(tokenizer)?
-                } else {
-                    decoder.push(tokenizer, ev.token)?
-                };
-                answer.push_str(&text);
-                write!(stdout, "{text}")?;
-                stdout.flush()?;
-                if ev.finish.is_some() {
-                    break 'generate;
-                }
-            }
-        }
-        writeln!(stdout)?;
-        if args.chat {
-            history.push(ChatMessage {
-                role: "assistant".into(),
-                content: answer,
-            });
+        match result {
+            Ok(_) => writeln!(terminal.out)?,
+            Err(e) => eprintln!("error: {e}"),
         }
     }
     Ok(())
+}
+
+// Writes an answer to the terminal as it is generated. Notices go to stderr,
+// so they don't mix into the answer.
+struct Terminal {
+    out: std::io::Stdout,
+}
+
+impl conversation::Sink for Terminal {
+    fn text(&mut self, piece: &str) -> bool {
+        write!(self.out, "{piece}")
+            .and_then(|_| self.out.flush())
+            .is_ok()
+    }
+
+    fn notice(&mut self, line: String) {
+        eprintln!("{line}");
+    }
 }
 
 // ---- serve ----------------------------------------------------------------
