@@ -69,7 +69,9 @@ cargo run --release -- cli \
 
 Pass `--chat` to wrap input in the model's chat format (use this with instruct
 models); the conversation history is then kept between questions. `--system
-"..."` is added after the model's default system prompt, so both apply.
+"..."` is added after the model's default system prompt, so both apply. A
+conversation that outgrows the KV cache is compacted, as described in
+[Long chats](#long-chats).
 
 With `--prompt` the CLI runs the given prompts once and exits. Multiple
 `--prompt`s run concurrently through continuous batching, all sharing one KV
@@ -112,27 +114,43 @@ level of subdirectories); each model uses a `tokenizer.json` next to it, else
 `--tokenizer`. `--model` skips the picker and preloads that file. Keys: Enter
 send, Esc stop generating, Ctrl-O switch model, Ctrl-N new conversation,
 PgUp/PgDn scroll, Ctrl-C quit. The sampling, `--chat`, `--system`,
-`--max-tokens`, `--device` and KV flags apply as in the plain interactive loop;
-`--prompt`/`--debug`/`--arrival-step` can't be combined with `--tui`.
+`--compact`, `--max-tokens`, `--device` and KV flags apply as in the plain
+interactive loop; `--prompt`/`--debug`/`--arrival-step` can't be combined with
+`--tui`.
 
-A chat resends its whole history each turn, so it eventually outgrows the KV
-cache. The pool is `--num-blocks` × `--block-size` tokens (the context length
-up to 4096 by default), capped at the context length. The answer keeps a reserve
-of its length, but at most a quarter of the pool. The prompt gets the rest. When
-the rendered prompt is over that budget, the TUI compacts the history to about
-three quarters of it and notes what it did in the transcript. `--compact
-summarize` (the default) has the loaded model fold the oldest turns into a
-summary kept in the system prompt; `--compact drop` removes the oldest
-user/assistant pairs instead. If the summary can't be written, the TUI drops
-turns. If the system prompt and newest message alone don't fit, the request is
-refused as before.
+Messages typed while an answer is streaming wait in a queue above the input.
+Each goes to the model when the answer before it finishes, and it moves into
+the transcript once the model has taken it. Ctrl-N clears the queue. Esc during
+a summary stops the send: the message stays in the queue until you press Enter.
 
-An answer longer than its reserve can outgrow the pool. Then the TUI compacts
-the history again, keeps the answer so far, and carries on, so the answer is
-not cut short by the pool. A single answer can be continued up to 64 times. It
-stops early only when the history can't make room for the rest of it, and a
-notice says so. Each continuation starts a fresh sampler, so sampled (non-greedy)
-output after a continuation differs from an uninterrupted run.
+### Long chats
+
+A chat resends its whole history each turn, so eventually it outgrows the KV
+cache. The TUI (`cli --tui --chat`), the terminal chat (`cli --chat`) and the
+server's `/v1/chat/completions` follow the same rules:
+
+- **Budget.** The pool is `--num-blocks` × `--block-size` tokens, capped at the
+  context length (the terminal chat and TUI size it to the context length, up to
+  4096 tokens, unless `--num-blocks` is given). An answer keeps room for its
+  `max_tokens`, but at most a quarter of the pool, and the prompt gets the rest.
+- **Compaction.** A prompt over that budget is compacted to about three quarters
+  of it before the message is sent. `--compact summarize` (the default) has the
+  model fold the oldest turns into a summary kept in the system prompt;
+  `--compact drop` removes the oldest user/assistant pairs instead. If the
+  summary can't be written, turns are dropped. The TUI and terminal chat say
+  what compaction did. If the newest message doesn't fit in the pool even after
+  compaction, the request is refused.
+- **Continuation.** If an answer fills the pool before it reaches `max_tokens`,
+  the history is compacted again, the answer so far is kept, and generation
+  carries on. An answer is continued at most 64 times. It stops early only when
+  the history can't make room for the rest of it; the TUI and terminal chat say
+  so in a notice, and the server ends the answer with `finish_reason: "length"`.
+  Each continuation starts a fresh sampler, so sampled (non-greedy) output
+  differs from an uninterrupted run. Greedy output doesn't.
+
+Answers without a chat history (`/v1/completions`, and `cli` without `--chat`)
+can't be compacted. They are capped at the room the pool leaves beside the
+prompt, and the terminal chat says so when that cuts an answer short.
 
 ## Server mode
 
@@ -157,6 +175,18 @@ Endpoints: `POST /v1/completions`, `POST /v1/chat/completions` (both with
 completions take a single prompt. Any OpenAI client works by pointing its base
 URL at `http://localhost:8000/v1`.
 
+Chats follow [Long chats](#long-chats): `--compact` (default `summarize`) sets
+how an over-budget conversation is compacted, and an answer that fills the pool
+is continued. The server keeps no conversation state, so each request is
+compacted from the messages it carries. With `summarize` that can cost an extra
+generation per request until the conversation fits. `usage.prompt_tokens` counts
+the prompt as first sent, after compaction, and `completion_tokens` counts every
+generated token across the continuations. `/v1/completions` is capped at the
+room left in the pool and never continued. A chat uses the system message the
+client sends as it is, and the model's default system prompt only when the
+client sends none. That differs from `--system` in the CLI, which is added after
+the default.
+
 ### How concurrent clients are handled
 
 All HTTP connections are served by tokio, but inference runs on one engine
@@ -169,7 +199,9 @@ thread that continuously batches whatever is in flight:
 - **Queue.** At most `--max-running` (default 8) sequences decode together.
   Further requests wait in a FIFO queue and start as slots free up (or as KV
   blocks free up; when the pool is exhausted mid-flight the engine preempts
-  the least recently used sequence and re-prefills it later).
+  the least recently used sequence and re-prefills it later). A chat answer
+  that is continued after compaction waits in the queue again for its next
+  segment, behind requests that arrived in the meantime.
 - **Backpressure.** Once `--max-running + --max-queue` (default 8 + 64)
   requests are in flight, new ones get `429` with `Retry-After: 1` instead of
   piling up.
