@@ -130,6 +130,10 @@ struct ServeArgs {
     // model file's name.
     #[arg(long)]
     model_name: Option<String>,
+    // What to do with the oldest turns once a chat outgrows the KV cache: as
+    // for `cli --compact`.
+    #[arg(long, value_enum, default_value_t = CompactArg::Summarize)]
+    compact: CompactArg,
     // Sequences decoded together in one batch. Further requests wait in a FIFO
     // queue until a slot frees up.
     #[arg(long, default_value_t = 8)]
@@ -468,6 +472,7 @@ fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
             default_max_tokens: args.default_max_tokens,
             default_temperature: args.default_temperature,
             default_top_p: args.default_top_p,
+            compact: args.compact.into(),
         },
     )
 }
