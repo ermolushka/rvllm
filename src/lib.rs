@@ -1,9 +1,12 @@
+pub mod answer;
 pub mod chat;
 mod conv_cache;
+pub mod conversation;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod engine;
 pub mod generator;
+pub mod history;
 pub mod kv_storage;
 pub mod model;
 pub mod runtime;

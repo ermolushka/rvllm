@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::chat::ChatFormat;
 use crate::engine::{BoxError, Engine, EngineConfig};
+use crate::history::Strategy;
 use crate::model::Model;
 use crate::runtime::Runtime;
 use crate::tokenizer::Tokenizer;
@@ -31,6 +32,8 @@ pub struct ServeOptions {
     pub default_max_tokens: usize,
     pub default_temperature: f32,
     pub default_top_p: f32,
+    // How a chat that outgrows the KV pool is compacted.
+    pub compact: Strategy,
 }
 
 impl Default for ServeOptions {
@@ -47,6 +50,7 @@ impl Default for ServeOptions {
             default_max_tokens: 256,
             default_temperature: 1.0,
             default_top_p: 1.0,
+            compact: Strategy::Summarize,
         }
     }
 }
@@ -116,6 +120,7 @@ pub fn run(model_path: &str, tokenizer_path: &str, opts: ServeOptions) -> Result
                 default_top_p: opts.default_top_p,
                 context_length,
                 max_sequence_tokens,
+                compact: opts.compact,
             },
             tokenizer,
             ChatFormat::for_model(&model.config),

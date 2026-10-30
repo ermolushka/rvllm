@@ -7,11 +7,12 @@
 // `Cmd` goes to the worker, `Event` comes back. Cancelling a generation uses a
 // shared flag the worker checks between decode steps.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -20,12 +21,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::chat::{self, ChatFormat, ChatMessage};
-use crate::engine::{self, BoxError, Engine, EngineConfig, Request};
+use crate::chat::{self, ChatFormat};
+use crate::conversation::{self, Chat};
+use crate::engine::{self, BoxError, Engine, EngineConfig};
+use crate::history::{self, Strategy};
 use crate::model::Model;
 use crate::runtime::Runtime;
-use crate::sampler::{Sampler, SamplingParams};
-use crate::tokenizer::{self, StreamDecoder, Tokenizer};
+use crate::sampler::SamplingParams;
+use crate::tokenizer::{self, Tokenizer};
 
 pub struct TuiOptions {
     pub device: String,
@@ -42,6 +45,8 @@ pub struct TuiOptions {
     pub models_dir: PathBuf,
     // Load this model right away instead of opening the picker.
     pub initial_model: Option<PathBuf>,
+    // What to do with old turns once a chat outgrows the KV budget.
+    pub compact: Strategy,
 }
 
 #[derive(Clone)]
@@ -112,8 +117,15 @@ enum Cmd {
         tokenizer: PathBuf,
         device: String,
     },
-    Send(String, Settings),
+    Send(u64, String, Settings),
     NewChat,
+}
+
+// One message on its way to the model. `id` is how the UI learns that the
+// worker took it into the chat.
+struct Turn {
+    id: u64,
+    line: String,
 }
 
 enum Event {
@@ -128,6 +140,12 @@ enum Event {
         secs: f64,
         hit_limit: bool,
     },
+    // A line for the transcript, such as what compaction did.
+    Notice(String),
+    // The worker took this message into the chat, so it is no longer unsent.
+    Accepted(u64),
+    // The send was stopped before it got a reply, so no reply entry is kept.
+    Stopped,
     Error(String),
 }
 
@@ -194,29 +212,30 @@ fn session(
     let _ = ctx.tx.send(Event::Ready { name, context });
 
     // Every chat, including one started with Ctrl-N, opens with the system
-    // prompt, if one was given.
-    let opening = || -> Vec<ChatMessage> {
-        opts.system
-            .iter()
-            .map(|system| ChatMessage {
-                role: "system".into(),
-                content: system.clone(),
-            })
-            .collect()
-    };
-    let mut history = opening();
+    // prompt: the model's default one, if it has one, then `--system`.
+    let mut chat = chat_format.map(|format| {
+        Chat::new(
+            format,
+            chat::system_prompt(Some(format), opts.system.as_deref()),
+            opts.compact,
+        )
+    });
     loop {
         match rx.recv() {
-            Ok(Cmd::NewChat) => history = opening(),
+            Ok(Cmd::NewChat) => {
+                if let Some(chat) = chat.as_mut() {
+                    chat.clear();
+                }
+            }
             Ok(load @ Cmd::Load { .. }) => return Ok(Some(load)),
-            Ok(Cmd::Send(line, settings)) => {
+            Ok(Cmd::Send(id, line, settings)) => {
                 if let Err(e) = generate(
                     ctx,
                     &mut engine,
                     &tokenizer,
                     chat_format,
-                    &mut history,
-                    line,
+                    chat.as_mut(),
+                    Turn { id, line },
                     &settings,
                 ) {
                     let _ = ctx.tx.send(Event::Error(e.to_string()));
@@ -227,84 +246,158 @@ fn session(
     }
 }
 
+// Runs one message. In a chat it is added to the history and compacted first;
+// the answer streams into the transcript. Esc during a summary stops the send,
+// and the message stays unsent.
 fn generate<B: engine::Backend>(
     ctx: &WorkerCtx,
     engine: &mut Engine<B>,
     tokenizer: &Tokenizer,
     chat_format: Option<ChatFormat>,
-    history: &mut Vec<ChatMessage>,
-    line: String,
+    chat: Option<&mut Chat>,
+    turn: Turn,
     settings: &Settings,
 ) -> Result<(), BoxError> {
-    let chat = settings.chat;
-    let prompt = if chat {
-        let format = chat_format.ok_or("this model's chat format is unknown; turn chat off")?;
-        history.push(ChatMessage {
-            role: "user".into(),
-            content: line,
-        });
-        format.render(history)
-    } else {
-        line
-    };
-    let request = Request {
-        tokens: tokenizer.encode(&prompt)?,
+    // Cleared before compacting, so an Esc during a summary stops the send.
+    ctx.cancel.store(false, Ordering::Relaxed);
+    if settings.chat && chat.is_none() {
+        return Err("this model's chat format is unknown; turn chat off".into());
+    }
+    let opts = conversation::Options {
         max_tokens: settings.max_tokens,
         stop_tokens: chat::stop_tokens(tokenizer, chat_format),
-        sampler: Sampler::from_params(settings.sampling),
+        sampling: settings.sampling,
     };
-    let id = match engine.add_request(request) {
-        Ok(id) => id,
-        Err(e) => {
-            if chat {
-                history.pop();
-            }
-            return Err(e.into());
-        }
-    };
-
-    ctx.cancel.store(false, Ordering::Relaxed);
-    let started = Instant::now();
-    let mut decoder = StreamDecoder::new();
-    let mut answer = String::new();
-    let mut tokens = 0;
-    let mut hit_limit = false;
-    'generate: while engine.has_work() {
-        if ctx.cancel.load(Ordering::Relaxed) {
-            engine.abort(id);
-            break;
-        }
-        for ev in engine.step()? {
-            tokens += 1;
-            let stopped = ev.finish == Some(engine::FinishReason::Stop);
-            let text = if stopped {
-                decoder.flush(tokenizer)?
-            } else {
-                decoder.push(tokenizer, ev.token)?
+    let mut lines = Lines { tx: &ctx.tx };
+    let reply = match chat.filter(|_| settings.chat) {
+        Some(chat) => {
+            let prompt = match chat.begin_turn(
+                engine,
+                tokenizer,
+                turn.line,
+                settings.max_tokens,
+                &ctx.cancel,
+                &mut lines,
+            ) {
+                Ok(prompt) => prompt,
+                // Esc while summarizing stops the send: no reply, and no error.
+                Err(e) if e.is::<history::Cancelled>() => {
+                    let _ = ctx.tx.send(Event::Notice(
+                        "stopped while summarizing; the message was not sent".into(),
+                    ));
+                    let _ = ctx.tx.send(Event::Stopped);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
             };
-            answer.push_str(&text);
-            if ctx.tx.send(Event::Token(text)).is_err() {
-                engine.abort(id);
-                break 'generate;
-            }
-            hit_limit = ev.finish == Some(engine::FinishReason::Length);
-            if ev.finish.is_some() {
-                break 'generate;
-            }
+            let _ = ctx.tx.send(Event::Accepted(turn.id));
+            chat.finish_turn(engine, tokenizer, prompt, &opts, &ctx.cancel, &mut lines)?
         }
-    }
-    if chat {
-        history.push(ChatMessage {
-            role: "assistant".into(),
-            content: answer,
-        });
-    }
+        None => {
+            let prompt = tokenizer.encode(&turn.line)?;
+            let _ = ctx.tx.send(Event::Accepted(turn.id));
+            conversation::plain(engine, tokenizer, prompt, &opts, &ctx.cancel, &mut lines)?
+        }
+    };
     let _ = ctx.tx.send(Event::Finished {
-        tokens,
-        secs: started.elapsed().as_secs_f64(),
-        hit_limit,
+        tokens: reply.tokens,
+        secs: reply.secs,
+        hit_limit: reply.hit_limit,
     });
     Ok(())
+}
+
+// Streams an answer into the transcript: text as tokens, notices as notices.
+struct Lines<'a> {
+    tx: &'a Sender<Event>,
+}
+
+impl conversation::Sink for Lines<'_> {
+    fn text(&mut self, piece: &str) -> bool {
+        self.tx.send(Event::Token(piece.to_string())).is_ok()
+    }
+
+    fn notice(&mut self, line: String) {
+        let _ = self.tx.send(Event::Notice(line));
+    }
+}
+
+// Messages typed but not yet accepted by the worker, oldest first. A message
+// leaves the outbox when the worker takes it into the chat, so until then it
+// is shown as unsent.
+#[derive(Default)]
+struct Outbox {
+    next_id: u64,
+    items: VecDeque<(u64, String)>,
+    // A message was handed to the worker and has not been accepted, stopped or
+    // refused yet.
+    in_flight: bool,
+    // A send was stopped or refused, so nothing goes out until Enter.
+    paused: bool,
+}
+
+impl Outbox {
+    fn push(&mut self, text: String) {
+        self.items.push_back((self.next_id, text));
+        self.next_id += 1;
+    }
+
+    // The oldest unsent message, handed out once: nothing else goes out while
+    // one is in flight or while paused.
+    fn next_to_send(&mut self) -> Option<(u64, String)> {
+        if self.in_flight || self.paused {
+            return None;
+        }
+        let (id, text) = self.items.front()?.clone();
+        self.in_flight = true;
+        Some((id, text))
+    }
+
+    // The worker took message `id` into the chat: it leaves the outbox.
+    fn accepted(&mut self, id: u64) -> Option<String> {
+        if !self.in_flight || self.items.front()?.0 != id {
+            return None;
+        }
+        self.in_flight = false;
+        self.items.pop_front().map(|(_, text)| text)
+    }
+
+    // The in-flight message was stopped before the worker took it: it stays
+    // unsent, and nothing goes out until Enter.
+    fn stopped(&mut self) {
+        self.in_flight = false;
+        self.paused = true;
+    }
+
+    // The worker refused the in-flight message: it is dropped, and nothing else
+    // goes out until Enter. Returns whether a message was in flight.
+    fn refused(&mut self) -> bool {
+        if !self.in_flight {
+            return false;
+        }
+        self.in_flight = false;
+        self.items.pop_front();
+        self.paused = true;
+        true
+    }
+
+    fn resume(&mut self) {
+        self.paused = false;
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.in_flight = false;
+        self.paused = false;
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    fn texts(&self) -> impl Iterator<Item = &str> {
+        self.items.iter().map(|(_, text)| text.as_str())
+    }
 }
 
 #[derive(PartialEq)]
@@ -315,11 +408,23 @@ enum Status {
     Generating,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Role {
     User,
     Assistant,
     Notice,
+}
+
+// A notice goes just before the reply being written, if there is one: its
+// entry is the last one, and tokens still go to it. Otherwise it goes at the
+// end.
+fn push_notice(transcript: &mut Vec<(Role, String)>, answering: bool, text: String) {
+    if answering && !transcript.is_empty() {
+        let at = transcript.len() - 1;
+        transcript.insert(at, (Role::Notice, text));
+    } else {
+        transcript.push((Role::Notice, text));
+    }
 }
 
 struct App {
@@ -345,6 +450,10 @@ struct App {
 
     picker: Option<Picker>,
     quit: bool,
+    // Messages typed but not yet accepted by the worker.
+    outbox: Outbox,
+    // The last transcript entry is the reply being written.
+    answering: bool,
 }
 
 #[derive(PartialEq)]
@@ -468,6 +577,7 @@ impl App {
             match ev {
                 Event::Loading(name) => self.status = Status::Loading(name),
                 Event::Ready { name, context } => {
+                    self.outbox.clear();
                     self.transcript.clear();
                     self.transcript
                         .push((Role::Notice, format!("loaded {name}")));
@@ -482,11 +592,28 @@ impl App {
                         answer.push_str(&text);
                     }
                 }
+                Event::Notice(text) => push_notice(&mut self.transcript, self.answering, text),
+                Event::Accepted(id) => {
+                    if let Some(text) = self.outbox.accepted(id) {
+                        self.transcript.push((Role::User, text));
+                        self.transcript.push((Role::Assistant, String::new()));
+                        self.answering = true;
+                        self.scroll_up = 0;
+                    }
+                }
+                Event::Stopped => {
+                    // Nothing was accepted, so the message stays unsent.
+                    self.outbox.stopped();
+                    if self.status == Status::Generating {
+                        self.status = Status::Idle;
+                    }
+                }
                 Event::Finished {
                     tokens,
                     secs,
                     hit_limit,
                 } => {
+                    self.answering = false;
                     // A cancelled generation can finish after a model switch
                     // was already requested.
                     if self.status == Status::Generating {
@@ -499,8 +626,10 @@ impl App {
                             format!("stopped at the {}-token limit", self.settings.max_tokens),
                         ));
                     }
+                    self.dispatch();
                 }
                 Event::Error(e) => {
+                    self.answering = false;
                     self.transcript.push((Role::Notice, format!("error: {e}")));
                     // A failed load leaves the previous model unusable (the
                     // worker already dropped it), so go back to the picker.
@@ -511,6 +640,9 @@ impl App {
                         self.device = self.good_device.clone();
                         self.open_picker();
                     } else {
+                        // A refused send leaves the outbox, and nothing else goes
+                        // out until Enter.
+                        self.outbox.refused();
                         self.status = Status::Idle;
                     }
                 }
@@ -521,18 +653,28 @@ impl App {
     fn submit(&mut self) {
         let line = self.input.trim().to_string();
         self.input.clear();
-        if line.is_empty() {
-            return;
-        }
         if matches!(line.as_str(), "exit" | "quit") {
             self.quit = true;
             return;
         }
-        self.transcript.push((Role::User, line.clone()));
-        self.transcript.push((Role::Assistant, String::new()));
-        self.scroll_up = 0;
-        self.status = Status::Generating;
-        let _ = self.cmd_tx.send(Cmd::Send(line, self.settings.clone()));
+        if !line.is_empty() {
+            self.outbox.push(line);
+        }
+        // Enter also resumes sends that a stop left unsent.
+        self.outbox.resume();
+        self.dispatch();
+    }
+
+    // Hands the oldest unsent message to the worker, once the worker is idle.
+    fn dispatch(&mut self) {
+        if self.status != Status::Idle {
+            return;
+        }
+        if let Some((id, text)) = self.outbox.next_to_send() {
+            self.status = Status::Generating;
+            self.scroll_up = 0;
+            let _ = self.cmd_tx.send(Cmd::Send(id, text, self.settings.clone()));
+        }
     }
 
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -557,6 +699,7 @@ impl App {
             KeyCode::Char('d') if ctrl => self.switch_device(),
             KeyCode::Char('n') if ctrl && self.status == Status::Idle => {
                 let _ = self.cmd_tx.send(Cmd::NewChat);
+                self.outbox.clear();
                 self.transcript.clear();
                 self.transcript
                     .push((Role::Notice, "new conversation".into()));
@@ -568,7 +711,7 @@ impl App {
             }
             KeyCode::PageUp => self.scroll_up = self.scroll_up.saturating_add(8),
             KeyCode::PageDown => self.scroll_up = self.scroll_up.saturating_sub(8),
-            KeyCode::Enter if self.status == Status::Idle => self.submit(),
+            KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -710,14 +853,20 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [main, input, status] = Layout::vertical([
+        let unsent = self.outbox.texts().count().min(3) as u16;
+        let queue_rows = if unsent == 0 { 0 } else { unsent + 2 };
+        let [main, queue, input, status] = Layout::vertical([
             Constraint::Min(3),
+            Constraint::Length(queue_rows),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
         .areas(frame.area());
 
         self.draw_transcript(frame, main);
+        if queue_rows > 0 {
+            self.draw_queue(frame, queue);
+        }
         self.draw_input(frame, input);
         self.draw_status(frame, status);
         if let Some(picker) = &mut self.picker {
@@ -766,12 +915,36 @@ impl App {
         );
     }
 
+    // The messages still unsent, above the input: at most three lines.
+    fn draw_queue(&self, frame: &mut Frame, area: Rect) {
+        let title = if self.outbox.is_paused() {
+            " unsent (Enter sends) "
+        } else {
+            " unsent "
+        };
+        let texts: Vec<&str> = self.outbox.texts().collect();
+        let mut lines: Vec<Line> = texts
+            .iter()
+            .take(3)
+            .map(|text| Line::styled(format!("you: {text}"), Style::new().fg(Color::Yellow)))
+            .collect();
+        if texts.len() > 3 {
+            lines.truncate(2);
+            lines.push(Line::styled(
+                format!("... {} more", texts.len() - 2),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        let block = Block::default().borders(Borders::ALL).title(title);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
         let ready = self.status == Status::Idle;
         let title = if ready {
             " message "
         } else {
-            " message (busy) "
+            " message (Enter queues it) "
         };
         let style = if ready {
             Style::new()
@@ -791,7 +964,7 @@ impl App {
             Paragraph::new(shown.clone()).style(style).block(block),
             area,
         );
-        if ready && self.picker.is_none() {
+        if self.picker.is_none() {
             frame.set_cursor_position((area.x + 1 + shown.chars().count() as u16, area.y + 1));
         }
     }
@@ -950,6 +1123,8 @@ pub fn run(opts: TuiOptions) -> Result<(), BoxError> {
         scroll_up: 0,
         picker: None,
         quit: false,
+        outbox: Outbox::default(),
+        answering: false,
     };
     match &opts.initial_model {
         Some(path) => app.load(&ModelEntry {
@@ -996,4 +1171,87 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), BoxEr
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbox_hands_out_one_message_at_a_time() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        outbox.push("b".into());
+        let (id_a, text) = outbox.next_to_send().unwrap();
+        assert_eq!(text, "a");
+        assert!(outbox.next_to_send().is_none());
+        assert_eq!(outbox.accepted(id_a).as_deref(), Some("a"));
+        let next = outbox.next_to_send().map(|(_, text)| text);
+        assert_eq!(next.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn outbox_ignores_acceptance_of_another_message() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        let (id, _) = outbox.next_to_send().unwrap();
+        assert!(outbox.accepted(id + 1).is_none());
+        assert!(outbox.next_to_send().is_none());
+    }
+
+    #[test]
+    fn outbox_stays_unsent_when_stopped_until_resumed() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        outbox.next_to_send().unwrap();
+        outbox.stopped();
+        assert!(outbox.next_to_send().is_none());
+        assert_eq!(outbox.texts().collect::<Vec<_>>(), vec!["a"]);
+        outbox.resume();
+        assert!(outbox.next_to_send().is_some());
+    }
+
+    #[test]
+    fn outbox_drops_a_refused_message_and_pauses() {
+        let mut outbox = Outbox::default();
+        outbox.push("a".into());
+        outbox.push("b".into());
+        outbox.next_to_send().unwrap();
+        assert!(outbox.refused());
+        assert!(!outbox.refused());
+        assert!(outbox.next_to_send().is_none());
+        assert_eq!(outbox.texts().collect::<Vec<_>>(), vec!["b"]);
+    }
+
+    #[test]
+    fn a_notice_goes_at_the_end_when_no_reply_is_being_written() {
+        let mut transcript = vec![
+            (Role::User, "q".to_string()),
+            (Role::Assistant, "a".to_string()),
+        ];
+        push_notice(&mut transcript, false, "note".into());
+        assert_eq!(
+            transcript.last().unwrap(),
+            &(Role::Notice, "note".to_string())
+        );
+        assert_eq!(transcript.len(), 3);
+    }
+
+    #[test]
+    fn a_notice_goes_before_the_reply_being_written() {
+        let mut transcript = vec![
+            (Role::User, "q".to_string()),
+            (Role::Assistant, "partial".to_string()),
+        ];
+        push_notice(&mut transcript, true, "note".into());
+        assert_eq!(transcript[1], (Role::Notice, "note".to_string()));
+        assert_eq!(transcript[2], (Role::Assistant, "partial".to_string()));
+    }
+
+    #[test]
+    fn a_notice_while_answering_into_an_empty_transcript_does_not_panic() {
+        let mut transcript = Vec::new();
+        push_notice(&mut transcript, true, "note".into());
+        assert_eq!(transcript, vec![(Role::Notice, "note".to_string())]);
+    }
 }

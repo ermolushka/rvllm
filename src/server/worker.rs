@@ -20,10 +20,14 @@ pub struct Job {
     pub max_tokens: usize,
     pub stop_tokens: Vec<u32>,
     pub sampling: SamplingParams,
+    // A chat segment: when the pool fills it ends with `FinishReason::PoolFull`,
+    // so the caller can compact and continue it.
+    pub continuable: bool,
     pub events: UnboundedSender<WorkerEvent>,
-    // Held for the job's whole life (queued + running); releasing it frees a
-    // slot for the next request the server would otherwise have rejected.
-    pub permit: OwnedSemaphorePermit,
+    // Held while the job is queued or running, so that a full queue is refused
+    // at once. Releasing it frees a slot for the next request. Summaries, which
+    // belong to a request that already holds its slot, carry none.
+    pub permit: Option<OwnedSemaphorePermit>,
 }
 
 pub enum WorkerEvent {
@@ -43,7 +47,7 @@ pub struct WorkerStatus {
 
 struct Live {
     events: UnboundedSender<WorkerEvent>,
-    permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 // Runs until every `Job` sender is dropped and all in-flight work is done.
@@ -61,7 +65,12 @@ pub fn run_worker<B: Backend>(
             stop_tokens: job.stop_tokens,
             sampler: Sampler::from_params(job.sampling),
         };
-        match engine.add_request(request) {
+        let added = if job.continuable {
+            engine.add_continuable_request(request)
+        } else {
+            engine.add_request(request)
+        };
+        match added {
             Ok(id) => {
                 live.insert(
                     id,

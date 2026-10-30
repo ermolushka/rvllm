@@ -134,6 +134,10 @@ pub struct Request {
 pub enum FinishReason {
     Stop,
     Length,
+    // The pool is full and this request is the only one running, so it can't
+    // grow. Only requests added with `add_continuable_request` stop like this;
+    // the caller continues them after compacting the prompt.
+    PoolFull,
 }
 
 pub struct TokenEvent {
@@ -195,6 +199,8 @@ struct SeqState {
     // emitted as soon as it's sampled, but not in the KV cache until then).
     last_token: u32,
     sampler: Sampler,
+    // Stops with `FinishReason::PoolFull` instead of growing past the pool.
+    continuable: bool,
 }
 
 // One running sequence's contribution to a decode step. Owned here so the
@@ -258,6 +264,19 @@ impl<B: Backend> Engine<B> {
     // Queues a request; it starts running on a later `step` once there is
     // room. `max_tokens` is clamped to what fits in the context window.
     pub fn add_request(&mut self, req: Request) -> Result<SequenceId, RequestError> {
+        self.enqueue(req, false)
+    }
+
+    // Like `add_request`, but the answer may outgrow the pool: only the prompt
+    // has to fit now. When the pool fills while this is the only running
+    // request, it stops with `FinishReason::PoolFull`. The caller can then
+    // continue it, after compacting its prompt, by submitting the new prompt
+    // followed by the tokens generated so far.
+    pub fn add_continuable_request(&mut self, req: Request) -> Result<SequenceId, RequestError> {
+        self.enqueue(req, true)
+    }
+
+    fn enqueue(&mut self, req: Request, continuable: bool) -> Result<SequenceId, RequestError> {
         if req.tokens.is_empty() {
             return Err(RequestError::EmptyPrompt);
         }
@@ -274,7 +293,15 @@ impl<B: Backend> Engine<B> {
         }
         let max_tokens = req.max_tokens.min(context - prompt_len);
         let capacity = self.cfg.num_blocks * self.cfg.block_size;
-        if prompt_len + max_tokens > capacity {
+        if continuable {
+            // The first token needs room too.
+            if prompt_len >= capacity {
+                return Err(RequestError::ExceedsKvCapacity {
+                    tokens: prompt_len + 1,
+                    capacity,
+                });
+            }
+        } else if prompt_len + max_tokens > capacity {
             return Err(RequestError::ExceedsKvCapacity {
                 tokens: prompt_len + max_tokens,
                 capacity,
@@ -293,6 +320,7 @@ impl<B: Backend> Engine<B> {
                 num_generated: 0,
                 last_token: 0,
                 sampler: req.sampler,
+                continuable,
             },
         );
         Ok(seq_id)
@@ -461,6 +489,18 @@ impl<B: Backend> Engine<B> {
         Ok(())
     }
 
+    // True when `seq_id` is the only running sequence and its next token needs a
+    // KV block the pool doesn't have. Its blocks are all its own, so nothing
+    // can be preempted to make room.
+    fn cannot_grow(&self, seq_id: SequenceId) -> bool {
+        self.scheduler.running == [seq_id]
+            && self.scheduler.sequences[&seq_id]
+                .block_table
+                .num_tokens()
+                .is_multiple_of(self.cfg.block_size)
+            && self.scheduler.pool.available() == 0
+    }
+
     // Records a freshly sampled token, retiring the sequence if it's done.
     fn emit(
         &mut self,
@@ -469,6 +509,7 @@ impl<B: Backend> Engine<B> {
         ttft: Option<Duration>,
         events: &mut Vec<TokenEvent>,
     ) {
+        let continuable = self.seqs[&seq_id].continuable;
         let state = self.seqs.get_mut(&seq_id).unwrap();
         state.num_generated += 1;
         state.last_token = token;
@@ -476,6 +517,8 @@ impl<B: Backend> Engine<B> {
             Some(FinishReason::Stop)
         } else if state.num_generated >= state.max_tokens {
             Some(FinishReason::Length)
+        } else if continuable && self.cannot_grow(seq_id) {
+            Some(FinishReason::PoolFull)
         } else {
             None
         };
@@ -834,6 +877,46 @@ mod tests {
         let mut big = Engine::new(CountingBackend::new(8), cfg(16, 8));
         let id = big.add_request(req(vec![1, 2], 100)).unwrap();
         assert_eq!(tokens_of(&drain(&mut big), id).len(), 6);
+    }
+
+    #[test]
+    fn continuable_request_stops_when_the_pool_is_full() {
+        // 4 blocks of 4 slots: the answer can grow until the pool is full.
+        let mut engine = Engine::new(CountingBackend::new(64), cfg(4, 8));
+        let id = engine
+            .add_continuable_request(req(vec![1, 2, 3], 40))
+            .unwrap();
+        let events = drain(&mut engine);
+        let mine: Vec<&TokenEvent> = events.iter().filter(|e| e.id == id).collect();
+        assert_eq!(mine.last().unwrap().finish, Some(FinishReason::PoolFull));
+        assert_eq!(mine.len(), 14);
+        assert!(!engine.has_work());
+        assert_eq!(engine.scheduler().pool.available(), 4);
+        // Continuing it needs only a prompt that fits the pool, with the
+        // tokens generated so far at its end.
+        let last = mine.last().unwrap().token;
+        let next = engine.add_continuable_request(req(vec![last], 3)).unwrap();
+        let events = drain(&mut engine);
+        assert_eq!(events.iter().filter(|e| e.id == next).count(), 3);
+    }
+
+    #[test]
+    fn continuable_request_must_leave_room_for_its_first_token() {
+        let mut engine = Engine::new(CountingBackend::new(64), cfg(4, 8));
+        assert!(matches!(
+            engine.add_continuable_request(req(vec![1; 16], 5)),
+            Err(RequestError::ExceedsKvCapacity { .. })
+        ));
+        assert!(engine.add_continuable_request(req(vec![1; 15], 5)).is_ok());
+    }
+
+    #[test]
+    fn plain_requests_still_reserve_their_whole_answer() {
+        let mut engine = Engine::new(CountingBackend::new(64), cfg(4, 8));
+        assert!(matches!(
+            engine.add_request(req(vec![1, 2, 3], 40)),
+            Err(RequestError::ExceedsKvCapacity { .. })
+        ));
     }
 
     #[test]

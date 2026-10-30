@@ -4,6 +4,7 @@
 use crate::model::{Arch, Config};
 use crate::tokenizer::Tokenizer;
 
+#[derive(Clone)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -65,6 +66,15 @@ impl ChatFormat {
             (Arch::Qwen3, Some("qwen2")) => Some(ChatFormat::QWEN3),
             (Arch::Gemma3, _) => Some(ChatFormat::Gemma),
             (Arch::Lfm2, Some("lfm2")) => Some(ChatFormat::LFM2),
+            _ => None,
+        }
+    }
+
+    // The system prompt the model's template uses when a chat has none. Only
+    // the ChatML families have one here.
+    pub fn default_system(&self) -> Option<&'static str> {
+        match self {
+            ChatFormat::ChatMl { default_system, .. } => *default_system,
             _ => None,
         }
     }
@@ -168,6 +178,18 @@ pub fn stop_tokens(tokenizer: &Tokenizer, format: Option<ChatFormat>) -> Vec<u32
         }
     }
     stops
+}
+
+// The system prompt for a chat: the model's default, if it has one, then the
+// given text, if any. Both are kept, so the model's own instructions survive
+// a `--system` text and a summary alike.
+pub fn system_prompt(format: Option<ChatFormat>, given: Option<&str>) -> Option<String> {
+    let parts: Vec<&str> = format
+        .and_then(|f| f.default_system())
+        .into_iter()
+        .chain(given)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 // ChatML with SmolLM2's default system prompt.
@@ -305,6 +327,25 @@ mod tests {
             ChatFormat::LFM2.render(&[msg("user", "hi")]),
             "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    #[test]
+    fn system_prompt_keeps_the_default_and_the_given_text() {
+        let default = ChatFormat::SMOLLM2.default_system().unwrap();
+        assert_eq!(
+            system_prompt(Some(ChatFormat::SMOLLM2), None).as_deref(),
+            Some(default)
+        );
+        assert_eq!(
+            system_prompt(Some(ChatFormat::SMOLLM2), Some("be terse")).unwrap(),
+            format!("{default}\n\nbe terse")
+        );
+        assert_eq!(
+            system_prompt(Some(ChatFormat::Llama3), Some("be terse")).as_deref(),
+            Some("be terse")
+        );
+        assert_eq!(system_prompt(Some(ChatFormat::Llama3), None), None);
+        assert_eq!(system_prompt(None, None), None);
     }
 
     #[test]
