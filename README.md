@@ -1,13 +1,15 @@
 # rvllm
 
+[![crates.io](https://img.shields.io/crates/v/rvllm.svg)](https://crates.io/crates/rvllm)
+
 Two modes, one engine: `rvllm cli` for asking questions in the terminal and
 `rvllm serve` for an OpenAI-compatible HTTP server.
 
 ## Use as a library
 
 ```toml
-rvllm = { version = "0.1", default-features = false }            # engine only
-rvllm = { version = "0.1", default-features = false, features = ["server"] }  # + HTTP server module
+rvllm = { version = "0.3.0", default-features = false }            # engine only
+rvllm = { version = "0.3.0", default-features = false, features = ["server"] }  # + HTTP server module
 ```
 
 ```rust
