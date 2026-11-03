@@ -8,6 +8,8 @@ pub mod engine;
 pub mod generator;
 pub mod history;
 pub mod kv_storage;
+#[cfg(feature = "metal")]
+pub mod metal;
 pub mod model;
 pub mod runtime;
 pub mod sampler;

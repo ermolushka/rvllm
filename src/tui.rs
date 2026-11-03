@@ -723,17 +723,19 @@ impl App {
     // Cycles through the devices this build supports and reloads the current
     // model on the new one.
     fn switch_device(&mut self) {
-        let devices: &[&str] = if cfg!(feature = "cuda") {
-            &["cpu", "cuda"]
-        } else {
-            &["cpu"]
-        };
+        let mut devices = vec!["cpu"];
+        if cfg!(feature = "cuda") {
+            devices.push("cuda");
+        }
+        if cfg!(feature = "metal") {
+            devices.push("metal");
+        }
         let at = devices.iter().position(|d| *d == self.device).unwrap_or(0);
         let next = devices[(at + 1) % devices.len()];
         if next == self.device {
             self.transcript.push((
                 Role::Notice,
-                "only cpu is available (build with --features cuda for cuda)".into(),
+                "only cpu is available (build with --features cuda or metal for a GPU)".into(),
             ));
             return;
         }

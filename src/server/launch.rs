@@ -16,7 +16,7 @@ use super::{AppState, ServerConfig, serve};
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
-    // "cpu" or "cuda" (the latter needs the `cuda` feature).
+    // "cpu", "cuda" or "metal" (the latter two need their feature).
     pub device: String,
     // `host:port` to bind.
     pub addr: String,

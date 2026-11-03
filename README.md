@@ -18,7 +18,7 @@ let text = generator.complete("The capital of France is", &GenerateOptions::defa
 ```
 
 Features: `server` (axum API), `tui` (ratatui UI), `cli` (default; both plus the
-`rvllm`/`bench` binaries), `cuda`. Lower-level pieces (`Runtime`, `Engine`,
+`rvllm`/`bench` binaries), `cuda`, `metal`. Lower-level pieces (`Runtime`, `Engine`,
 `Backend`) are public too.
 
 ## Supported models
@@ -334,3 +334,58 @@ cargo run --release --features cuda --bin bench -- \
   --batch-sizes 1,4,8,16,32 \
   --device cuda
 ```
+
+## Metal support (Apple GPUs)
+
+Requires a Mac with Apple silicon and building with the `metal` feature, which
+pulls in the `metal` crate and compiles every kernel under
+`src/metal/kernels/*.metal` from source when the runtime starts - no separate
+build step and no Xcode `metal` compiler needed. The kernels, including the
+matmuls, are hand-written; nothing goes through MPS or Candle's Metal backend.
+
+```
+cargo build --release --features metal
+cargo test --release --features metal      # kernel/model unit tests, CPU vs Metal
+```
+
+Every command (`cli`, `serve`, `bench`) takes `--metal` (shorthand for
+`--device metal`) to run through `metal::model::MetalModel` +
+`metal::engine::MetalBackend` instead of the CPU/Candle path. Building with the
+feature only makes the code available; the flag is what switches to it.
+
+```
+cargo run --release --features metal -- cli \
+  --model ../SmolLM2-360M.Q8_0.gguf \
+  --tokenizer tokenizer.json \
+  --prompt "The capital of France is" \
+  --max-tokens 20 \
+  --metal
+
+cargo run --release --features metal --bin bench -- \
+  --model ../SmolLM2-360M.Q8_0.gguf \
+  --batch-sizes 1,4,8,16,32 \
+  --metal
+```
+
+The Metal backend covers the same model features as CUDA (Llama 3 RoPE scaling,
+Qwen2 biases, Qwen3 Q/K norm, Gemma 3, LFM2 short convolutions), each compared
+with the CPU path by a unit test on a tiny model. Unlike the CUDA tests these
+run on a Mac, so a plain `cargo test --features metal` really exercises the GPU;
+the tests skip only when the machine has no Metal device at all (set
+`RVLLM_REQUIRE_METAL=1` to make that a failure), and a kernel that fails to
+compile is always a failure.
+
+Weights are uploaded as F16 (activations stay F32). Because of that, greedy
+output matches the CPU path except where the CPU's own top two logits are
+nearly tied (the F16 rounding error is around 0.01 in a logit).
+
+Debugging aids:
+
+- `RVLLM_TIMING=1` prints, when a run ends, how a decode step splits into CPU
+  encode time and GPU wait time.
+- `RVLLM_METAL_PROFILE=1` runs every dispatch in its own command buffer and
+  prints the GPU time per kernel (matmuls per shape). Slow; for finding where
+  time goes, not for benchmarking.
+- Two `#[ignore]`d tests: `linear_microbench` times each matmul kernel on the
+  model's real projection shapes, and `real_model_prefill_logits_match_cpu`
+  (set `RVLLM_TEST_MODEL` to a GGUF) compares real-weight logits with the CPU.

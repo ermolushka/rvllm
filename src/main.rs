@@ -39,15 +39,26 @@ struct ModelArgs {
     // ./tokenizer.json.
     #[arg(long)]
     tokenizer: Option<String>,
-    // "cpu" (default) or "cuda" - requires building with --features cuda.
+    // "cpu" (default), "cuda" or "metal" - the latter two need building with
+    // --features cuda / --features metal.
     #[arg(long, default_value = "cpu")]
     device: String,
+    // Shorthand for `--device metal` (Apple GPU).
+    #[arg(long, conflicts_with = "device")]
+    metal: bool,
     #[arg(long, default_value_t = 16)]
     block_size: usize,
     // Total KV cache capacity, in blocks of `--block-size` tokens. Defaults
     // are sized per mode (see each command).
     #[arg(long)]
     num_blocks: Option<usize>,
+}
+
+impl ModelArgs {
+    // The device to run on: `--metal`, else `--device`.
+    fn device_name(&self) -> String {
+        if self.metal { "metal".into() } else { self.device.clone() }
+    }
 }
 
 #[derive(Args)]
@@ -203,7 +214,7 @@ fn run_cli(args: CliArgs) -> Result<(), BoxError> {
     };
     if args.tui {
         return rvllm::tui::run(rvllm::tui::TuiOptions {
-            device: args.model.device,
+            device: args.model.device_name(),
             block_size: args.model.block_size,
             num_blocks: args.model.num_blocks,
             max_tokens: args.max_tokens.unwrap_or(256),
@@ -230,7 +241,7 @@ fn run_cli(args: CliArgs) -> Result<(), BoxError> {
         (true, None) => return Err("this model's chat format is unknown; drop --chat".into()),
     };
     let stops = chat::stop_tokens(&tokenizer, format);
-    let runtime = Runtime::new(&model, &args.model.device)?;
+    let runtime = Runtime::new(&model, &args.model.device_name())?;
     if args.prompt.is_empty() {
         interactive(&args, &runtime, &tokenizer, chat, &stops, sampling)
     } else {
@@ -461,7 +472,7 @@ fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
         &model_file,
         &tokenizer_path(&args.model, &model_file),
         server::ServeOptions {
-            device: args.model.device,
+            device: args.model.device_name(),
             addr: format!("{}:{}", args.host, args.port),
             model_name: args.model_name,
             block_size: args.model.block_size,

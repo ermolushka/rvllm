@@ -93,7 +93,7 @@ fn device_thread(
 }
 
 impl Generator {
-    // `device` is "cpu" or "cuda" (the latter needs the `cuda` feature).
+    // `device` is "cpu", "cuda" or "metal" (the latter two need their feature).
     pub fn load(model_path: &str, tokenizer_path: &str, device: &str) -> Result<Self, BoxError> {
         let (tasks_tx, tasks_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();

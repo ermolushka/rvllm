@@ -42,9 +42,13 @@ struct Args {
     // under more varied load than the fixed-length sweep.
     #[arg(long)]
     trace_file: Option<String>,
-    // "cpu" (default) or "cuda" - requires building with --features cuda.
+    // "cpu" (default), "cuda" or "metal" - the latter two need building with
+    // --features cuda / --features metal.
     #[arg(long, default_value = "cpu")]
     device: String,
+    // Shorthand for `--device metal` (Apple GPU).
+    #[arg(long, conflicts_with = "device")]
+    metal: bool,
 }
 
 struct TraceEntry {
@@ -231,12 +235,13 @@ fn run_and_report(
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
+    let device = if args.metal { "metal" } else { args.device.as_str() };
     let model = Model::load(&args.model)?;
-    let runtime = Runtime::new(&model, &args.device)?;
-    let suffix = if args.device == "cpu" {
+    let runtime = Runtime::new(&model, device)?;
+    let suffix = if device == "cpu" {
         String::new()
     } else {
-        format!(" ({})", args.device)
+        format!(" ({device})")
     };
 
     let mut rng = StdRng::seed_from_u64(args.seed);
