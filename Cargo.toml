@@ -1,6 +1,6 @@
 [package]
 name = "rvllm"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 default-run = "rvllm"
 description = "Small LLM inference engine in Rust: paged KV cache, continuous batching, CPU, CUDA and Metal backends, GGUF loading"
