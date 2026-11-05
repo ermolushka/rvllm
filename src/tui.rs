@@ -14,7 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -447,6 +450,11 @@ struct App {
     input: String,
     // Lines scrolled up from the bottom; 0 follows the stream.
     scroll_up: u16,
+    // Visible transcript rows, as of the last draw (for page-sized scrolling).
+    view_height: u16,
+    // Whether the terminal reports mouse events to us (wheel scrolling) instead
+    // of handling the mouse itself (text selection). Off by default: see `set_mouse`.
+    mouse: bool,
 
     picker: Option<Picker>,
     quit: bool,
@@ -508,6 +516,48 @@ fn apply_text(settings: &mut Settings, field: usize, text: &str) {
         }
         _ => {}
     }
+}
+
+// Puts `text` on the clipboard: pbcopy when it exists (macOS), otherwise an
+// OSC 52 sequence, which many terminals (iTerm2, kitty, WezTerm, tmux with
+// set-clipboard) turn into a clipboard write, including over ssh.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().is_ok_and(|status| status.success()) {
+            return;
+        }
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let _ = out.flush();
+}
+
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+// `current` lines scrolled up, moved by `delta` (positive = further up), kept in range.
+fn scrolled(current: u16, delta: i32) -> u16 {
+    (current as i32 + delta).clamp(0, u16::MAX as i32) as u16
 }
 
 // Nudges one settings field (`coarse` for PgUp/PgDn-sized steps); returns true
@@ -697,6 +747,8 @@ impl App {
                 }
             }
             KeyCode::Char('d') if ctrl => self.switch_device(),
+            KeyCode::Char('t') if ctrl => self.set_mouse(!self.mouse),
+            KeyCode::Char('y') if ctrl => self.copy_last_response(),
             KeyCode::Char('n') if ctrl && self.status == Status::Idle => {
                 let _ = self.cmd_tx.send(Cmd::NewChat);
                 self.outbox.clear();
@@ -709,13 +761,76 @@ impl App {
                     self.cancel.store(true, Ordering::Relaxed);
                 }
             }
-            KeyCode::PageUp => self.scroll_up = self.scroll_up.saturating_add(8),
-            KeyCode::PageDown => self.scroll_up = self.scroll_up.saturating_sub(8),
+            KeyCode::Up => self.scroll_by(1),
+            KeyCode::Down => self.scroll_by(-1),
+            KeyCode::PageUp => self.scroll_by(self.page()),
+            KeyCode::PageDown => self.scroll_by(-self.page()),
+            // draw clamps to the real maximum.
+            KeyCode::Home => self.scroll_up = u16::MAX,
+            KeyCode::End => self.scroll_up = 0,
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => {
                 self.input.pop();
             }
             KeyCode::Char(c) if !ctrl => self.input.push(c),
+            _ => {}
+        }
+    }
+
+    // Mouse capture gives wheel scrolling in terminals that do not turn the wheel
+    // into arrow keys on the alternate screen, but it takes text selection away
+    // from the terminal (Shift or Option may bring it back, depending on the
+    // terminal). So it is off by default, and Ctrl-T switches it.
+    fn set_mouse(&mut self, on: bool) {
+        let result = if on {
+            ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+        } else {
+            ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+        };
+        let note = match (result, on) {
+            (Err(e), _) => format!("could not change mouse mode: {e}"),
+            (Ok(()), true) => {
+                self.mouse = true;
+                "mouse on: wheel scrolls, text selection needs Shift/Option held (Ctrl-T to undo)".into()
+            }
+            (Ok(()), false) => {
+                self.mouse = false;
+                "mouse off: select text normally, scroll with arrows/PgUp/PgDn (Ctrl-T for wheel)".into()
+            }
+        };
+        push_notice(&mut self.transcript, self.answering, note);
+    }
+
+    // Copies the newest model reply to the system clipboard.
+    fn copy_last_response(&mut self) {
+        let note = match self.transcript.iter().rev().find(|(role, _)| *role == Role::Assistant) {
+            None => "nothing to copy yet".to_string(),
+            Some((_, text)) => {
+                copy_to_clipboard(text);
+                format!("copied last response ({} chars)", text.chars().count())
+            }
+        };
+        push_notice(&mut self.transcript, self.answering, note);
+    }
+
+    // Scrolls the transcript up (positive) or down (negative) by `lines`.
+    fn scroll_by(&mut self, lines: i32) {
+        self.scroll_up = scrolled(self.scroll_up, lines);
+    }
+
+    // A page: the visible height minus a line of overlap, at least one line.
+    fn page(&self) -> i32 {
+        (self.view_height as i32 - 1).max(1)
+    }
+
+    fn handle_mouse(&mut self, kind: MouseEventKind) {
+        // The picker has its own lists; the wheel only scrolls the chat.
+        if self.picker.is_some() {
+            return;
+        }
+        match kind {
+            MouseEventKind::ScrollUp => self.scroll_by(3),
+            MouseEventKind::ScrollDown => self.scroll_by(-3),
             _ => {}
         }
     }
@@ -902,13 +1017,19 @@ impl App {
             ));
         }
 
-        let block = Block::default().borders(Borders::ALL).title(" rvllm ");
         let inner_width = area.width.saturating_sub(2);
         let inner_height = area.height.saturating_sub(2);
+        self.view_height = inner_height;
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let total = paragraph.line_count(inner_width) as u16;
+        let total = paragraph.line_count(inner_width).min(u16::MAX as usize) as u16;
         let max_scroll = total.saturating_sub(inner_height);
         self.scroll_up = self.scroll_up.min(max_scroll);
+        let title = if self.scroll_up > 0 {
+            " rvllm (scrolled up - End to follow) "
+        } else {
+            " rvllm "
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
         frame.render_widget(
             paragraph
                 .block(block)
@@ -992,7 +1113,7 @@ impl App {
             spans.push(Span::raw(format!("| {speed} ")));
         }
         spans.push(Span::styled(
-            "| Enter send  Esc stop  Ctrl-O models  Ctrl-S settings  Ctrl-D device  Ctrl-N new chat  PgUp/PgDn scroll  Ctrl-C quit",
+            "| Enter send  Esc stop  ^O models  ^S settings  ^D device  ^N new  ^Y copy reply  ^T mouse  arrows/PgUp/PgDn/Home/End scroll  ^C quit",
             Style::new().fg(Color::DarkGray),
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1123,6 +1244,8 @@ pub fn run(opts: TuiOptions) -> Result<(), BoxError> {
         transcript: Vec::new(),
         input: String::new(),
         scroll_up: 0,
+        view_height: 0,
+        mouse: false,
         picker: None,
         quit: false,
         outbox: Outbox::default(),
@@ -1149,7 +1272,16 @@ pub fn run(opts: TuiOptions) -> Result<(), BoxError> {
     });
 
     let mut terminal = ratatui::init();
+    // Mouse capture starts off so the terminal's own text selection works (see
+    // `App::set_mouse`). `init` installs a panic hook that restores the screen;
+    // extend it to release the mouse too, in case Ctrl-T turned it on.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        previous_hook(info);
+    }));
     let result = event_loop(&mut terminal, &mut app);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
     // Hanging up the command channel ends the worker; the cancel flag cuts
@@ -1165,10 +1297,12 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), BoxEr
         app.drain_events();
         terminal.draw(|f| app.draw(f))?;
         if event::poll(Duration::from_millis(50))? {
-            if let TermEvent::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key.code, key.modifiers);
                 }
+                TermEvent::Mouse(mouse) => app.handle_mouse(mouse.kind),
+                _ => {}
             }
         }
     }
@@ -1178,6 +1312,24 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<(), BoxEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn scrolling_stays_within_range() {
+        assert_eq!(scrolled(0, 3), 3);
+        assert_eq!(scrolled(3, -1), 2);
+        assert_eq!(scrolled(2, -3), 0, "cannot scroll below the newest line");
+        assert_eq!(scrolled(u16::MAX - 1, 8), u16::MAX, "saturates instead of wrapping");
+        assert_eq!(scrolled(u16::MAX, -1), u16::MAX - 1);
+    }
 
     #[test]
     fn outbox_hands_out_one_message_at_a_time() {
