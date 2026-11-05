@@ -3,7 +3,7 @@
 // (the matmuls and attention GEMMs that cuBLAS provided are kernels here).
 use metal::MTLSize;
 
-use super::context::{Arg, MetalBuf, MetalRuntime, Result};
+use super::context::{Arg, MetalBuf, MetalRuntime, Result, ATTN_DECODE_KERNELS};
 
 fn size(x: usize, y: usize, z: usize) -> MTLSize {
     MTLSize::new(x as u64, y as u64, z as u64)
@@ -11,66 +11,6 @@ fn size(x: usize, y: usize, z: usize) -> MTLSize {
 
 fn check(cond: bool, msg: &str) -> Result<()> {
     if cond { Ok(()) } else { Err(msg.to_string().into()) }
-}
-
-pub fn silu_wrapper(rt: &MetalRuntime, input: &MetalBuf<f32>, output: &mut MetalBuf<f32>) -> Result<()> {
-    let n = input.len();
-    check(output.len() == n, "Silu: input and output have different lengths")?;
-    check(n > 0, "Silu: input len is 0")?;
-    rt.dispatch_1d("silu", &[input.arg(), output.arg(), Arg::U32(n as u32)], n)
-}
-
-pub fn silu_gate_multiply_wrapper(
-    rt: &MetalRuntime,
-    gate: &MetalBuf<f32>,
-    up: &MetalBuf<f32>,
-    output: &mut MetalBuf<f32>,
-) -> Result<()> {
-    let n = gate.len();
-    check(
-        output.len() == n && up.len() == n,
-        "silu_gate_multiply: input and output have different lengths",
-    )?;
-    check(n > 0, "silu_gate_multiply: input len is 0")?;
-    rt.dispatch_1d(
-        "silu_gate_multiply",
-        &[gate.arg(), up.arg(), output.arg(), Arg::U32(n as u32)],
-        n,
-    )
-}
-
-pub fn gelu_gate_multiply_wrapper(
-    rt: &MetalRuntime,
-    gate: &MetalBuf<f32>,
-    up: &MetalBuf<f32>,
-    output: &mut MetalBuf<f32>,
-) -> Result<()> {
-    let n = gate.len();
-    check(
-        output.len() == n && up.len() == n,
-        "gelu_gate_multiply: input and output have different lengths",
-    )?;
-    check(n > 0, "gelu_gate_multiply: input len is 0")?;
-    rt.dispatch_1d(
-        "gelu_gate_multiply",
-        &[gate.arg(), up.arg(), output.arg(), Arg::U32(n as u32)],
-        n,
-    )
-}
-
-// Adds `bias` ([n_cols]) to every row of `x` ([rows, n_cols]), in place.
-pub fn add_bias_wrapper(rt: &MetalRuntime, x: &mut MetalBuf<f32>, bias: &MetalBuf<f32>) -> Result<()> {
-    let n = x.len();
-    let n_cols = bias.len();
-    check(
-        n > 0 && n_cols > 0 && n % n_cols == 0,
-        "add_bias: x length must be a non-zero multiple of the bias length",
-    )?;
-    rt.dispatch_1d(
-        "add_bias",
-        &[x.arg(), bias.arg(), Arg::U32(n_cols as u32), Arg::U32(n as u32)],
-        n,
-    )
 }
 
 pub fn scale_inplace_wrapper(rt: &MetalRuntime, x: &mut MetalBuf<f32>, scale: f32) -> Result<()> {
@@ -182,206 +122,61 @@ pub fn rmsnorm_wrapper(
     )
 }
 
-// x, out: [n_rows, head_dim]. cos, sin: [n_rows, head_dim / 2], one row per x row.
-pub fn rope_wrapper(
+// sum_out = a + b and norm_out = rmsnorm(sum_out) * weight, one dispatch.
+pub fn add_rmsnorm_wrapper(
     rt: &MetalRuntime,
-    x: &MetalBuf<f32>,
-    cos: &MetalBuf<f32>,
-    sin: &MetalBuf<f32>,
-    output: &mut MetalBuf<f32>,
-    head_dim: u32,
+    a: &MetalBuf<f32>,
+    b: &MetalBuf<f32>,
+    weight: &MetalBuf<f32>,
+    hidden_dim: u32,
+    eps: f32,
+    sum_out: &mut MetalBuf<f32>,
+    norm_out: &mut MetalBuf<f32>,
 ) -> Result<()> {
-    check(output.len() == x.len(), "RoPE: input and output have different lengths")?;
+    let n = a.len();
     check(
-        head_dim > 0 && head_dim % 2 == 0,
-        "RoPE: head_dim must be a positive even number",
-    )?;
-    let n = x.len();
-    check(
-        n > 0 && n % head_dim as usize == 0,
-        "RoPE: input length is not a multiple of head_dim",
-    )?;
-    let half = head_dim / 2;
-    let n_pairs = n / head_dim as usize * half as usize;
-    check(
-        cos.len() == n_pairs && sin.len() == n_pairs,
-        "RoPE: cos/sin length must equal n_rows * (head_dim / 2)",
-    )?;
-    rt.dispatch_1d(
-        "rope",
-        &[
-            x.arg(),
-            cos.arg(),
-            sin.arg(),
-            output.arg(),
-            Arg::U32(head_dim),
-            Arg::U32(half),
-            Arg::U32(n_pairs as u32),
-        ],
-        n_pairs,
-    )
-}
-
-// k, v: [n_tokens, n_kv_heads, head_dim]; block_ids/offsets: one per token.
-// out_k/out_v: [num_blocks, block_size, n_kv_heads, head_dim], mutated in place.
-#[allow(clippy::too_many_arguments)]
-pub fn kv_write_wrapper(
-    rt: &MetalRuntime,
-    k: &MetalBuf<f32>,
-    v: &MetalBuf<f32>,
-    block_ids: &MetalBuf<u32>,
-    offsets: &MetalBuf<u32>,
-    out_k: &mut MetalBuf<f32>,
-    out_v: &mut MetalBuf<f32>,
-    n_kv_heads: u32,
-    head_dim: u32,
-    block_size: u32,
-) -> Result<()> {
-    check(k.len() == v.len(), "kv_write: k and v have different lengths")?;
-    let n = k.len();
-    check(n > 0, "kv_write: k/v len is 0")?;
-    check(
-        n_kv_heads > 0 && head_dim > 0 && block_size > 0,
-        "kv_write: n_kv_heads/head_dim/block_size must be positive",
-    )?;
-    let per_token = (n_kv_heads * head_dim) as usize;
-    check(
-        n % per_token == 0,
-        "kv_write: k/v length is not a multiple of n_kv_heads * head_dim",
-    )?;
-    let n_tokens = n / per_token;
-    check(
-        block_ids.len() == n_tokens && offsets.len() == n_tokens,
-        "kv_write: block_ids/offsets length must equal n_tokens",
-    )?;
-    check(out_k.len() == out_v.len(), "kv_write: out_k and out_v have different lengths")?;
-    check(
-        out_k.len() % (block_size as usize * per_token) == 0,
-        "kv_write: out_k/out_v length is not a multiple of block_size * n_kv_heads * head_dim",
-    )?;
-    rt.dispatch_1d(
-        "kv_write",
-        &[
-            k.arg(),
-            v.arg(),
-            block_ids.arg(),
-            offsets.arg(),
-            out_k.arg(),
-            out_v.arg(),
-            Arg::U32(n_kv_heads),
-            Arg::U32(head_dim),
-            Arg::U32(block_size),
-            Arg::U32(n as u32),
-        ],
-        n,
-    )
-}
-
-// cache: one layer's K (or V) storage; block_idx: [batch * max_blocks];
-// output: [batch, n_kv_heads, ctx_len, head_dim].
-#[allow(clippy::too_many_arguments)]
-pub fn kv_gather_wrapper(
-    rt: &MetalRuntime,
-    cache: &MetalBuf<f32>,
-    block_idx: &MetalBuf<u32>,
-    output: &mut MetalBuf<f32>,
-    batch: u32,
-    max_blocks: u32,
-    ctx_len: u32,
-    block_size: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-) -> Result<()> {
-    check(
-        batch > 0 && max_blocks > 0 && ctx_len > 0 && block_size > 0 && n_kv_heads > 0 && head_dim > 0,
-        "kv_gather: all dimensions must be positive",
-    )?;
-    let n = (batch * n_kv_heads * ctx_len * head_dim) as usize;
-    check(
-        output.len() == n,
-        "kv_gather: output must be [batch, n_kv_heads, ctx_len, head_dim]",
+        b.len() == n && sum_out.len() == n && norm_out.len() == n,
+        "add_rmsnorm: lengths differ",
     )?;
     check(
-        block_idx.len() == (batch * max_blocks) as usize,
-        "kv_gather: block_idx must be [batch, max_blocks]",
+        n > 0 && hidden_dim > 0 && n % hidden_dim as usize == 0,
+        "add_rmsnorm: length is not a non-zero multiple of hidden_dim",
     )?;
     check(
-        max_blocks * block_size >= ctx_len,
-        "kv_gather: block table too short for ctx_len",
-    )?;
-    rt.dispatch_1d(
-        "kv_gather",
-        &[
-            cache.arg(),
-            block_idx.arg(),
-            output.arg(),
-            Arg::U32(max_blocks),
-            Arg::U32(ctx_len),
-            Arg::U32(block_size),
-            Arg::U32(n_kv_heads),
-            Arg::U32(head_dim),
-            Arg::U32(n as u32),
-        ],
-        n,
-    )
-}
-
-// scores: [batch, n_kv_heads, group_size, q_len, ctx_len], in place; mask:
-// [batch, q_len, ctx_len], broadcast over the heads.
-pub fn mask_add_broadcast_wrapper(
-    rt: &MetalRuntime,
-    scores: &mut MetalBuf<f32>,
-    mask: &MetalBuf<f32>,
-    n_kv_heads: u32,
-    group_size: u32,
-    q_len: u32,
-    ctx_len: u32,
-) -> Result<()> {
-    let n = scores.len();
-    check(n > 0, "mask_add_broadcast: scores len is 0")?;
-    let per_batch = (n_kv_heads * group_size * q_len * ctx_len) as usize;
-    check(
-        per_batch > 0 && n % per_batch == 0,
-        "mask_add_broadcast: scores length is not a multiple of the head/row/ctx product",
-    )?;
-    let batch = n / per_batch;
-    check(
-        mask.len() == batch * (q_len * ctx_len) as usize,
-        "mask_add_broadcast: mask must be [batch, q_len, ctx_len]",
-    )?;
-    rt.dispatch_1d(
-        "mask_add_broadcast",
-        &[
-            scores.arg(),
-            mask.arg(),
-            Arg::U32(n_kv_heads),
-            Arg::U32(group_size),
-            Arg::U32(q_len),
-            Arg::U32(ctx_len),
-            Arg::U32(n as u32),
-        ],
-        n,
-    )
-}
-
-// Softmax over rows of `row_len`: one 256-thread threadgroup per row.
-pub fn softmax_wrapper(
-    rt: &MetalRuntime,
-    x: &MetalBuf<f32>,
-    row_len: u32,
-    output: &mut MetalBuf<f32>,
-) -> Result<()> {
-    let n = x.len();
-    check(output.len() == n, "softmax: input and output have different lengths")?;
-    check(
-        n > 0 && row_len > 0 && n % row_len as usize == 0,
-        "softmax: input length is not a multiple of row_len",
+        weight.len() == hidden_dim as usize,
+        "add_rmsnorm: weight length must equal hidden_dim",
     )?;
     rt.dispatch_groups(
-        "softmax",
-        &[x.arg(), output.arg(), Arg::U32(row_len)],
-        size(n / row_len as usize, 1, 1),
+        "add_rmsnorm",
+        &[
+            a.arg(),
+            b.arg(),
+            weight.arg(),
+            sum_out.arg(),
+            norm_out.arg(),
+            Arg::U32(hidden_dim),
+            Arg::F32(eps),
+        ],
+        size(n / hidden_dim as usize, 1, 1),
         size(256, 1, 1),
+    )
+}
+
+// out = act(gate) * up from the stacked gate/up matmul output [rows, 2 * ffn_dim].
+pub fn glu_wrapper(
+    rt: &MetalRuntime,
+    gelu: bool,
+    gate_up: &MetalBuf<f32>,
+    ffn_dim: usize,
+    out: &mut MetalBuf<f32>,
+) -> Result<()> {
+    let n = out.len();
+    check(n > 0 && ffn_dim > 0 && n % ffn_dim == 0, "glu: out must be [rows, ffn_dim]")?;
+    check(gate_up.len() == 2 * n, "glu: gate_up must be [rows, 2 * ffn_dim]")?;
+    rt.dispatch_1d(
+        if gelu { "gelu_glu" } else { "silu_glu" },
+        &[gate_up.arg(), out.arg(), Arg::U32(ffn_dim as u32), Arg::U32(n as u32)],
+        n,
     )
 }
 
@@ -449,36 +244,6 @@ pub fn narrow_last_row_wrapper(
     rt.dispatch_1d(
         "narrow_last_row",
         &[x.arg(), out.arg(), Arg::U32(q_len), Arg::U32(hidden_dim), Arg::U32(n as u32)],
-        n,
-    )
-}
-
-// [d0, d1, d2, d3] -> [d0, d2, d1, d3].
-pub fn transpose_axes12_wrapper(
-    rt: &MetalRuntime,
-    input: &MetalBuf<f32>,
-    output: &mut MetalBuf<f32>,
-    d0: u32,
-    d1: u32,
-    d2: u32,
-    d3: u32,
-) -> Result<()> {
-    let n = input.len();
-    check(
-        n > 0 && n == (d0 * d1 * d2 * d3) as usize && output.len() == n,
-        "transpose_axes12: input/output length must equal d0*d1*d2*d3",
-    )?;
-    rt.dispatch_1d(
-        "transpose_axes12",
-        &[
-            input.arg(),
-            output.arg(),
-            Arg::U32(d0),
-            Arg::U32(d1),
-            Arg::U32(d2),
-            Arg::U32(d3),
-            Arg::U32(n as u32),
-        ],
         n,
     )
 }
@@ -585,87 +350,154 @@ pub fn linear_with(
     }
 }
 
-// scores[b] = (1/sqrt(head_dim)) * Q[b] @ K[b]^T, batched over batch*n_kv_heads
-// with the GQA group folded into the row count (see cuda/cublas_ops.rs).
-// q: [batch, n_kv_heads, group_size*q_len, head_dim], k: [batch, n_kv_heads,
-// ctx_len, head_dim], scores: [batch, n_kv_heads, group_size*q_len, ctx_len].
+// Everything between the QKV projection and attention: bias, per-head Q/K
+// norm, RoPE, Q into `q_out` and K/V into the paged cache (see the kernel).
+// qkv: [rows, (n_heads + 2 * n_kv_heads) * head_dim]; cos/sin: [rows, head_dim / 2].
 #[allow(clippy::too_many_arguments)]
-pub fn attention_scores(
+pub fn attn_prep(
     rt: &MetalRuntime,
-    q: &MetalBuf<f32>,
-    k: &MetalBuf<f32>,
-    scores: &mut MetalBuf<f32>,
-    batch: usize,
+    qkv: &MetalBuf<f32>,
+    bias: Option<&MetalBuf<f32>>,
+    q_norm: Option<&MetalBuf<f32>>,
+    k_norm: Option<&MetalBuf<f32>>,
+    cos: &MetalBuf<f32>,
+    sin: &MetalBuf<f32>,
+    block_ids: &MetalBuf<u32>,
+    offsets: &MetalBuf<u32>,
+    cache_k: &MetalBuf<f32>,
+    cache_v: &MetalBuf<f32>,
+    q_out: &mut MetalBuf<f32>,
+    n_heads: usize,
     n_kv_heads: usize,
-    group_size: usize,
-    q_len: usize,
-    ctx_len: usize,
     head_dim: usize,
+    block_size: u32,
+    eps: f32,
 ) -> Result<()> {
-    let rows = group_size * q_len;
-    let batch_count = batch * n_kv_heads;
-    check(q.len() == batch_count * rows * head_dim, "attention_scores: q length mismatch")?;
-    check(k.len() == batch_count * ctx_len * head_dim, "attention_scores: k length mismatch")?;
+    check(head_dim > 0 && head_dim % 2 == 0, "attn_prep: head_dim must be a positive even number")?;
+    let qkv_dim = (n_heads + 2 * n_kv_heads) * head_dim;
+    check(qkv.len() > 0 && qkv.len() % qkv_dim == 0, "attn_prep: qkv length is not a multiple of the QKV width")?;
+    let rows = qkv.len() / qkv_dim;
+    check(q_out.len() == rows * n_heads * head_dim, "attn_prep: q_out must be [rows, n_heads * head_dim]")?;
     check(
-        scores.len() == batch_count * rows * ctx_len,
-        "attention_scores: scores length mismatch",
+        cos.len() == rows * head_dim / 2 && sin.len() == cos.len(),
+        "attn_prep: cos/sin must be [rows, head_dim / 2]",
     )?;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    rt.dispatch(
-        "attention_scores",
+    check(
+        block_ids.len() == rows && offsets.len() == rows,
+        "attn_prep: block_ids/offsets must hold one entry per row",
+    )?;
+    check(bias.is_none_or(|b| b.len() == qkv_dim), "attn_prep: bias must be [QKV width]")?;
+    check(
+        q_norm.is_none_or(|w| w.len() == head_dim) && k_norm.is_none_or(|w| w.len() == head_dim),
+        "attn_prep: Q/K norm weights must be [head_dim]",
+    )?;
+    check(cache_k.len() == cache_v.len(), "attn_prep: K and V caches differ in length")?;
+    let flags = u32::from(bias.is_some()) | u32::from(q_norm.is_some()) << 1 | u32::from(k_norm.is_some()) << 2;
+    // Unused optional buffers still need something bound.
+    rt.dispatch_groups(
+        "attn_prep",
         &[
-            q.arg(),
-            k.arg(),
-            scores.arg(),
-            Arg::U32(rows as u32),
-            Arg::U32(ctx_len as u32),
+            qkv.arg(),
+            bias.unwrap_or(qkv).arg(),
+            q_norm.unwrap_or(qkv).arg(),
+            k_norm.unwrap_or(qkv).arg(),
+            cos.arg(),
+            sin.arg(),
+            block_ids.arg(),
+            offsets.arg(),
+            cache_k.arg(),
+            cache_v.arg(),
+            q_out.arg(),
+            Arg::U32(n_heads as u32),
+            Arg::U32(n_kv_heads as u32),
             Arg::U32(head_dim as u32),
-            Arg::F32(scale),
+            Arg::U32(block_size),
+            Arg::U32(flags),
+            Arg::F32(eps),
         ],
-        size(ctx_len, rows, batch_count),
+        size(n_heads + 2 * n_kv_heads, rows, 1),
         size(32, 1, 1),
     )
 }
 
-// attn_out[b] = probs[b] @ V[b]. probs: [batch, n_kv_heads, group_size*q_len,
-// ctx_len], v: [batch, n_kv_heads, ctx_len, head_dim], attn_out: [batch,
-// n_kv_heads, group_size*q_len, head_dim].
+// Simd groups per attention threadgroup; must equal ATT_SG in attention.metal.
+const ATT_SIMDGROUPS: usize = 8;
+
+// The attention variant for a model: (name, query heads per threadgroup).
+// Prefers handling the whole GQA group in one threadgroup (K/V loaded once);
+// falls back to one head per threadgroup when no variant exists for the group.
+fn attn_decode_variant(group: usize, head_dim: usize) -> Result<(&'static str, usize)> {
+    let dpl = head_dim.div_ceil(32);
+    let width = [2usize, 4, 8]
+        .into_iter()
+        .find(|&w| dpl <= w)
+        .ok_or("attn_decode: head_dim must be at most 256")?;
+    let find = |g: usize| ATTN_DECODE_KERNELS.iter().find(|&&(vg, vd, _)| vg == g && vd == width);
+    let &(g, _, name) = find(group)
+        .or_else(|| find(1))
+        .ok_or("attn_decode: no kernel variant for this head layout")?;
+    Ok((name, g))
+}
+
+// Attention over the paged cache, output in the layout the O projection reads.
+// q, out: [batch * q_len, n_heads * head_dim]; mask: [batch, q_len, ctx_len];
+// block_idx: [batch, max_blocks].
 #[allow(clippy::too_many_arguments)]
-pub fn attention_apply(
+pub fn attn_decode(
     rt: &MetalRuntime,
-    probs: &MetalBuf<f32>,
-    v: &MetalBuf<f32>,
-    attn_out: &mut MetalBuf<f32>,
+    q: &MetalBuf<f32>,
+    cache_k: &MetalBuf<f32>,
+    cache_v: &MetalBuf<f32>,
+    block_idx: &MetalBuf<u32>,
+    mask: &MetalBuf<f32>,
+    out: &mut MetalBuf<f32>,
     batch: usize,
-    n_kv_heads: usize,
-    group_size: usize,
     q_len: usize,
-    ctx_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
     head_dim: usize,
+    block_size: u32,
+    max_blocks: u32,
+    ctx_len: usize,
 ) -> Result<()> {
-    let rows = group_size * q_len;
-    let batch_count = batch * n_kv_heads;
     check(
-        probs.len() == batch_count * rows * ctx_len,
-        "attention_apply: probs length mismatch",
+        head_dim > 0 && head_dim <= 256,
+        "attn_decode: head_dim must be in 1..=256",
     )?;
-    check(v.len() == batch_count * ctx_len * head_dim, "attention_apply: v length mismatch")?;
     check(
-        attn_out.len() == batch_count * rows * head_dim,
-        "attention_apply: attn_out length mismatch",
+        n_kv_heads > 0 && n_heads % n_kv_heads == 0,
+        "attn_decode: n_heads must be a multiple of n_kv_heads",
     )?;
-    rt.dispatch(
-        "attention_apply",
+    let rows = batch * q_len;
+    check(q.len() == rows * n_heads * head_dim, "attn_decode: q length mismatch")?;
+    check(out.len() == q.len(), "attn_decode: out length mismatch")?;
+    check(mask.len() == rows * ctx_len, "attn_decode: mask must be [batch, q_len, ctx_len]")?;
+    check(
+        block_idx.len() == batch * max_blocks as usize && max_blocks as usize * block_size as usize >= ctx_len,
+        "attn_decode: block table does not cover ctx_len",
+    )?;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let (kernel, heads_per_group) = attn_decode_variant(n_heads / n_kv_heads, head_dim)?;
+    rt.dispatch_groups(
+        kernel,
         &[
-            probs.arg(),
-            v.arg(),
-            attn_out.arg(),
-            Arg::U32(rows as u32),
-            Arg::U32(ctx_len as u32),
+            q.arg(),
+            cache_k.arg(),
+            cache_v.arg(),
+            block_idx.arg(),
+            mask.arg(),
+            out.arg(),
+            Arg::U32(n_heads as u32),
+            Arg::U32(n_kv_heads as u32),
             Arg::U32(head_dim as u32),
+            Arg::U32(block_size),
+            Arg::U32(max_blocks),
+            Arg::U32(ctx_len as u32),
+            Arg::U32(q_len as u32),
+            Arg::F32(scale),
         ],
-        size(head_dim, rows, batch_count),
-        size(head_dim.min(64), 1, 1),
+        size(n_heads / heads_per_group, q_len, batch),
+        size(ATT_SIMDGROUPS * 32, 1, 1),
     )
 }
 
@@ -773,32 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn softmax_handles_masked_rows_and_long_rows() {
-        let Some(rt) = runtime() else { return };
-        // A row with -inf entries (the attention mask), and rows longer than
-        // the 256-thread threadgroup.
-        for &len in &[5usize, 200, 1000] {
-            let mut x = values(2 * len, 5);
-            for v in x[len / 2..len].iter_mut() {
-                *v = f32::NEG_INFINITY;
-            }
-            let xb = MetalBuf::from_slice(&rt, &x);
-            let mut out = MetalBuf::<f32>::zeros(&rt, 2 * len);
-            softmax_wrapper(&rt, &xb, len as u32, &mut out).unwrap();
-            let got = rt.read(&out).unwrap();
-            for r in 0..2 {
-                let row = &x[r * len..(r + 1) * len];
-                let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f64 = row.iter().map(|v| ((v - max) as f64).exp()).sum();
-                for i in 0..len {
-                    let want = ((row[i] - max) as f64).exp() / sum;
-                    assert!((got[r * len + i] as f64 - want).abs() < 1e-6, "len={len} r={r} i={i}");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn argmax_matches_sampler_tie_and_nan_rules() {
         let Some(rt) = runtime() else { return };
         let len = 1000;
@@ -819,51 +625,6 @@ mod tests {
         let mut ids = MetalBuf::<u32>::zeros(&rt, 1);
         argmax_wrapper(&rt, &xb, 64, &mut ids).unwrap();
         assert_eq!(rt.read(&ids).unwrap(), vec![0]);
-    }
-
-    // Attention scores + apply against a direct CPU computation, with a GQA
-    // group (2 query rows per KV head) and a head_dim that is not a multiple of 4.
-    #[test]
-    fn attention_kernels_match_reference() {
-        let Some(rt) = runtime() else { return };
-        for &head_dim in &[6usize, 64] {
-            let (batch, n_kv, group, q_len, ctx) = (2usize, 2usize, 2usize, 3usize, 9usize);
-            let rows = group * q_len;
-            let bk = batch * n_kv;
-            let q = values(bk * rows * head_dim, 7);
-            let k = values(bk * ctx * head_dim, 8);
-            let v = values(bk * ctx * head_dim, 9);
-            let (qb, kb, vb) = (
-                MetalBuf::from_slice(&rt, &q),
-                MetalBuf::from_slice(&rt, &k),
-                MetalBuf::from_slice(&rt, &v),
-            );
-            let mut scores = MetalBuf::<f32>::zeros(&rt, bk * rows * ctx);
-            attention_scores(&rt, &qb, &kb, &mut scores, batch, n_kv, group, q_len, ctx, head_dim).unwrap();
-            let mut out = MetalBuf::<f32>::zeros(&rt, bk * rows * head_dim);
-            // Feed the raw scores through apply as if they were probabilities.
-            attention_apply(&rt, &scores, &vb, &mut out, batch, n_kv, group, q_len, ctx, head_dim).unwrap();
-            let (got_s, got_o) = (rt.read(&scores).unwrap(), rt.read(&out).unwrap());
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            for b in 0..bk {
-                for r in 0..rows {
-                    let mut want_s = vec![0f32; ctx];
-                    for c in 0..ctx {
-                        let dot: f32 = (0..head_dim)
-                            .map(|d| q[(b * rows + r) * head_dim + d] * k[(b * ctx + c) * head_dim + d])
-                            .sum();
-                        want_s[c] = dot * scale;
-                        let g = got_s[(b * rows + r) * ctx + c];
-                        assert!((g - want_s[c]).abs() < 1e-4, "scores b={b} r={r} c={c}");
-                    }
-                    for d in 0..head_dim {
-                        let want: f32 = (0..ctx).map(|c| want_s[c] * v[(b * ctx + c) * head_dim + d]).sum();
-                        let g = got_o[(b * rows + r) * head_dim + d];
-                        assert!((g - want).abs() < 1e-3, "apply b={b} r={r} d={d}: {g} vs {want}");
-                    }
-                }
-            }
-        }
     }
 
     // Not a correctness test: `cargo test --release --features metal --lib
@@ -901,6 +662,244 @@ mod tests {
                     let gbs = (in_f * out_f * 2) as f64 / us / 1e3;
                     let gflops = 2.0 * (rows * in_f * out_f) as f64 / us / 1e3;
                     println!("{name:<22} {rows:>5} {:>7} {us:>9.1} {gbs:>9.1} {gflops:>9.1}", format!("{kernel:?}"));
+                }
+            }
+        }
+    }
+
+    // Fused attention against a direct CPU computation over a shuffled block
+    // table: every GQA group size the kernel specializes (3, 4, 2) plus ones it
+    // does not (5, 9: per-head fallback), head widths in each register tier,
+    // contexts shorter and longer than one 32-key chunk, ragged sequence
+    // lengths (masked tails) and multi-token queries (causal mask).
+    #[test]
+    fn attn_decode_matches_reference() {
+        let Some(rt) = runtime() else { return };
+        // (n_kv_heads, group, head_dim, batch, q_len, ctx_len)
+        let cases = [
+            (2usize, 3usize, 64usize, 2usize, 1usize, 100usize),
+            (2, 5, 64, 2, 1, 40),
+            (1, 9, 32, 1, 2, 33),
+            (2, 2, 6, 3, 2, 17),
+            (1, 4, 128, 2, 3, 70),
+            (2, 2, 200, 1, 1, 300),
+        ];
+        let block_size = 16usize;
+        for (case, &(n_kv, group, hd, batch, q_len, ctx)) in cases.iter().enumerate() {
+            let n_heads = n_kv * group;
+            let rows = batch * q_len;
+            let max_blocks = ctx.div_ceil(block_size);
+            let num_blocks = batch * max_blocks;
+            // Sequences own blocks in reverse order, so addressing is never the identity.
+            let mut block_idx = Vec::new();
+            for b in 0..batch {
+                for i in 0..max_blocks {
+                    block_idx.push((num_blocks - 1 - (b * max_blocks + i)) as u32);
+                }
+            }
+            let mut sorted = block_idx.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), num_blocks, "test block table must be a permutation");
+            let q = values(rows * n_heads * hd, 10 + case as u32);
+            let cache_k = values(num_blocks * block_size * n_kv * hd, 20 + case as u32);
+            let cache_v = values(num_blocks * block_size * n_kv * hd, 30 + case as u32);
+            // Sequence b has ctx - 2b real tokens; its last q_len are the queries.
+            let mut mask = vec![0f32; rows * ctx];
+            for b in 0..batch {
+                let valid = ctx - 2 * b;
+                for qi in 0..q_len {
+                    for j in 0..ctx {
+                        if j >= valid || j + q_len > valid + qi {
+                            mask[(b * q_len + qi) * ctx + j] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+            }
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mut want = vec![0f32; rows * n_heads * hd];
+            for b in 0..batch {
+                for qi in 0..q_len {
+                    let row = b * q_len + qi;
+                    for h in 0..n_heads {
+                        let kvh = h / group;
+                        let at = |c: usize| {
+                            let blk = block_idx[b * max_blocks + c / block_size] as usize;
+                            ((blk * block_size + c % block_size) * n_kv + kvh) * hd
+                        };
+                        let qh = &q[(row * n_heads + h) * hd..(row * n_heads + h + 1) * hd];
+                        let scores: Vec<f64> = (0..ctx)
+                            .map(|c| {
+                                let dot: f64 = (0..hd).map(|d| qh[d] as f64 * cache_k[at(c) + d] as f64).sum();
+                                dot * scale as f64 + mask[row * ctx + c] as f64
+                            })
+                            .collect();
+                        let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                        let total: f64 = exps.iter().sum();
+                        for d in 0..hd {
+                            let o: f64 = (0..ctx).map(|c| exps[c] * cache_v[at(c) + d] as f64).sum();
+                            want[(row * n_heads + h) * hd + d] = (o / total) as f32;
+                        }
+                    }
+                }
+            }
+            let (qb, kb, vb, bb, mb) = (
+                MetalBuf::from_slice(&rt, &q),
+                MetalBuf::from_slice(&rt, &cache_k),
+                MetalBuf::from_slice(&rt, &cache_v),
+                MetalBuf::from_slice(&rt, &block_idx),
+                MetalBuf::from_slice(&rt, &mask),
+            );
+            let mut out = MetalBuf::<f32>::zeros(&rt, rows * n_heads * hd);
+            attn_decode(
+                &rt, &qb, &kb, &vb, &bb, &mb, &mut out, batch, q_len, n_heads, n_kv, hd,
+                block_size as u32, max_blocks as u32, ctx,
+            )
+            .unwrap();
+            let got = rt.read(&out).unwrap();
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).abs() < 1e-4, "case {case} i={i}: got {g}, want {w}");
+            }
+        }
+    }
+
+    // The projection epilogue: bias, per-head norm, RoPE, and the scatter into
+    // the paged cache, against a direct computation. Head widths past one
+    // 32-lane pass, with and without bias / Q norm / K norm.
+    #[test]
+    fn attn_prep_matches_reference() {
+        let Some(rt) = runtime() else { return };
+        let block_size = 4usize;
+        for &(hd, bias_on, qn_on, kn_on) in &[
+            (64usize, true, true, true),
+            (128, false, false, false),
+            (6, true, false, true),
+            (2, false, true, false),
+        ] {
+            let (n_heads, n_kv, rows) = (6usize, 2usize, 5usize);
+            let half = hd / 2;
+            let qkv_dim = (n_heads + 2 * n_kv) * hd;
+            let qkv = values(rows * qkv_dim, 40);
+            let bias = values(qkv_dim, 41);
+            let q_norm = values(hd, 42);
+            let k_norm = values(hd, 43);
+            let cos = values(rows * half, 44);
+            let sin = values(rows * half, 45);
+            // Token r goes to (block r % 3 + 1, offset r % block_size).
+            let block_ids: Vec<u32> = (0..rows as u32).map(|r| r % 3 + 1).collect();
+            let offsets: Vec<u32> = (0..rows as u32).map(|r| r % block_size as u32).collect();
+            let cache_len = 4 * block_size * n_kv * hd;
+            let eps = 1e-5f32;
+
+            let head = |row: usize, slot: usize| -> Vec<f32> {
+                let base = row * qkv_dim + slot * hd;
+                (0..hd).map(|d| qkv[base + d] + if bias_on { bias[slot * hd + d] } else { 0.0 }).collect()
+            };
+            let rotate = |row: usize, x: Vec<f32>, norm: Option<&Vec<f32>>| -> Vec<f32> {
+                let x: Vec<f32> = match norm {
+                    Some(w) => {
+                        let ms = x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / hd as f64;
+                        let rms = (ms + eps as f64).sqrt() as f32;
+                        x.iter().zip(w).map(|(v, w)| v / rms * w).collect()
+                    }
+                    None => x,
+                };
+                let mut out = vec![0f32; hd];
+                for j in 0..half {
+                    let (c, s) = (cos[row * half + j], sin[row * half + j]);
+                    out[j] = x[j] * c - x[half + j] * s;
+                    out[half + j] = x[j] * s + x[half + j] * c;
+                }
+                out
+            };
+            let mut want_q = vec![0f32; rows * n_heads * hd];
+            let mut want_k = vec![0f32; cache_len];
+            let mut want_v = vec![0f32; cache_len];
+            for row in 0..rows {
+                for h in 0..n_heads {
+                    let r = rotate(row, head(row, h), qn_on.then_some(&q_norm));
+                    want_q[(row * n_heads + h) * hd..(row * n_heads + h + 1) * hd].copy_from_slice(&r);
+                }
+                for kvh in 0..n_kv {
+                    let dest = (((block_ids[row] as usize * block_size + offsets[row] as usize) * n_kv) + kvh) * hd;
+                    let r = rotate(row, head(row, n_heads + kvh), kn_on.then_some(&k_norm));
+                    want_k[dest..dest + hd].copy_from_slice(&r);
+                    want_v[dest..dest + hd].copy_from_slice(&head(row, n_heads + n_kv + kvh));
+                }
+            }
+
+            let (qkv_b, bias_b, qn_b, kn_b, cos_b, sin_b, ids_b, off_b) = (
+                MetalBuf::from_slice(&rt, &qkv),
+                MetalBuf::from_slice(&rt, &bias),
+                MetalBuf::from_slice(&rt, &q_norm),
+                MetalBuf::from_slice(&rt, &k_norm),
+                MetalBuf::from_slice(&rt, &cos),
+                MetalBuf::from_slice(&rt, &sin),
+                MetalBuf::from_slice(&rt, &block_ids),
+                MetalBuf::from_slice(&rt, &offsets),
+            );
+            let (ck, cv) = (MetalBuf::<f32>::zeros(&rt, cache_len), MetalBuf::<f32>::zeros(&rt, cache_len));
+            let mut q_out = MetalBuf::<f32>::zeros(&rt, rows * n_heads * hd);
+            attn_prep(
+                &rt, &qkv_b, bias_on.then_some(&bias_b), qn_on.then_some(&qn_b), kn_on.then_some(&kn_b),
+                &cos_b, &sin_b, &ids_b, &off_b, &ck, &cv, &mut q_out, n_heads, n_kv, hd, block_size as u32, eps,
+            )
+            .unwrap();
+            for (name, got, want) in [
+                ("q", rt.read(&q_out).unwrap(), want_q),
+                ("k cache", rt.read(&ck).unwrap(), want_k),
+                ("v cache", rt.read(&cv).unwrap(), want_v),
+            ] {
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!((g - w).abs() < 1e-5, "hd={hd} {name} i={i}: got {g}, want {w}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn add_rmsnorm_and_glu_match_reference() {
+        let Some(rt) = runtime() else { return };
+        for &(rows, dim) in &[(1usize, 960usize), (3, 64), (2, 3000), (5, 33)] {
+            let (a, b, weight) = (values(rows * dim, 50), values(rows * dim, 51), values(dim, 52));
+            let (ab, bb, wb) = (
+                MetalBuf::from_slice(&rt, &a),
+                MetalBuf::from_slice(&rt, &b),
+                MetalBuf::from_slice(&rt, &weight),
+            );
+            let mut sum = MetalBuf::<f32>::zeros(&rt, rows * dim);
+            let mut normed = MetalBuf::<f32>::zeros(&rt, rows * dim);
+            add_rmsnorm_wrapper(&rt, &ab, &bb, &wb, dim as u32, 1e-5, &mut sum, &mut normed).unwrap();
+            let (got_sum, got_norm) = (rt.read(&sum).unwrap(), rt.read(&normed).unwrap());
+            for r in 0..rows {
+                let s: Vec<f64> = (0..dim).map(|i| a[r * dim + i] as f64 + b[r * dim + i] as f64).collect();
+                let rms = (s.iter().map(|v| v * v).sum::<f64>() / dim as f64 + 1e-5).sqrt();
+                for i in 0..dim {
+                    assert!((got_sum[r * dim + i] as f64 - s[i]).abs() < 1e-6, "sum r={r} i={i}");
+                    let want = s[i] / rms * weight[i] as f64;
+                    assert!((got_norm[r * dim + i] as f64 - want).abs() < 1e-5, "norm r={r} i={i}");
+                }
+            }
+        }
+
+        let (rows, ffn) = (3usize, 37usize);
+        let gate_up = values(rows * 2 * ffn, 53);
+        let gb = MetalBuf::from_slice(&rt, &gate_up);
+        for gelu in [false, true] {
+            let mut out = MetalBuf::<f32>::zeros(&rt, rows * ffn);
+            glu_wrapper(&rt, gelu, &gb, ffn, &mut out).unwrap();
+            let got = rt.read(&out).unwrap();
+            for r in 0..rows {
+                for j in 0..ffn {
+                    let g = gate_up[r * 2 * ffn + j] as f64;
+                    let u = gate_up[r * 2 * ffn + ffn + j] as f64;
+                    let act = if gelu {
+                        0.5 * g * (1.0 + (0.7978845608028654 * (g + 0.044715 * g * g * g)).tanh())
+                    } else {
+                        g / (1.0 + (-g).exp())
+                    };
+                    assert!((got[r * ffn + j] as f64 - act * u).abs() < 1e-5, "gelu={gelu} r={r} j={j}");
                 }
             }
         }

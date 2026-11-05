@@ -11,57 +11,6 @@ kernel void add(
     if (i < n) out[i] = a[i] + b[i];
 }
 
-kernel void silu(
-    device const float *in [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint i [[thread_position_in_grid]]
-) {
-    if (i < n) {
-        float v = in[i];
-        out[i] = v * (1.0f / (1.0f + exp(-v)));
-    }
-}
-
-kernel void silu_gate_multiply(
-    device const float *gate [[buffer(0)]],
-    device const float *up [[buffer(1)]],
-    device float *out [[buffer(2)]],
-    constant uint &n [[buffer(3)]],
-    uint i [[thread_position_in_grid]]
-) {
-    if (i < n) {
-        float g = gate[i];
-        out[i] = (g * (1.0f / (1.0f + exp(-g)))) * up[i];
-    }
-}
-
-// GeGLU gate: gelu_tanh(gate) * up (Gemma's FFN; same formula as candle).
-kernel void gelu_gate_multiply(
-    device const float *gate [[buffer(0)]],
-    device const float *up [[buffer(1)]],
-    device float *out [[buffer(2)]],
-    constant uint &n [[buffer(3)]],
-    uint i [[thread_position_in_grid]]
-) {
-    if (i < n) {
-        float x = gate[i];
-        const float k = 0.7978845608028654f; // sqrt(2 / pi)
-        out[i] = 0.5f * x * (1.0f + tanh(k * (x + 0.044715f * x * x * x))) * up[i];
-    }
-}
-
-// x: [n / n_cols, n_cols], bias: [n_cols], added to every row in place.
-kernel void add_bias(
-    device float *x [[buffer(0)]],
-    device const float *bias [[buffer(1)]],
-    constant uint &n_cols [[buffer(2)]],
-    constant uint &n [[buffer(3)]],
-    uint i [[thread_position_in_grid]]
-) {
-    if (i < n) x[i] += bias[i % n_cols];
-}
-
 kernel void scale_inplace(
     device float *x [[buffer(0)]],
     constant float &scale [[buffer(1)]],
@@ -156,5 +105,37 @@ kernel void short_conv_filter_gate(
         }
         uint row = b * q_len + t;
         out[i] = proj[(ulong)row * 3 * hidden + hidden + c] * acc;
+    }
+}
+
+// Gated FFN activation over the stacked gate/up matmul output: gate_up is
+// [rows, 2 * ffn_dim] with the gate in the first half of each row and the up
+// projection in the second; out is [rows, ffn_dim]. n = rows * ffn_dim.
+kernel void silu_glu(
+    device const float *gate_up [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant uint &ffn_dim [[buffer(2)]],
+    constant uint &n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        ulong src = (ulong)(i / ffn_dim) * 2 * ffn_dim + i % ffn_dim;
+        float g = gate_up[src];
+        out[i] = (g * (1.0f / (1.0f + exp(-g)))) * gate_up[src + ffn_dim];
+    }
+}
+
+kernel void gelu_glu(
+    device const float *gate_up [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant uint &ffn_dim [[buffer(2)]],
+    constant uint &n [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < n) {
+        ulong src = (ulong)(i / ffn_dim) * 2 * ffn_dim + i % ffn_dim;
+        float x = gate_up[src];
+        const float k = 0.7978845608028654f; // sqrt(2 / pi)
+        out[i] = 0.5f * x * (1.0f + tanh(k * (x + 0.044715f * x * x * x))) * gate_up[src + ffn_dim];
     }
 }

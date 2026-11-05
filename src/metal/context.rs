@@ -35,10 +35,8 @@ const SOURCES: [&str; 4] = [
 // Every kernel function in SOURCES; one pipeline state is built for each.
 const KERNELS: &[&str] = &[
     "add",
-    "silu",
-    "silu_gate_multiply",
-    "gelu_gate_multiply",
-    "add_bias",
+    "silu_glu",
+    "gelu_glu",
     "scale_inplace",
     "embed_lookup",
     "narrow_last_row",
@@ -46,18 +44,34 @@ const KERNELS: &[&str] = &[
     "short_conv_bx",
     "short_conv_filter_gate",
     "rmsnorm",
-    "softmax",
+    "add_rmsnorm",
     "argmax",
-    "rope",
-    "transpose_axes12",
-    "kv_write",
-    "kv_gather",
-    "mask_add_broadcast",
-    "attention_scores",
-    "attention_apply",
+    "attn_prep",
     "linear_small",
     "linear_mma_small",
     "linear_gemm_32x64",
+];
+
+// `attn_decode` specializations: (query heads per threadgroup, ceil(head_dim / 32), name).
+// A group of G heads sharing a KV head is handled by one threadgroup when a
+// variant for G exists; otherwise the G = 1 variant runs one head at a time.
+pub const ATTN_DECODE_KERNELS: &[(usize, usize, &str)] = &[
+    (1, 2, "attn_decode_g1_d2"),
+    (2, 2, "attn_decode_g2_d2"),
+    (3, 2, "attn_decode_g3_d2"),
+    (4, 2, "attn_decode_g4_d2"),
+    (6, 2, "attn_decode_g6_d2"),
+    (7, 2, "attn_decode_g7_d2"),
+    (8, 2, "attn_decode_g8_d2"),
+    (1, 4, "attn_decode_g1_d4"),
+    (2, 4, "attn_decode_g2_d4"),
+    (3, 4, "attn_decode_g3_d4"),
+    (4, 4, "attn_decode_g4_d4"),
+    (6, 4, "attn_decode_g6_d4"),
+    (7, 4, "attn_decode_g7_d4"),
+    (1, 8, "attn_decode_g1_d8"),
+    (2, 8, "attn_decode_g2_d8"),
+    (3, 8, "attn_decode_g3_d8"),
 ];
 
 // One kernel argument, bound to consecutive buffer indices in order.
@@ -166,7 +180,7 @@ impl MetalRuntime {
             .map_err(|e| format!("Metal kernel compile failed:\n{e}"))?;
 
         let mut pipelines = HashMap::new();
-        for &name in KERNELS {
+        for &name in KERNELS.iter().chain(ATTN_DECODE_KERNELS.iter().map(|(_, _, n)| n)) {
             if pipelines.contains_key(name) {
                 continue;
             }
@@ -250,6 +264,11 @@ impl MetalRuntime {
                 (true, [.., Arg::U32(rows), Arg::U32(in_f), Arg::U32(out_f)]) => {
                     format!("{kernel} rows={rows} {in_f}x{out_f}")
                 }
+                // Attention: prefill (q_len > 1) and decode cost very different amounts.
+                _ if kernel.starts_with("attn_decode") => match args {
+                    [.., Arg::U32(q_len), Arg::F32(_)] => format!("attn_decode q_len={}", (*q_len).min(2)),
+                    _ => kernel.to_string(),
+                },
                 _ => kernel.to_string(),
             };
             let mut totals = profile.borrow_mut();

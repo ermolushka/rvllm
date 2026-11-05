@@ -6,7 +6,7 @@
 use candle_core::Tensor;
 use half::f16;
 
-use crate::model::{Mixer, Model};
+use crate::model::{Attention, Mixer, Model};
 
 use super::context::{MetalBuf, MetalRuntime, Result};
 
@@ -14,13 +14,12 @@ pub struct MetalAttention {
     // Index of this layer's slot in the KV cache.
     pub kv_index: usize,
     pub local: bool,
-    pub q: MetalBuf<f16>,
-    pub k: MetalBuf<f16>,
-    pub v: MetalBuf<f16>,
+    // Q, K and V projections stacked row-wise: [(n_heads + 2 * n_kv_heads) * head_dim, hidden_dim],
+    // so one matmul produces all three.
+    pub qkv: MetalBuf<f16>,
     pub o: MetalBuf<f16>,
-    pub q_bias: Option<MetalBuf<f32>>,
-    pub k_bias: Option<MetalBuf<f32>>,
-    pub v_bias: Option<MetalBuf<f32>>,
+    // The three biases stacked the same way (zeros for one a model lacks), when any exists.
+    pub qkv_bias: Option<MetalBuf<f32>>,
     pub q_norm: Option<MetalBuf<f32>>,
     pub k_norm: Option<MetalBuf<f32>>,
 }
@@ -46,8 +45,8 @@ pub struct MetalLayer {
     pub mixer: MetalMixer,
     pub post_attn_norm: Option<MetalBuf<f32>>,
     pub ffn_norm: MetalBuf<f32>,
-    pub ffn_gate: MetalBuf<f16>,
-    pub ffn_up: MetalBuf<f16>,
+    // Gate and up projections stacked row-wise: [2 * ffn_dim, hidden_dim].
+    pub ffn_gate_up: MetalBuf<f16>,
     pub ffn_down: MetalBuf<f16>,
     pub post_ffn_norm: Option<MetalBuf<f32>>,
 }
@@ -74,6 +73,24 @@ fn upload_optional(rt: &MetalRuntime, t: Option<&Tensor>) -> Result<Option<Metal
     t.map(|t| upload(rt, t)).transpose()
 }
 
+// The Q/K/V biases as one vector in QKV order; a missing one becomes zeros
+// (adding 0.0 changes nothing). None when the layer has no bias at all.
+fn stacked_bias(rt: &MetalRuntime, attn: &Attention) -> Result<Option<MetalBuf<f32>>> {
+    if attn.q_bias.is_none() && attn.k_bias.is_none() && attn.v_bias.is_none() {
+        return Ok(None);
+    }
+    let part = |bias: &Option<Tensor>, weight: &Tensor| -> Result<Vec<f32>> {
+        match bias {
+            Some(b) => Ok(b.flatten_all()?.to_vec1()?),
+            None => Ok(vec![0.0; weight.dim(0)?]),
+        }
+    };
+    let mut all = part(&attn.q_bias, &attn.q)?;
+    all.extend(part(&attn.k_bias, &attn.k)?);
+    all.extend(part(&attn.v_bias, &attn.v)?);
+    Ok(Some(MetalBuf::from_slice(rt, &all)))
+}
+
 impl MetalWeights {
     pub fn upload(rt: &MetalRuntime, model: &Model) -> Result<Self> {
         let token_embd = upload(rt, &model.token_embd)?;
@@ -85,13 +102,9 @@ impl MetalWeights {
                     Mixer::Attention(attn) => MetalMixer::Attention(MetalAttention {
                         kv_index: attn.kv_index,
                         local: attn.local,
-                        q: upload_f16(rt, &attn.q)?,
-                        k: upload_f16(rt, &attn.k)?,
-                        v: upload_f16(rt, &attn.v)?,
+                        qkv: upload_f16(rt, &Tensor::cat(&[&attn.q, &attn.k, &attn.v], 0)?)?,
                         o: upload_f16(rt, &attn.o)?,
-                        q_bias: upload_optional(rt, attn.q_bias.as_ref())?,
-                        k_bias: upload_optional(rt, attn.k_bias.as_ref())?,
-                        v_bias: upload_optional(rt, attn.v_bias.as_ref())?,
+                        qkv_bias: stacked_bias(rt, attn)?,
                         q_norm: upload_optional(rt, attn.q_norm.as_ref())?,
                         k_norm: upload_optional(rt, attn.k_norm.as_ref())?,
                     }),
@@ -108,8 +121,7 @@ impl MetalWeights {
                     mixer,
                     post_attn_norm: upload_optional(rt, l.post_attn_norm.as_ref())?,
                     ffn_norm: upload(rt, &l.ffn_norm)?,
-                    ffn_gate: upload_f16(rt, &l.ffn.gate)?,
-                    ffn_up: upload_f16(rt, &l.ffn.up)?,
+                    ffn_gate_up: upload_f16(rt, &Tensor::cat(&[&l.ffn.gate, &l.ffn.up], 0)?)?,
                     ffn_down: upload_f16(rt, &l.ffn.down)?,
                     post_ffn_norm: upload_optional(rt, l.post_ffn_norm.as_ref())?,
                 })

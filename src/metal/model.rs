@@ -1,6 +1,10 @@
-// Metal mirror of cuda/model.rs (itself the mirror of model.rs's Layer::forward
-// / Model::forward / forward_last): same math, same shapes, same kernel-per-op
-// structure. Two differences from the CUDA version:
+// Metal counterpart of cuda/model.rs (itself the mirror of model.rs's
+// Layer::forward / Model::forward / forward_last): same math and shapes, but
+// fused into 9 dispatches per attention layer instead of one kernel per op:
+// stacked QKV matmul, attn_prep (bias, Q/K norm, RoPE, KV write), attn_decode
+// (attention straight over the paged cache), O matmul, add+rmsnorm, stacked
+// gate/up matmul, GLU, down matmul, add+rmsnorm (with the next layer's norm).
+// Differences from the CUDA version:
 //  * the matmuls are the hand-written `ops::linear` / attention kernels instead
 //    of cuBLAS, and they read F32 activations directly, so there is no F16
 //    activation scratch (`to_f16`) to thread through the layers;
@@ -21,15 +25,11 @@ use super::weights::{MetalAttention, MetalLayer, MetalMixer, MetalShortConv, Met
 
 // The RoPE tables and attention mask one kind of attention layer uses: the
 // global ones, or a Gemma local layer's (its own RoPE base, its window).
-// cos/sin are pre-expanded across the head axis on the host since the rope
-// kernel expects one cos/sin row per input row, and q/k have different head
-// counts.
 struct MetalAttnCtx {
-    cos_q: MetalBuf<f32>,
-    sin_q: MetalBuf<f32>,
-    cos_k: MetalBuf<f32>,
-    sin_k: MetalBuf<f32>,
-    // [batch * q_len * ctx_len], broadcast across the heads.
+    // [batch * q_len, head_dim / 2], one row per token.
+    cos: MetalBuf<f32>,
+    sin: MetalBuf<f32>,
+    // [batch * q_len * ctx_len], read by the attention kernel.
     mask: MetalBuf<f32>,
 }
 
@@ -76,21 +76,6 @@ fn rope_cos_sin_rows(
     (cos, sin)
 }
 
-// Repeats each (batch, q_len) row's cos/sin across `n_heads` heads, in
-// (batch, head, q_len) order: the layout q/k are in after `transpose_axes12`.
-fn expand_across_heads(base: &[f32], batch: usize, q_len: usize, n_heads: usize, half: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(batch * n_heads * q_len * half);
-    for b in 0..batch {
-        for _h in 0..n_heads {
-            for qi in 0..q_len {
-                let row = b * q_len + qi;
-                out.extend_from_slice(&base[row * half..row * half + half]);
-            }
-        }
-    }
-    out
-}
-
 impl MetalAttnCtx {
     // `window` hides keys that many positions or more behind the query, for
     // sliding-window attention; the mask rule is model::batch_mask's.
@@ -107,16 +92,7 @@ impl MetalAttnCtx {
     ) -> Result<Self> {
         let batch = items.len();
         let q_len = items[0].tokens.len();
-        let head_dim = config.head_dim();
-        let half = head_dim / 2;
-        let n_heads = config.n_heads as usize;
-        let n_kv_heads = config.n_kv_heads as usize;
-
-        let (cos_rows, sin_rows) = rope_cos_sin_rows(rope_theta, factors, head_dim, positions);
-        let cos_q = MetalBuf::from_slice(rt, &expand_across_heads(&cos_rows, batch, q_len, n_heads, half));
-        let sin_q = MetalBuf::from_slice(rt, &expand_across_heads(&sin_rows, batch, q_len, n_heads, half));
-        let cos_k = MetalBuf::from_slice(rt, &expand_across_heads(&cos_rows, batch, q_len, n_kv_heads, half));
-        let sin_k = MetalBuf::from_slice(rt, &expand_across_heads(&sin_rows, batch, q_len, n_kv_heads, half));
+        let (cos_rows, sin_rows) = rope_cos_sin_rows(rope_theta, factors, config.head_dim(), positions);
 
         // Same masking rule as model::batch_mask: causal within the sequence's
         // real tokens, plus masked past its own read_num_tokens (the
@@ -136,10 +112,8 @@ impl MetalAttnCtx {
             }
         }
         Ok(MetalAttnCtx {
-            cos_q,
-            sin_q,
-            cos_k,
-            sin_k,
+            cos: MetalBuf::from_slice(rt, &cos_rows),
+            sin: MetalBuf::from_slice(rt, &sin_rows),
             mask: MetalBuf::from_slice(rt, &mask_data),
         })
     }
@@ -221,38 +195,21 @@ impl MetalStepCtx {
 }
 
 // Every intermediate a layer needs, allocated once per forward pass (sizes
-// depend on the batch and context length) and reused by all layers.
-// Zero-initialized; k_full/v_full padding slots keep whatever finite values
-// earlier layers left there, which the attention mask hides.
+// depend on the batch) and reused by all layers.
 struct Workspace {
     normed: MetalBuf<f32>,
-    q_proj: MetalBuf<f32>,
-    k_proj: MetalBuf<f32>,
-    v_proj: MetalBuf<f32>,
-    // Q/K after their per-head RMS norm (Qwen3, LFM2), when they have one.
-    q_normed: MetalBuf<f32>,
-    k_normed: MetalBuf<f32>,
-    q_t: MetalBuf<f32>,
-    k_t: MetalBuf<f32>,
-    v_t: MetalBuf<f32>,
-    q_roped: MetalBuf<f32>,
-    k_roped: MetalBuf<f32>,
-    k_tok: MetalBuf<f32>,
-    v_tok: MetalBuf<f32>,
-    k_full: MetalBuf<f32>,
-    v_full: MetalBuf<f32>,
-    scores: MetalBuf<f32>,
-    probs: MetalBuf<f32>,
+    // The stacked Q/K/V projection output, and the rotated Q.
+    qkv: MetalBuf<f32>,
+    q_rot: MetalBuf<f32>,
     attn_out: MetalBuf<f32>,
-    attn_out_t: MetalBuf<f32>,
     // The mixer's output (attention or short conv), projected back to hidden_dim.
     attn_proj: MetalBuf<f32>,
     // The mixer's output after its post-norm (Gemma), when it has one.
     attn_post: MetalBuf<f32>,
     h: MetalBuf<f32>,
     normed2: MetalBuf<f32>,
-    gate: MetalBuf<f32>,
-    up: MetalBuf<f32>,
+    // The stacked gate/up matmul output, and the activated product.
+    gate_up: MetalBuf<f32>,
     ffn_mid: MetalBuf<f32>,
     ffn_out: MetalBuf<f32>,
     // The FFN's output after its post-norm (Gemma), when it has one.
@@ -273,41 +230,22 @@ impl Workspace {
         let head_dim = config.head_dim();
         let ffn_dim = config.ffn_dim as usize;
         let rows = ctx.batch * ctx.q_len;
-        let attn_rows = (n_heads / n_kv_heads) * ctx.q_len;
         let q_size = rows * n_heads * head_dim;
-        let kv_size = rows * n_kv_heads * head_dim;
-        let full_size = ctx.batch * n_kv_heads * ctx.ctx_len * head_dim;
-        let scores_size = ctx.batch * n_kv_heads * attn_rows * ctx.ctx_len;
+        let qkv_size = rows * (n_heads + 2 * n_kv_heads) * head_dim;
         // A conv window of kernel - 1 + q_len rows per item; zero without conv.
         let kernel = config.conv.as_ref().map_or(1, |conv| conv.kernel);
         let window_rows = ctx.batch * (kernel - 1 + ctx.q_len);
         let z = |len: usize| MetalBuf::<f32>::zeros(rt, len);
         Workspace {
             normed: z(rows * hidden_dim),
-            q_proj: z(q_size),
-            k_proj: z(kv_size),
-            v_proj: z(kv_size),
-            q_normed: z(q_size),
-            k_normed: z(kv_size),
-            q_t: z(q_size),
-            k_t: z(kv_size),
-            v_t: z(kv_size),
-            q_roped: z(q_size),
-            k_roped: z(kv_size),
-            k_tok: z(kv_size),
-            v_tok: z(kv_size),
-            k_full: z(full_size),
-            v_full: z(full_size),
-            scores: z(scores_size),
-            probs: z(scores_size),
+            qkv: z(qkv_size),
+            q_rot: z(q_size),
             attn_out: z(q_size),
-            attn_out_t: z(q_size),
             attn_proj: z(rows * hidden_dim),
             attn_post: z(rows * hidden_dim),
             h: z(rows * hidden_dim),
             normed2: z(rows * hidden_dim),
-            gate: z(rows * ffn_dim),
-            up: z(rows * ffn_dim),
+            gate_up: z(rows * 2 * ffn_dim),
             ffn_mid: z(rows * ffn_dim),
             ffn_out: z(rows * hidden_dim),
             ffn_post: z(rows * hidden_dim),
@@ -320,7 +258,9 @@ impl Workspace {
 }
 
 // The attention mixer: writes its output, projected to hidden_dim, into
-// ws.attn_proj. `ws.normed` must hold the normalized input on entry.
+// ws.attn_proj. `ws.normed` must hold the normalized input on entry. Four
+// dispatches: the stacked QKV matmul, `attn_prep` (bias, Q/K norm, RoPE, KV
+// write), `attn_decode` (attention over the paged cache) and the O matmul.
 fn attention_mixer(
     rt: &MetalRuntime,
     config: &Config,
@@ -333,48 +273,9 @@ fn attention_mixer(
     let n_heads = config.n_heads as usize;
     let n_kv_heads = config.n_kv_heads as usize;
     let head_dim = config.head_dim();
-    let group_size = n_heads / n_kv_heads;
-    let batch = ctx.batch;
-    let q_len = ctx.q_len;
-    let ctx_len = ctx.ctx_len;
-    let rows = batch * q_len;
-    let eps = config.rms_eps;
+    let rows = ctx.batch * ctx.q_len;
 
-    // Project into Q/K/V, naturally [batch, q_len, heads, head_dim] flat.
-    ops::linear(rt, &ws.normed, &attn.q, rows, hidden_dim, n_heads * head_dim, &mut ws.q_proj)?;
-    ops::linear(rt, &ws.normed, &attn.k, rows, hidden_dim, n_kv_heads * head_dim, &mut ws.k_proj)?;
-    ops::linear(rt, &ws.normed, &attn.v, rows, hidden_dim, n_kv_heads * head_dim, &mut ws.v_proj)?;
-    if let Some(bias) = &attn.q_bias {
-        ops::add_bias_wrapper(rt, &mut ws.q_proj, bias)?;
-    }
-    if let Some(bias) = &attn.k_bias {
-        ops::add_bias_wrapper(rt, &mut ws.k_proj, bias)?;
-    }
-    if let Some(bias) = &attn.v_bias {
-        ops::add_bias_wrapper(rt, &mut ws.v_proj, bias)?;
-    }
-
-    // Per-head RMS norm on Q and K (each head is a head_dim-wide row), before
-    // RoPE, as on the CPU.
-    let q_src = match &attn.q_norm {
-        Some(norm) => {
-            ops::rmsnorm_wrapper(rt, &ws.q_proj, norm, head_dim as u32, eps, &mut ws.q_normed)?;
-            &ws.q_normed
-        }
-        None => &ws.q_proj,
-    };
-    let k_src = match &attn.k_norm {
-        Some(norm) => {
-            ops::rmsnorm_wrapper(rt, &ws.k_proj, norm, head_dim as u32, eps, &mut ws.k_normed)?;
-            &ws.k_normed
-        }
-        None => &ws.k_proj,
-    };
-
-    // [batch, q_len, heads, head_dim] -> [batch, heads, q_len, head_dim].
-    ops::transpose_axes12_wrapper(rt, q_src, &mut ws.q_t, batch as u32, q_len as u32, n_heads as u32, head_dim as u32)?;
-    ops::transpose_axes12_wrapper(rt, k_src, &mut ws.k_t, batch as u32, q_len as u32, n_kv_heads as u32, head_dim as u32)?;
-    ops::transpose_axes12_wrapper(rt, &ws.v_proj, &mut ws.v_t, batch as u32, q_len as u32, n_kv_heads as u32, head_dim as u32)?;
+    ops::linear(rt, &ws.normed, &attn.qkv, rows, hidden_dim, (n_heads + 2 * n_kv_heads) * head_dim, &mut ws.qkv)?;
 
     // Local layers rotate with their own RoPE base and see only their window.
     let actx = match &ctx.local {
@@ -382,54 +283,44 @@ fn attention_mixer(
         _ => &ctx.global,
     };
 
-    // RoPE rotates Q and K given position; V carries content, not position.
-    ops::rope_wrapper(rt, &ws.q_t, &actx.cos_q, &actx.sin_q, &mut ws.q_roped, head_dim as u32)?;
-    ops::rope_wrapper(rt, &ws.k_t, &actx.cos_k, &actx.sin_k, &mut ws.k_roped, head_dim as u32)?;
-
-    // The cache wants token-major rows [batch * q_len, n_kv_heads, head_dim].
-    ops::transpose_axes12_wrapper(rt, &ws.k_roped, &mut ws.k_tok, batch as u32, n_kv_heads as u32, q_len as u32, head_dim as u32)?;
-    ops::transpose_axes12_wrapper(rt, &ws.v_t, &mut ws.v_tok, batch as u32, n_kv_heads as u32, q_len as u32, head_dim as u32)?;
-    kv_storage.write_tokens(rt, attn.kv_index, &ctx.block_ids, &ctx.offsets, &ws.k_tok, &ws.v_tok)?;
-    kv_storage.gather(rt, attn.kv_index, &ctx.gather, &mut ws.k_full, &mut ws.v_full)?;
-
-    ops::attention_scores(
+    let (cache_k, cache_v) = kv_storage.layer_cache(attn.kv_index);
+    ops::attn_prep(
         rt,
-        &ws.q_roped,
-        &ws.k_full,
-        &mut ws.scores,
-        batch,
+        &ws.qkv,
+        attn.qkv_bias.as_ref(),
+        attn.q_norm.as_ref(),
+        attn.k_norm.as_ref(),
+        &actx.cos,
+        &actx.sin,
+        &ctx.block_ids,
+        &ctx.offsets,
+        cache_k,
+        cache_v,
+        &mut ws.q_rot,
+        n_heads,
         n_kv_heads,
-        group_size,
-        q_len,
-        ctx_len,
         head_dim,
+        kv_storage.block_size(),
+        config.rms_eps,
     )?;
-    ops::mask_add_broadcast_wrapper(
+    ops::attn_decode(
         rt,
-        &mut ws.scores,
+        &ws.q_rot,
+        cache_k,
+        cache_v,
+        ctx.gather.block_idx(),
         &actx.mask,
-        n_kv_heads as u32,
-        group_size as u32,
-        q_len as u32,
-        ctx_len as u32,
-    )?;
-    ops::softmax_wrapper(rt, &ws.scores, ctx_len as u32, &mut ws.probs)?;
-    ops::attention_apply(
-        rt,
-        &ws.probs,
-        &ws.v_full,
         &mut ws.attn_out,
-        batch,
+        ctx.batch,
+        ctx.q_len,
+        n_heads,
         n_kv_heads,
-        group_size,
-        q_len,
-        ctx_len,
         head_dim,
+        kv_storage.block_size(),
+        ctx.gather.max_blocks(),
+        ctx.ctx_len,
     )?;
-
-    // [batch, heads, q_len, head_dim] -> [batch, q_len, heads, head_dim].
-    ops::transpose_axes12_wrapper(rt, &ws.attn_out, &mut ws.attn_out_t, batch as u32, n_heads as u32, q_len as u32, head_dim as u32)?;
-    ops::linear(rt, &ws.attn_out_t, &attn.o, rows, n_heads * head_dim, hidden_dim, &mut ws.attn_proj)
+    ops::linear(rt, &ws.attn_out, &attn.o, rows, n_heads * head_dim, hidden_dim, &mut ws.attn_proj)
 }
 
 // LFM2's short-convolution mixer, the GPU side of model::ShortConv: writes its
@@ -486,11 +377,17 @@ fn short_conv_mixer(
 //   out = h + post_ffn(ffn(rms_norm(h, ffn_norm)))
 // where mixer is attention or a short conv, the post norms exist for Gemma, and
 // ffn is SwiGLU or GeGLU. x: [batch * q_len, hidden_dim] flattened.
+//
+// Norms are fused with the residual add in front of them: `ws.normed` holds
+// rms_norm(x, attn_norm) on entry (the previous layer, or `hidden`, left it
+// there), and when `next_norm` (the next layer's attn_norm) is given this layer
+// leaves rms_norm(out, next_norm) in `ws.normed` for the next one.
 #[allow(clippy::too_many_arguments)]
 fn layer_forward(
     rt: &MetalRuntime,
     config: &Config,
     weights: &MetalLayer,
+    next_norm: Option<&MetalBuf<f32>>,
     ctx: &MetalStepCtx,
     kv_storage: &mut MetalKvStorage,
     x: &MetalBuf<f32>,
@@ -502,7 +399,6 @@ fn layer_forward(
     let rows = ctx.batch * ctx.q_len;
     let eps = config.rms_eps;
 
-    ops::rmsnorm_wrapper(rt, x, &weights.attn_norm, hidden_dim as u32, eps, &mut ws.normed)?;
     match &weights.mixer {
         MetalMixer::Attention(attn) => attention_mixer(rt, config, attn, ctx, kv_storage, ws)?,
         MetalMixer::ShortConv(conv) => short_conv_mixer(rt, config, conv, ctx, kv_storage, ws)?,
@@ -512,22 +408,24 @@ fn layer_forward(
         std::mem::swap(&mut ws.attn_proj, &mut ws.attn_post);
     }
 
-    ops::add_wrapper(rt, x, &ws.attn_proj, &mut ws.h)?;
-
-    ops::rmsnorm_wrapper(rt, &ws.h, &weights.ffn_norm, hidden_dim as u32, eps, &mut ws.normed2)?;
-    ops::linear(rt, &ws.normed2, &weights.ffn_gate, rows, hidden_dim, ffn_dim, &mut ws.gate)?;
-    ops::linear(rt, &ws.normed2, &weights.ffn_up, rows, hidden_dim, ffn_dim, &mut ws.up)?;
-    match config.activation {
-        Activation::Silu => ops::silu_gate_multiply_wrapper(rt, &ws.gate, &ws.up, &mut ws.ffn_mid)?,
-        Activation::GeluTanh => ops::gelu_gate_multiply_wrapper(rt, &ws.gate, &ws.up, &mut ws.ffn_mid)?,
-    }
+    // h = x + mixer output, and the FFN's input norm of it.
+    ops::add_rmsnorm_wrapper(
+        rt, x, &ws.attn_proj, &weights.ffn_norm, hidden_dim as u32, eps, &mut ws.h, &mut ws.normed2,
+    )?;
+    ops::linear(rt, &ws.normed2, &weights.ffn_gate_up, rows, hidden_dim, 2 * ffn_dim, &mut ws.gate_up)?;
+    ops::glu_wrapper(rt, config.activation == Activation::GeluTanh, &ws.gate_up, ffn_dim, &mut ws.ffn_mid)?;
     ops::linear(rt, &ws.ffn_mid, &weights.ffn_down, rows, ffn_dim, hidden_dim, &mut ws.ffn_out)?;
     if let Some(norm) = &weights.post_ffn_norm {
         ops::rmsnorm_wrapper(rt, &ws.ffn_out, norm, hidden_dim as u32, eps, &mut ws.ffn_post)?;
         std::mem::swap(&mut ws.ffn_out, &mut ws.ffn_post);
     }
 
-    ops::add_wrapper(rt, &ws.h, &ws.ffn_out, out)
+    match next_norm {
+        Some(norm) => ops::add_rmsnorm_wrapper(
+            rt, &ws.h, &ws.ffn_out, norm, hidden_dim as u32, eps, out, &mut ws.normed,
+        ),
+        None => ops::add_wrapper(rt, &ws.h, &ws.ffn_out, out),
+    }
 }
 
 pub struct MetalModel {
@@ -572,8 +470,12 @@ impl MetalModel {
         // Ping-pong between two hidden-state buffers: a layer reads `x` and
         // writes `x_next`, then they swap.
         let mut x_next = MetalBuf::<f32>::zeros(rt, rows * hidden_dim);
-        for layer in self.weights.layers.iter() {
-            layer_forward(rt, &self.config, layer, &step_ctx, kv_storage, &x, &mut x_next, &mut ws)?;
+        if let Some(first) = self.weights.layers.first() {
+            ops::rmsnorm_wrapper(rt, &x, &first.attn_norm, hidden_dim as u32, self.config.rms_eps, &mut ws.normed)?;
+        }
+        for (i, layer) in self.weights.layers.iter().enumerate() {
+            let next_norm = self.weights.layers.get(i + 1).map(|next| &next.attn_norm);
+            layer_forward(rt, &self.config, layer, next_norm, &step_ctx, kv_storage, &x, &mut x_next, &mut ws)?;
             std::mem::swap(&mut x, &mut x_next);
         }
         Ok((x, batch, q_len))
