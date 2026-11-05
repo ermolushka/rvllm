@@ -377,6 +377,14 @@ the tests skip only when the machine has no Metal device at all (set
 `RVLLM_REQUIRE_METAL=1` to make that a failure), and a kernel that fails to
 compile is always a failure.
 
+A decoder layer is 9 dispatches (it was about 27 as one kernel per op): Q/K/V
+and gate/up are stacked into one matmul each, `attn_prep` does bias, Q/K norm,
+RoPE and the KV-cache write, `attn_decode` runs attention directly over the paged
+cache (online softmax, one K/V load shared by a GQA group, no gather or score
+buffers), and each residual add is fused with the RMS norm after it. On the M5 this
+took SmolLM2-360M batch 32 from 36.7 to 21.1 ms/step and prefill from 2.7k to
+3.4k tok/s with identical greedy output.
+
 Weights are uploaded as F16 (activations stay F32). Because of that, greedy
 output matches the CPU path except where the CPU's own top two logits are
 nearly tied (the F16 rounding error is around 0.01 in a logit).

@@ -5,7 +5,6 @@ use kv_cache_scheduler::block_pool::BlockID;
 
 use super::context::{MetalBuf, MetalRuntime, Result};
 use super::conv_cache::MetalConvCache;
-use super::ops::{kv_gather_wrapper, kv_write_wrapper};
 
 // Built once per forward call and reused by every layer's `gather`.
 pub struct MetalGatherPlan {
@@ -41,6 +40,15 @@ impl MetalGatherPlan {
         self.ctx_len
     }
 
+    // [batch, max_blocks] block table, padded with each sequence's last block.
+    pub fn block_idx(&self) -> &MetalBuf<u32> {
+        &self.block_idx
+    }
+
+    pub fn max_blocks(&self) -> u32 {
+        self.max_blocks
+    }
+
     pub fn batch(&self) -> u32 {
         self.batch
     }
@@ -50,8 +58,6 @@ pub struct MetalKvStorage {
     kv_k: Vec<MetalBuf<f32>>,
     kv_v: Vec<MetalBuf<f32>>,
     block_size: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
     // LFM2's short-conv state, kept alongside the KV cache like the CPU KvStorage.
     pub(crate) conv: MetalConvCache,
 }
@@ -72,61 +78,18 @@ impl MetalKvStorage {
             kv_k,
             kv_v,
             block_size: block_size as u32,
-            n_kv_heads: n_kv_heads as u32,
-            head_dim: head_dim as u32,
             conv: MetalConvCache::new(block_size),
         })
     }
 
-    // Writes this call's tokens' K/V into `layer`'s cache in place.
-    // k, v: [n_tokens, n_kv_heads, head_dim].
-    pub fn write_tokens(
-        &mut self,
-        rt: &MetalRuntime,
-        layer: usize,
-        block_ids: &MetalBuf<u32>,
-        offsets: &MetalBuf<u32>,
-        k: &MetalBuf<f32>,
-        v: &MetalBuf<f32>,
-    ) -> Result<()> {
-        kv_write_wrapper(
-            rt,
-            k,
-            v,
-            block_ids,
-            offsets,
-            &mut self.kv_k[layer],
-            &mut self.kv_v[layer],
-            self.n_kv_heads,
-            self.head_dim,
-            self.block_size,
-        )
+    pub fn block_size(&self) -> u32 {
+        self.block_size
     }
 
-    // Every sequence's cached K and V for `layer`, right-padded to the batch's
-    // longest context: both [batch, n_kv_heads, ctx_len, head_dim].
-    pub fn gather(
-        &self,
-        rt: &MetalRuntime,
-        layer: usize,
-        plan: &MetalGatherPlan,
-        out_k: &mut MetalBuf<f32>,
-        out_v: &mut MetalBuf<f32>,
-    ) -> Result<()> {
-        for (cache, out) in [(&self.kv_k[layer], out_k), (&self.kv_v[layer], out_v)] {
-            kv_gather_wrapper(
-                rt,
-                cache,
-                &plan.block_idx,
-                out,
-                plan.batch,
-                plan.max_blocks,
-                plan.ctx_len,
-                self.block_size,
-                self.n_kv_heads,
-                self.head_dim,
-            )?;
-        }
-        Ok(())
+    // One layer's K and V storage, for the fused attention kernels that write
+    // this call's tokens into it and read the context back without a gather.
+    pub fn layer_cache(&self, layer: usize) -> (&MetalBuf<f32>, &MetalBuf<f32>) {
+        (&self.kv_k[layer], &self.kv_v[layer])
     }
+
 }
