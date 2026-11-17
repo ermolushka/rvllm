@@ -170,6 +170,12 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '
 }'
 ```
 
+Chat UI: open `http://localhost:8000/` for a browser chat (streaming, markdown,
+sampling settings, system prompt, token stats). With `--models-dir <dir>` (default:
+the model's directory) its model picker lists the `.gguf` files there and
+hot-swaps between them: the old engine is drained first, then the new one loads,
+and requests meanwhile get 503. Embedded as `src/server/ui.html`, no build step.
+
 Endpoints: `POST /v1/completions`, `POST /v1/chat/completions` (both with
 `stream: true` SSE support, `stream_options.include_usage`, `stop`,
 `temperature`, `top_p`, `seed`, `max_tokens`), `GET /v1/models`,

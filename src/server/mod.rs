@@ -9,10 +9,12 @@
 // requests get HTTP 429 instead of piling up unboundedly.
 
 mod api;
+mod hub;
 mod launch;
 mod stop;
 pub mod worker;
 
+pub use hub::Hub;
 pub use launch::{ServeOptions, run};
 
 use std::convert::Infallible;
@@ -94,16 +96,28 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
+    router_for(Hub::fixed(state))
+}
+
+pub fn router_for(hub: Arc<Hub>) -> Router {
     Router::new()
+        .route("/", get(hub::index))
+        .route("/api/models", get(hub::models_info))
+        .route("/api/models/load", post(hub::load_model))
+        .route("/api/models/unload", post(hub::unload_model))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/health", get(health))
-        .with_state(state)
+        .with_state(hub)
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, state: Arc<AppState>) -> std::io::Result<()> {
-    axum::serve(listener, router(state))
+    serve_hub(listener, Hub::fixed(state)).await
+}
+
+pub async fn serve_hub(listener: tokio::net::TcpListener, hub: Arc<Hub>) -> std::io::Result<()> {
+    axum::serve(listener, router_for(hub))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -136,6 +150,33 @@ impl ApiError {
             code: Some("queue_full"),
             message: "the server is at capacity (all slots and the queue are full); retry shortly"
                 .into(),
+        }
+    }
+
+    fn loading() -> Self {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            code: Some("model_loading"),
+            message: "a model is being loaded; try again in a moment".into(),
+        }
+    }
+
+    fn unloaded() -> Self {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            code: Some("no_model"),
+            message: "no model is loaded; load one first".into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            kind: "invalid_request_error",
+            code: None,
+            message: message.into(),
         }
     }
 
@@ -686,9 +727,10 @@ fn sse(
 // ---- handlers -------------------------------------------------------------
 
 async fn completions(
-    State(state): State<Arc<AppState>>,
+    State(hub): State<Arc<Hub>>,
     Json(body): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
+    let state = hub.state()?;
     let prompt = match body.prompt {
         PromptField::One(p) => p,
         PromptField::Many(mut v) if v.len() == 1 => v.pop().unwrap(),
@@ -746,9 +788,10 @@ async fn completions(
 }
 
 async fn chat_completions(
-    State(state): State<Arc<AppState>>,
+    State(hub): State<Arc<Hub>>,
     Json(body): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
+    let state = hub.state()?;
     if body.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
@@ -824,8 +867,9 @@ async fn chat_completions(
     .into_response())
 }
 
-async fn models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
-    Json(ModelList {
+async fn models(State(hub): State<Arc<Hub>>) -> Result<Json<ModelList>, ApiError> {
+    let state = hub.state()?;
+    Ok(Json(ModelList {
         object: "list",
         data: vec![ModelInfo {
             id: state.cfg.model_name.clone(),
@@ -833,12 +877,16 @@ async fn models(State(state): State<Arc<AppState>>) -> Json<ModelList> {
             created: now(),
             owned_by: "rvllm",
         }],
-    })
+    }))
 }
 
-async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+async fn health(State(hub): State<Arc<Hub>>) -> Json<Value> {
+    let Ok(state) = hub.state() else {
+        return Json(hub::health_fields(&hub));
+    };
     Json(json!({
         "status": "ok",
+        "model": state.cfg.model_name,
         "running": state.status.running.load(Ordering::Relaxed),
         "waiting": state.status.waiting.load(Ordering::Relaxed),
         "max_running": state.cfg.max_running,
@@ -1613,5 +1661,40 @@ mod tests {
         assert_eq!(health["status"], "ok");
         assert_eq!(health["max_running"], 3);
         assert_eq!(health["max_queue"], 5);
+    }
+
+    #[tokio::test]
+    async fn serves_chat_ui_and_model_info() {
+        let h = harness(2, 2, 0);
+        let resp = h
+            .app
+            .clone()
+            .oneshot(HttpRequest::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+            .unwrap();
+        assert!(html.contains("<title>rvllm chat</title>"));
+
+        let resp = h
+            .app
+            .clone()
+            .oneshot(HttpRequest::get("/api/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (_, info) = json_of(resp).await;
+        assert_eq!(info["model"]["name"], "test-model");
+        assert_eq!(info["loading"], false);
+        assert_eq!(info["can_switch"], false);
+
+        // A fixed hub has no models directory to switch within.
+        let resp = h
+            .app
+            .oneshot(post("/api/models/load", json!({"path": "x.gguf"})))
+            .await
+            .unwrap();
+        let (status, _) = json_of(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

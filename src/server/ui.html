@@ -1,0 +1,713 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rvllm chat</title>
+<style>
+:root {
+  --bg: #fff; --rail: #fafafa; --panel-2: #f2f2f2; --line: #e6e6e6;
+  --text: #111; --muted: #8c8c8c; --accent: #6f8df2; --accent-ink: #fff; --accent-soft: #eef1fe;
+  --user: #f3f3f3; --code-bg: #f7f7f7; --code-ink: #111; --code-muted: #8c8c8c;
+  --ok: #3f9a5f; --warn: #c28a1e; --err: #c0392b;
+  --shadow: 0 10px 40px rgb(0 0 0 / .10);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e0e0e; --rail: #131313; --panel-2: #1e1e1e; --line: #2a2a2a;
+    --text: #f0f0f0; --muted: #8c8c8c; --accent: #8aa4f7; --accent-ink: #0b1020; --accent-soft: #1a2038;
+    --user: #1c1c1c; --code-bg: #151515; --code-ink: #f0f0f0; --code-muted: #8c8c8c;
+    --shadow: 0 10px 40px rgb(0 0 0 / .5);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e0e0e; --rail: #131313; --panel-2: #1e1e1e; --line: #2a2a2a;
+  --text: #f0f0f0; --muted: #8c8c8c; --accent: #8aa4f7; --accent-ink: #0b1020; --accent-soft: #1a2038;
+  --user: #1c1c1c; --code-bg: #151515; --code-ink: #f0f0f0; --code-muted: #8c8c8c;
+  --shadow: 0 10px 40px rgb(0 0 0 / .5);
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--text); display: flex; overflow: hidden;
+  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* ---- left rail ---- */
+#sidebar { width: 260px; flex: none; background: var(--rail); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.brand { font-weight: 800; font-size: 26px; letter-spacing: -.04em; line-height: 1; padding: 22px 20px 16px; }
+.brand b { color: var(--accent); }
+#new-chat { margin: 0 14px 12px; border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 9px 14px; text-align: left; color: var(--muted); display: flex; justify-content: space-between; }
+#new-chat:hover { color: var(--text); border-color: var(--muted); }
+#new-chat:disabled { opacity: .5; cursor: not-allowed; }
+#chats { flex: 1; overflow-y: auto; padding: 0 10px 10px; }
+.chat-item { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 10px; cursor: pointer; color: var(--muted); }
+.chat-item:hover { background: var(--panel-2); }
+.chat-item.active { background: var(--bg); color: var(--text); box-shadow: 0 0 0 1px var(--line); }
+.chat-item span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-item .del { opacity: 0; border: 0; background: none; color: var(--muted); padding: 0 4px; }
+.chat-item:hover .del { opacity: 1; }
+.chat-item .del:hover { color: var(--err); }
+.rail-foot { padding: 12px 18px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.rail-foot .grow { flex: 1; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.ok { background: var(--ok); } .dot.busy { background: var(--warn); } .dot.err { background: var(--err); }
+.icon-btn { border: 0; background: none; border-radius: 8px; padding: 4px 8px; color: var(--muted); }
+.icon-btn:hover { background: var(--panel-2); color: var(--text); }
+#scrim { position: fixed; inset: 0; z-index: 14; display: none; background: rgb(0 0 0 / .2); }
+
+/* ---- main ---- */
+main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+#menu-btn { display: none; position: absolute; top: 14px; left: 14px; z-index: 5; font-size: 18px; }
+#ctx { position: absolute; top: 16px; right: 22px; z-index: 5; display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+#ctx svg { transform: rotate(-90deg); }
+#ctx-ring { transition: stroke-dashoffset .3s; }
+#scroll { flex: 1; overflow-y: auto; }
+#thread { max-width: 760px; margin: 0 auto; padding: 56px 24px 12px; display: flex; flex-direction: column; gap: 26px; min-height: 100%; }
+
+.empty { margin: auto; text-align: center; padding-bottom: 6vh; }
+.empty h2 { margin: 0 0 6px; font-size: 34px; font-weight: 800; letter-spacing: -.04em; }
+.empty p { margin: 0 0 22px; color: var(--muted); }
+.starters { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; max-width: 560px; }
+.starters button { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 7px 14px; font-size: 14px; color: var(--muted); }
+.starters button:hover { border-color: var(--accent); color: var(--text); background: var(--accent-soft); }
+
+.msg { display: flex; flex-direction: column; gap: 6px; }
+.msg .who { font-size: 12px; color: var(--muted); }
+.msg.user { align-items: flex-end; }
+.msg.user .who { display: none; }
+.msg.user .body { background: var(--user); border-radius: 20px 20px 6px 20px; padding: 9px 16px; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.assistant .body { overflow-wrap: anywhere; }
+.body p { margin: 0 0 .8em; } .body p:last-child { margin-bottom: 0; }
+.body h1, .body h2, .body h3 { margin: 1em 0 .4em; letter-spacing: -.02em; line-height: 1.25; }
+.body h1 { font-size: 1.35em; } .body h2 { font-size: 1.2em; } .body h3 { font-size: 1.05em; }
+.body ul, .body ol { margin: 0 0 .8em; padding-left: 1.4em; }
+.body blockquote { margin: 0 0 .8em; padding: 2px 14px; border-left: 3px solid var(--line); color: var(--muted); }
+.body a { color: var(--accent); }
+.body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; background: var(--panel-2); padding: 1px 6px; border-radius: 6px; }
+.codeblock { margin: 0 0 .9em; border-radius: 16px; background: var(--code-bg); color: var(--code-ink); border: 1px solid var(--line); overflow: hidden; }
+.codeblock .lang { display: flex; justify-content: space-between; align-items: center; padding: 8px 16px 0; font-size: 12px; color: var(--code-muted); }
+.codeblock .lang button { background: none; border: 0; color: var(--code-muted); font-size: 12px; }
+.codeblock .lang button:hover { color: var(--text); }
+.codeblock pre { margin: 0; padding: 10px 18px 16px; overflow-x: auto; }
+.codeblock code { background: none; padding: 0; font-size: 14px; line-height: 1.7; color: inherit; }
+.cursor::after { content: ""; display: inline-block; width: .5em; height: 1em; margin-left: 2px; vertical-align: -.15em; background: var(--accent); border-radius: 2px; animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.meta { display: flex; flex-wrap: wrap; gap: 2px 14px; align-items: center; font-size: 12px; color: var(--muted); min-height: 22px; }
+.meta button { background: none; border: 0; color: var(--muted); padding: 2px 6px; border-radius: 6px; font-size: 12px; }
+.meta button:hover { background: var(--panel-2); color: var(--text); }
+.msg.user .meta { justify-content: flex-end; }
+.error { color: var(--err); border: 1px solid var(--err); border-radius: 12px; padding: 8px 14px; font-size: 14px; }
+
+/* ---- composer dock ---- */
+#dock { position: relative; max-width: 760px; width: 100%; margin: 0 auto; padding: 8px 24px 18px; }
+#composer { border: 1px solid var(--line); border-radius: 24px; background: var(--bg); padding: 12px 12px 10px 20px; box-shadow: 0 2px 14px rgb(0 0 0 / .04); }
+#composer:focus-within { border-color: var(--muted); }
+#input { display: block; width: 100%; border: 0; background: none; outline: none; resize: none; max-height: 220px; padding: 2px 0 8px; line-height: 1.55; font-size: 16px; }
+.bar { display: flex; align-items: center; gap: 6px; }
+.bar .grow { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 4px 11px; font-size: 13px; color: var(--muted); max-width: 46vw; }
+.pill span.t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pill:hover, .pill.on { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
+#send { width: 44px; height: 36px; border-radius: 999px; border: 0; background: var(--accent); color: var(--accent-ink); font-size: 18px; font-weight: 700; }
+#send.stop { background: var(--text); color: var(--bg); }
+.hint { text-align: center; font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+.pop { display: none; position: absolute; left: 24px; bottom: calc(100% - 4px); width: min(400px, calc(100% - 48px)); max-height: min(70vh, 560px); overflow-y: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 20px; box-shadow: var(--shadow); padding: 16px 18px 18px; z-index: 10; }
+.pop.show { display: block; }
+.pop h3 { margin: 0 0 12px; font-size: 13px; font-weight: 700; letter-spacing: -.01em; }
+.sec { margin: 18px 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.field { margin-bottom: 14px; }
+.field label { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; margin-bottom: 6px; }
+.field label small { color: var(--muted); }
+.field input[type=number], .field select, .field textarea { width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 8px 12px; outline: none; }
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent); }
+.field textarea { resize: vertical; min-height: 64px; }
+.field input[type=range] { width: 100%; accent-color: var(--accent); }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row > .btn:first-child { flex: 1; }
+.btn { border: 1px solid var(--line); background: var(--bg); border-radius: 999px; padding: 7px 14px; font-size: 14px; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.stat { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; color: var(--muted); }
+.stat b { color: var(--text); font-weight: 500; }
+
+#overlay { position: fixed; inset: 0; background: rgb(0 0 0 / .35); display: none; align-items: center; justify-content: center; z-index: 20; }
+#overlay.show { display: flex; }
+#overlay .box { background: var(--bg); border: 1px solid var(--line); padding: 22px 28px; border-radius: 20px; text-align: center; max-width: 340px; }
+.spin { width: 26px; height: 26px; border-radius: 50%; border: 3px solid var(--panel-2); border-top-color: var(--accent); animation: spin .8s linear infinite; margin: 0 auto 12px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 999px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 30; max-width: 80vw; }
+#toast.show { opacity: 1; }
+
+@media (max-width: 900px) {
+  #sidebar { position: fixed; inset: 0 auto 0 0; z-index: 15; transform: translateX(-100%); transition: transform .2s; box-shadow: var(--shadow); }
+  body.sidebar-open #sidebar { transform: none; }
+  body.sidebar-open #scrim { display: block; }
+  #menu-btn { display: block; }
+  #ctx-text { display: none; }
+  #dock { padding: 8px 14px 14px; }
+  .pop { left: 14px; width: calc(100% - 28px); }
+  #thread { padding: 56px 16px 12px; }
+}
+</style>
+</head>
+<body>
+<div id="scrim"></div>
+<aside id="sidebar">
+  <div class="brand">rvllm<b>.</b></div>
+  <button id="new-chat"><span>New chat</span><span>+</span></button>
+  <div id="chats"></div>
+  <div class="rail-foot">
+    <span class="dot" id="side-dot"></span><span id="status-text" class="grow">connecting…</span>
+    <button class="icon-btn" id="theme-btn" title="Toggle theme">◐</button>
+  </div>
+</aside>
+
+<main>
+  <button class="icon-btn" id="menu-btn" title="Chats">☰</button>
+  <div id="ctx" title="Tokens used by the last turn / context window">
+    <span id="ctx-text" class="mono">–</span>
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" stroke-width="3">
+      <circle cx="11" cy="11" r="8" stroke="var(--panel-2)"/>
+      <circle id="ctx-ring" cx="11" cy="11" r="8" stroke="var(--muted)" stroke-linecap="round" stroke-dasharray="50.27" stroke-dashoffset="50.27"/>
+    </svg>
+  </div>
+  <div id="scroll"><div id="thread"></div></div>
+
+  <div id="dock">
+    <div class="pop" id="pop-model">
+      <h3>Model</h3>
+      <div class="field">
+        <label for="model-select">Loaded model <small id="model-note"></small></label>
+        <select id="model-select"></select>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="load-btn" type="button">Load model</button>
+        <button class="btn" id="unload-btn" type="button" title="Free the model's memory without loading another">Unload</button>
+        <button class="btn" id="refresh-btn" type="button" title="Rescan the models directory">↻</button>
+      </div>
+      <div id="model-stats" style="margin-top:12px"></div>
+    </div>
+
+    <div class="pop" id="pop-tune">
+      <h3>Generation</h3>
+      <div class="field">
+        <label for="temperature">Temperature <small id="temperature-v"></small></label>
+        <input type="range" id="temperature" min="0" max="2" step="0.05">
+      </div>
+      <div class="field">
+        <label for="top_p">Top-p <small id="top_p-v"></small></label>
+        <input type="range" id="top_p" min="0.05" max="1" step="0.05">
+      </div>
+      <div class="two">
+        <div class="field"><label for="max_tokens">Max output</label><input type="number" id="max_tokens" min="1" step="1"></div>
+        <div class="field"><label for="seed">Seed</label><input type="number" id="seed" step="1" placeholder="random"></div>
+      </div>
+      <div class="field">
+        <label for="stop">Stop sequences <small>one per line</small></label>
+        <textarea id="stop" style="min-height:48px" class="mono"></textarea>
+      </div>
+      <div class="sec">Conversation</div>
+      <div class="field">
+        <label for="system">System prompt</label>
+        <textarea id="system" placeholder="Optional. Sent as the first message."></textarea>
+      </div>
+      <div class="field"><label class="check"><input type="checkbox" id="stream"> Stream tokens as they arrive</label></div>
+      <button class="btn" id="reset-btn" type="button">Reset to server defaults</button>
+    </div>
+
+    <form id="composer" autocomplete="off">
+      <textarea id="input" rows="1" placeholder="Ask anything…"></textarea>
+      <div class="bar">
+        <button class="pill" id="model-pill" type="button" title="Model"><span class="dot" id="status-dot"></span><span class="t" id="model-name">connecting…</span><span>▾</span></button>
+        <button class="pill mono" id="tune-pill" type="button" title="Generation settings"><span class="t" id="tune-text">–</span></button>
+        <span class="grow"></span>
+        <button id="send" type="submit" title="Send">↑</button>
+      </div>
+    </form>
+    <div class="hint">Enter to send · Shift+Enter for a new line</div>
+  </div>
+</main>
+
+<div id="overlay"><div class="box"><div class="spin"></div><div id="overlay-text">Loading model…</div><div id="overlay-sub" style="color:var(--muted);font-size:13px;margin-top:6px">Waiting for in-flight requests, then reading weights.</div></div></div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ---- state -------------------------------------------------------------
+let server = { model: null, available: [], can_switch: false, loading: false, unloaded: false, device: null };
+let settings = Object.assign({
+  temperature: null, top_p: null, max_tokens: null, seed: "", stop: "", system: "", stream: true,
+}, store.get("rvllm.settings", {}));
+let chats = store.get("rvllm.chats", []);
+let currentId = store.get("rvllm.current", null);
+let busy = false;
+let abort = null;
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const current = () => chats.find((c) => c.id === currentId);
+const save = () => { store.set("rvllm.chats", chats); store.set("rvllm.current", currentId); };
+const saveSettings = () => store.set("rvllm.settings", settings);
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+// ---- markdown (escape first, then a small subset) ------------------------
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function inline(s) {
+  const codes = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  s = esc(s);
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+       .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>")
+       .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${esc(codes[+i])}</code>`);
+}
+
+function markdown(src) {
+  const out = [];
+  const lines = src.replace(/\r\n/g, "\n").split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    let m;
+    if ((m = line.match(/^```\s*([\w+#.-]*)\s*$/))) {
+      const buf = []; i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) buf.push(lines[i++]);
+      i++; // closing fence (or end of a still-streaming block)
+      out.push(`<div class="codeblock"><div class="lang"><span>${esc(m[1] || "text")}</span><button data-copy>Copy</button></div><pre><code>${esc(buf.join("\n"))}</code></pre></div>`);
+    } else if ((m = line.match(/^(#{1,3})\s+(.*)$/))) {
+      out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); i++;
+    } else if (/^\s*[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) items.push(`<li>${inline(lines[i++].replace(/^\s*[-*]\s+/, ""))}</li>`);
+      out.push(`<ul>${items.join("")}</ul>`);
+    } else if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) items.push(`<li>${inline(lines[i++].replace(/^\s*\d+[.)]\s+/, ""))}</li>`);
+      out.push(`<ol>${items.join("")}</ol>`);
+    } else if (/^>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) buf.push(lines[i++].replace(/^>\s?/, ""));
+      out.push(`<blockquote>${inline(buf.join("\n")).replace(/\n/g, "<br>")}</blockquote>`);
+    } else if (line.trim() === "") {
+      i++;
+    } else {
+      const buf = [];
+      while (i < lines.length && lines[i].trim() !== "" && !/^(```|#{1,3}\s|\s*[-*]\s|\s*\d+[.)]\s|>)/.test(lines[i])) buf.push(lines[i++]);
+      out.push(`<p>${inline(buf.join("\n")).replace(/\n/g, "<br>")}</p>`);
+    }
+  }
+  return out.join("");
+}
+
+// ---- rendering -----------------------------------------------------------
+function renderChats() {
+  const box = $("chats"); box.textContent = "";
+  for (const c of chats) {
+    const el = document.createElement("div");
+    el.className = "chat-item" + (c.id === currentId ? " active" : "");
+    const t = document.createElement("span"); t.textContent = c.title || "New chat";
+    const d = document.createElement("button"); d.className = "del"; d.textContent = "✕"; d.title = "Delete";
+    d.onclick = (e) => { e.stopPropagation(); deleteChat(c.id); };
+    el.onclick = () => { if (!busy) { currentId = c.id; save(); renderAll(); closeAll(); } };
+    el.append(t, d); box.append(el);
+  }
+}
+
+function messageEl(m, idx, streaming) {
+  const el = document.createElement("div");
+  el.className = "msg " + m.role; el.dataset.idx = idx;
+  const who = document.createElement("div"); who.className = "who"; who.textContent = m.model || "Assistant";
+  const body = document.createElement("div"); body.className = "body";
+  if (m.role === "user") body.textContent = m.content;
+  else { body.innerHTML = markdown(m.content); if (streaming) body.classList.add("cursor"); }
+  el.append(who, body);
+  if (m.error) { const e = document.createElement("div"); e.className = "error"; e.textContent = m.error; el.append(e); }
+  const meta = document.createElement("div"); meta.className = "meta";
+  if (m.role === "assistant" && m.stats) {
+    const s = m.stats;
+    const parts = [];
+    if (s.tokens != null) parts.push(`${s.tokens} tokens`);
+    if (s.tps) parts.push(`${s.tps.toFixed(1)} tok/s`);
+    if (s.ttft != null) parts.push(`first token ${s.ttft < 1000 ? Math.round(s.ttft) + " ms" : (s.ttft / 1000).toFixed(1) + " s"}`);
+    if (s.finish === "length") parts.push("cut off at max tokens");
+    if (s.stopped) parts.push("stopped");
+    for (const p of parts) { const sp = document.createElement("span"); sp.textContent = p; meta.append(sp); }
+  }
+  if (!streaming) {
+    const copy = document.createElement("button"); copy.textContent = "Copy"; copy.dataset.act = "copy"; meta.append(copy);
+    if (m.role === "assistant" && idx === current().messages.length - 1) {
+      const re = document.createElement("button"); re.textContent = "Regenerate"; re.dataset.act = "regen"; meta.append(re);
+    }
+    if (m.role === "user" && idx === current().messages.length - 2) {
+      const ed = document.createElement("button"); ed.textContent = "Edit"; ed.dataset.act = "edit"; meta.append(ed);
+    }
+  }
+  el.append(meta);
+  return el;
+}
+
+const STARTERS = ["Explain KV caching simply", "Write a Rust function to reverse a string", "Summarize Hamlet in three sentences", "Give me a regex for email addresses"];
+
+function renderThread() {
+  const th = $("thread"); th.textContent = "";
+  const c = current();
+  if (!c || c.messages.length === 0) {
+    const e = document.createElement("div"); e.className = "empty";
+    if (server.unloaded) {
+      e.innerHTML = `<h2>No model loaded</h2><p>Its memory is free. Pick one from the model chip below.</p>`;
+    } else {
+      e.innerHTML = `<h2>What's on your mind?</h2><p>Running locally${server.model ? " on " + esc(server.model.name) : ""}.</p>`;
+      const st = document.createElement("div"); st.className = "starters";
+      for (const s of STARTERS) { const b = document.createElement("button"); b.type = "button"; b.textContent = s; b.onclick = () => { $("input").value = s; send(); }; st.append(b); }
+      e.append(st);
+    }
+    th.append(e); return;
+  }
+  c.messages.forEach((m, i) => th.append(messageEl(m, i, false)));
+}
+
+function renderAll() { renderChats(); renderThread(); scrollDown(true); updateContext(); }
+function scrollDown(force) {
+  const s = $("scroll");
+  if (force || s.scrollHeight - s.scrollTop - s.clientHeight < 140) s.scrollTop = s.scrollHeight;
+}
+
+function newChat() {
+  if (busy) return;
+  const existing = chats.find((c) => c.messages.length === 0);
+  if (existing) currentId = existing.id;
+  else { const c = { id: uid(), title: "", messages: [] }; chats.unshift(c); currentId = c.id; }
+  save(); renderAll(); closeAll(); $("input").focus();
+}
+function deleteChat(id) {
+  if (busy) return;
+  chats = chats.filter((c) => c.id !== id);
+  if (currentId === id) currentId = chats[0]?.id ?? null;
+  if (!currentId) { newChat(); return; }
+  save(); renderAll();
+}
+
+// ---- context ring ---------------------------------------------------------
+const RING = 50.27;
+function updateContext() {
+  const c = current();
+  const last = c && [...c.messages].reverse().find((m) => m.stats && m.stats.total);
+  const limit = server.model ? Math.min(server.model.context_length, server.model.max_sequence_tokens) : 0;
+  const frac = last && limit ? Math.min(1, last.stats.total / limit) : 0;
+  $("ctx-text").textContent = limit ? `${last?.stats.total ?? 0} / ${limit}` : "–";
+  $("ctx-ring").style.strokeDashoffset = RING * (1 - frac);
+  $("ctx-ring").style.stroke = frac > 0.85 ? "var(--err)" : frac > 0.6 ? "var(--warn)" : "var(--muted)";
+}
+
+// ---- generation ---------------------------------------------------------
+function buildMessages(c, upto) {
+  const msgs = [];
+  if (settings.system.trim()) msgs.push({ role: "system", content: settings.system.trim() });
+  for (const m of c.messages.slice(0, upto)) if (!m.error || m.content) msgs.push({ role: m.role, content: m.content });
+  return msgs;
+}
+
+function requestBody(messages) {
+  const d = server.model?.defaults ?? {};
+  const body = {
+    messages, stream: settings.stream,
+    temperature: settings.temperature ?? d.temperature,
+    top_p: settings.top_p ?? d.top_p,
+    max_tokens: settings.max_tokens ?? d.max_tokens,
+  };
+  if (settings.seed !== "" && settings.seed != null) body.seed = Number(settings.seed);
+  const stop = settings.stop.split("\n").map((s) => s.replace(/\\n/g, "\n")).filter((s) => s !== "");
+  if (stop.length) body.stop = stop;
+  if (settings.stream) body.stream_options = { include_usage: true };
+  return body;
+}
+
+function setBusy(b) {
+  busy = b;
+  const send = $("send");
+  send.textContent = b ? "■" : "↑"; send.classList.toggle("stop", b); send.title = b ? "Stop" : "Send";
+  $("new-chat").disabled = b;
+}
+
+async function generate() {
+  const c = current();
+  const assistant = { role: "assistant", content: "", model: server.model?.name, stats: null };
+  const messages = buildMessages(c, c.messages.length);
+  c.messages.push(assistant);
+  renderThread();
+  const el = $("thread").lastElementChild; const body = el.querySelector(".body");
+  body.classList.add("cursor");
+  scrollDown(true);
+  setBusy(true);
+  abort = new AbortController();
+  const t0 = performance.now(); let tFirst = null; let chunks = 0; let usage = null; let finish = null;
+  let raf = 0;
+  const paint = () => { raf = 0; body.innerHTML = markdown(assistant.content); scrollDown(false); };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(paint); };
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(requestBody(messages)), signal: abort.signal,
+    });
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try { msg = (await resp.json()).error.message; } catch {}
+      throw new Error(msg);
+    }
+    if (settings.stream) {
+      const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          const j = JSON.parse(data);
+          if (j.error) throw new Error(j.error.message);
+          if (j.usage) usage = j.usage;
+          const ch = j.choices?.[0];
+          if (ch?.delta?.content) {
+            if (tFirst == null) tFirst = performance.now();
+            chunks++; assistant.content += ch.delta.content; schedule();
+          }
+          if (ch?.finish_reason) finish = ch.finish_reason;
+        }
+      }
+    } else {
+      const j = await resp.json();
+      tFirst = performance.now();
+      assistant.content = j.choices[0].message.content; usage = j.usage; finish = j.choices[0].finish_reason;
+    }
+  } catch (e) {
+    if (e.name === "AbortError") assistant.stopped = true;
+    else assistant.error = e.message;
+  }
+  if (raf) cancelAnimationFrame(raf);
+  const t1 = performance.now();
+  const tokens = usage?.completion_tokens ?? (chunks || null);
+  const genMs = tFirst != null ? t1 - tFirst : 0;
+  assistant.stats = {
+    tokens, total: usage?.total_tokens ?? null, finish,
+    ttft: tFirst != null ? tFirst - t0 : null,
+    tps: tokens && genMs > 50 && tokens > 1 ? (tokens - 1) / (genMs / 1000) : null,
+    stopped: !!assistant.stopped,
+  };
+  if (!assistant.content && !assistant.error && !assistant.stopped) assistant.error = "The model returned an empty reply.";
+  if (assistant.error && !assistant.content) c.messages.pop();
+  abort = null; setBusy(false); save();
+  if (assistant.error && !assistant.content) { c.messages.push({ role: "assistant", content: "", error: assistant.error, model: assistant.model }); }
+  renderAll();
+}
+
+function send() {
+  if (busy) { abort?.abort(); return; }
+  if (server.loading) { toast("A model is loading…"); return; }
+  if (server.unloaded) { toast("No model loaded. Load one first."); openPop("model"); return; }
+  const input = $("input"); const text = input.value.trim();
+  if (!text) return;
+  let c = current(); if (!c) { newChat(); c = current(); }
+  // Drop a trailing error bubble before continuing the conversation.
+  while (c.messages.length && c.messages[c.messages.length - 1].error && !c.messages[c.messages.length - 1].content) c.messages.pop();
+  c.messages.push({ role: "user", content: text });
+  if (!c.title) c.title = text.slice(0, 48);
+  input.value = ""; autosize(); save(); renderChats(); closeAll();
+  generate();
+}
+
+// ---- message actions -----------------------------------------------------
+$("thread").addEventListener("click", (e) => {
+  const cb = e.target.closest("[data-copy]");
+  if (cb) { navigator.clipboard?.writeText(cb.closest(".codeblock").querySelector("code").textContent); cb.textContent = "Copied"; setTimeout(() => (cb.textContent = "Copy"), 1200); return; }
+  const btn = e.target.closest("[data-act]"); if (!btn || busy) return;
+  const c = current(); const idx = +btn.closest(".msg").dataset.idx; const m = c.messages[idx];
+  if (btn.dataset.act === "copy") { navigator.clipboard?.writeText(m.content); toast("Copied"); }
+  else if (btn.dataset.act === "regen") { c.messages.splice(idx, 1); save(); renderThread(); generate(); }
+  else if (btn.dataset.act === "edit") { $("input").value = m.content; c.messages.splice(idx); save(); renderAll(); autosize(); $("input").focus(); }
+});
+
+// ---- popovers ---------------------------------------------------------------
+function openPop(name) {
+  const open = !$("pop-" + name).classList.contains("show");
+  closePops();
+  if (open) { $("pop-" + name).classList.add("show"); $(name + "-pill").classList.add("on"); }
+}
+function closePops() {
+  for (const n of ["model", "tune"]) { $("pop-" + n).classList.remove("show"); $(n + "-pill").classList.remove("on"); }
+}
+function closeAll() { closePops(); document.body.classList.remove("sidebar-open"); }
+$("model-pill").onclick = (e) => { e.stopPropagation(); openPop("model"); };
+$("tune-pill").onclick = (e) => { e.stopPropagation(); openPop("tune"); };
+document.addEventListener("click", (e) => { if (!e.target.closest(".pop")) closePops(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAll(); });
+$("scrim").onclick = closeAll;
+$("menu-btn").onclick = () => document.body.classList.add("sidebar-open");
+
+// ---- settings --------------------------------------------------------------
+function fmtSize(n) { return n > 1e9 ? (n / 1e9).toFixed(1) + " GB" : (n / 1e6).toFixed(0) + " MB"; }
+
+function effective() {
+  const d = server.model?.defaults ?? { temperature: 1, top_p: 1, max_tokens: 256 };
+  return { t: settings.temperature ?? d.temperature, p: settings.top_p ?? d.top_p, m: settings.max_tokens ?? d.max_tokens };
+}
+function renderPill() {
+  const { t, p, m } = effective();
+  $("tune-text").textContent = `T ${Number(t).toFixed(2).replace(/0$/, "")} · P ${Number(p).toFixed(2).replace(/0$/, "")} · ${m}`;
+  $("temperature-v").textContent = Number(t).toFixed(2);
+  $("top_p-v").textContent = Number(p).toFixed(2);
+}
+
+function renderSettings() {
+  const { t, p, m } = effective();
+  $("temperature").value = t; $("top_p").value = p; $("max_tokens").value = m;
+  $("seed").value = settings.seed ?? "";
+  $("stop").value = settings.stop; $("system").value = settings.system; $("stream").checked = settings.stream;
+  renderPill();
+
+  const sel = $("model-select"); sel.textContent = "";
+  const cur = server.model?.path;
+  const list = server.available.slice();
+  if (cur && !list.some((m) => m.path === cur)) list.unshift({ name: server.model.name, path: cur, size_bytes: 0 });
+  const last = store.get("rvllm.lastModel", null);
+  for (const m of list) {
+    const o = document.createElement("option"); o.value = m.path;
+    o.textContent = m.name + (m.size_bytes ? `  (${fmtSize(m.size_bytes)})` : "");
+    if (m.path === cur || (cur && m.path.endsWith(cur)) || (!cur && m.path === last)) o.selected = true;
+    sel.append(o);
+  }
+  if (!list.length) { const o = document.createElement("option"); o.textContent = "no models found"; sel.append(o); }
+  sel.disabled = !server.can_switch;
+  $("load-btn").disabled = !server.can_switch || server.loading;
+  $("load-btn").textContent = server.unloaded ? "Load model" : "Switch model";
+  $("unload-btn").disabled = !server.can_switch || server.loading || server.unloaded;
+  $("model-note").textContent = server.can_switch ? "" : "switching unavailable";
+
+  const st = $("model-stats"); st.textContent = "";
+  if (server.model) {
+    const rows = [["Context window", server.model.context_length], ["KV pool per request", server.model.max_sequence_tokens], ["Chat format", server.model.chat ? "known" : "unknown"]];
+    if (server.device) rows.push(["Device", server.device]);
+    for (const [k, v] of rows) { const r = document.createElement("div"); r.className = "stat"; r.innerHTML = `<span>${esc(String(k))}</span><b>${esc(String(v))}</b>`; st.append(r); }
+  }
+}
+
+function bind(id, key, parse) {
+  $(id).addEventListener("input", () => { settings[key] = parse($(id)); saveSettings(); renderPill(); });
+}
+const num = (e) => (e.value === "" || isNaN(parseFloat(e.value)) ? null : parseFloat(e.value));
+bind("temperature", "temperature", num);
+bind("top_p", "top_p", num);
+bind("max_tokens", "max_tokens", (e) => (e.value === "" ? null : Math.max(1, parseInt(e.value, 10))));
+bind("seed", "seed", (e) => e.value);
+bind("stop", "stop", (e) => e.value);
+bind("system", "system", (e) => e.value);
+bind("stream", "stream", (e) => e.checked);
+$("reset-btn").onclick = () => { Object.assign(settings, { temperature: null, top_p: null, max_tokens: null, seed: "", stop: "", system: "", stream: true }); saveSettings(); renderSettings(); toast("Settings reset"); };
+
+$("new-chat").onclick = newChat;
+$("theme-btn").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const next = cur === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next; store.set("rvllm.theme", next);
+};
+
+// ---- server info + model switching ------------------------------------------
+function paintStatus(kind, text) {
+  for (const id of ["status-dot", "side-dot"]) $(id).className = "dot" + (kind ? " " + kind : "");
+  $("status-text").textContent = text;
+}
+
+async function refreshInfo() {
+  try {
+    const r = await fetch("/api/models"); server = await r.json();
+    $("model-name").textContent = server.loading ? "loading…" : server.unloaded ? "no model" : server.model?.name ?? "no model";
+    renderSettings(); if (!current()?.messages.length) renderThread(); updateContext();
+  } catch { $("model-name").textContent = "offline"; paintStatus("err", "offline"); }
+}
+
+async function loadModel() {
+  const path = $("model-select").value; if (!path) return;
+  if (busy) { toast("Stop the current reply first"); return; }
+  closePops();
+  $("overlay-text").textContent = `Loading ${$("model-select").selectedOptions[0].textContent.trim()}…`;
+  $("overlay").classList.add("show");
+  server.loading = true;
+  try {
+    const r = await fetch("/api/models/load", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message ?? `HTTP ${r.status}`);
+    toast(`Loaded ${j.model.name}`); store.set("rvllm.lastModel", j.model.path);
+  } catch (e) { toast(e.message); }
+  $("overlay").classList.remove("show");
+  await refreshInfo();
+}
+$("load-btn").onclick = loadModel;
+$("unload-btn").onclick = async () => {
+  if (busy) { toast("Stop the current reply first"); return; }
+  closePops();
+  $("overlay-text").textContent = "Unloading model…"; $("overlay-sub").textContent = "Waiting for in-flight requests, then freeing memory.";
+  $("overlay").classList.add("show");
+  try {
+    const r = await fetch("/api/models/unload", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message ?? `HTTP ${r.status}`);
+    toast("Model unloaded");
+  } catch (e) { toast(e.message); }
+  $("overlay").classList.remove("show"); $("overlay-sub").textContent = "Waiting for in-flight requests, then reading weights.";
+  await refreshInfo();
+};
+$("refresh-btn").onclick = async () => { await refreshInfo(); toast("Rescanned"); };
+
+async function pollHealth() {
+  try {
+    const h = await (await fetch("/health")).json();
+    if (h.status === "loading") paintStatus("busy", "loading model…");
+    else if (h.status === "unloaded") paintStatus("", "no model loaded");
+    else paintStatus(h.running + h.waiting > 0 ? "busy" : "ok", h.running + h.waiting > 0 ? `${h.running} running · ${h.waiting} waiting` : "idle");
+    if (h.status === "ok" && h.model && server.model && h.model !== server.model.name) refreshInfo();
+    if ((h.status === "unloaded") !== !!server.unloaded) refreshInfo();
+  } catch { paintStatus("err", "offline"); }
+}
+
+// ---- composer ----------------------------------------------------------------
+function autosize() { const i = $("input"); i.style.height = "auto"; i.style.height = Math.min(i.scrollHeight, 220) + "px"; }
+$("input").addEventListener("input", autosize);
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+
+// ---- boot ------------------------------------------------------------------------
+(function boot() {
+  const th = store.get("rvllm.theme", null); if (th) document.documentElement.dataset.theme = th;
+  if (!chats.length || !current()) { chats = chats.length ? chats : [{ id: uid(), title: "", messages: [] }]; currentId = chats[0].id; save(); }
+  renderAll(); renderSettings();
+  refreshInfo().then(() => { renderThread(); });
+  setInterval(pollHealth, 2000); pollHealth();
+  $("input").focus();
+})();
+</script>
+</body>
+</html>

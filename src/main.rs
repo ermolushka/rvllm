@@ -164,6 +164,10 @@ struct ServeArgs {
     // `--num-blocks` isn't given: pool = max_running * this many tokens.
     #[arg(long, default_value_t = 2048)]
     tokens_per_seq: usize,
+    // Where the chat UI (served at /) looks for .gguf files to switch between
+    // (plus one level of subdirectories). Defaults to the model's directory.
+    #[arg(long)]
+    models_dir: Option<String>,
 }
 
 fn main() -> Result<(), BoxError> {
@@ -484,6 +488,7 @@ fn run_serve(args: ServeArgs) -> Result<(), BoxError> {
             default_temperature: args.default_temperature,
             default_top_p: args.default_top_p,
             compact: args.compact.into(),
+            models_dir: args.models_dir.map(Into::into),
         },
     )
 }
